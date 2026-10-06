@@ -26,7 +26,8 @@ function Get-SourceArchive([string] $Uri, [string] $Path) {
 }
 
 $sevenZip = Join-Path $buildRoot '7zr.exe'
-Get-VerifiedDownload 'https://www.7-zip.org/a/7zr.exe' $sevenZip 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d'
+# Pin the release URL as well as the hash; the unversioned download changes on release.
+Get-VerifiedDownload 'https://github.com/ip7z/7zip/releases/download/26.03/7zr.exe' $sevenZip 'ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d'
 $toolchainArchive = Join-Path $buildRoot 'w64devkit-x64-2.10.0.7z.exe'
 Get-VerifiedDownload 'https://github.com/skeeto/w64devkit/releases/download/v2.10.0/w64devkit-x64-2.10.0.7z.exe' $toolchainArchive '18d0a4c71a166f8401ab6305781bec5882b40b5e06ba9807c61cb5f3b3c6325e'
 $toolchainParent = Join-Path $buildRoot 'toolchain'
