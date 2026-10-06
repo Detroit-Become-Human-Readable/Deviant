@@ -1,0 +1,186 @@
+<Window x:Class="Deviant.Desktop.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:Deviant.Desktop"
+        Title="Deviant Resource Explorer" Icon="Assets/app-icon.png" Width="1360" Height="850"
+        MinWidth="1050" MinHeight="620" WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" FontSize="13"
+        UseLayoutRounding="True" TextOptions.TextFormattingMode="Display"
+        Background="{DynamicResource WindowBackground}" Foreground="{DynamicResource WindowForeground}"
+        Closing="Window_Closing" PreviewKeyDown="Window_PreviewKeyDown">
+    <Window.InputBindings>
+        <KeyBinding Key="O" Modifiers="Control" Command="{x:Static ApplicationCommands.Open}" />
+        <KeyBinding Key="F5" Command="{x:Static NavigationCommands.Refresh}" />
+    </Window.InputBindings>
+    <Window.CommandBindings>
+        <CommandBinding Command="{x:Static ApplicationCommands.Open}" Executed="OpenIndex_Executed" />
+        <CommandBinding Command="{x:Static NavigationCommands.Refresh}" Executed="Refresh_Executed" />
+    </Window.CommandBindings>
+    <DockPanel LastChildFill="True">
+        <Border DockPanel.Dock="Top" Padding="10,8" BorderBrush="{DynamicResource ControlBorder}" BorderThickness="0,0,0,1">
+            <DockPanel LastChildFill="True">
+                <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button Content="Open index" Click="OpenIndex_Click" IsEnabled="{Binding CanStartOpen}" />
+                    <Button Content="Open folder" Click="OpenFolder_Click" IsEnabled="{Binding CanStartOpen}" />
+                    <Button Content="Refresh" Click="Refresh_Click" IsEnabled="{Binding CanRefresh}" />
+                    <Button Content="Cancel open" Click="CancelOpen_Click" IsEnabled="{Binding IsOpening}" />
+                    <TextBlock Text="{Binding SourceLabel}" ToolTip="{Binding SourceIndexPath}"
+                               VerticalAlignment="Center" Margin="10,0,4,0" MaxWidth="145" TextTrimming="CharacterEllipsis" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <TextBlock Text="ID" VerticalAlignment="Center" Margin="6,0,4,0" />
+                    <TextBox x:Name="IdFilterTextBox" Width="125" ToolTip="Decimal or 0x hex"
+                             TextChanged="FilterText_Changed" />
+                    <TextBlock Text="Search" VerticalAlignment="Center" Margin="10,0,4,0" />
+                    <TextBox x:Name="SearchTextBox" Width="220"
+                             TextChanged="FilterText_Changed" />
+                    <Button Content="Reset" Click="ResetFilters_Click" />
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <Border DockPanel.Dock="Bottom" Padding="10,6" MinHeight="44" BorderBrush="{DynamicResource ControlBorder}" BorderThickness="0,1,0,0">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center">
+                    <Button Content="Cancel export" Click="CancelExport_Click" IsEnabled="{Binding IsExporting}" />
+                    <Button Content="View report" Click="ViewReport_Click" IsEnabled="{Binding HasReport}" />
+                </StackPanel>
+                <TextBlock Grid.Column="1" Text="This is a pre-release. It's not finished. There's going to be a lot of bugs."
+                           MaxWidth="450" Margin="10,0" FontSize="11" Opacity="0.7" TextWrapping="Wrap" TextAlignment="Center" VerticalAlignment="Center" />
+                <Grid Grid.Column="2" MaxWidth="380" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <local:ProcessingAnimation x:Name="ExplorerProcessing" Grid.Column="0" IsActive="{Binding IsProcessing, Mode=OneWay}" Margin="0,0,8,0"/>
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,8,0">
+                        <TextBlock Text="{Binding StatusText}" TextTrimming="CharacterEllipsis" TextAlignment="Right" />
+                        <TextBlock Text="{Binding ProgressText}" FontSize="11" Opacity="0.8" TextTrimming="CharacterEllipsis" TextAlignment="Right" />
+                    </StackPanel>
+                    <ProgressBar Grid.Column="2" Width="110" Height="10" VerticalAlignment="Center" Minimum="0" Maximum="{Binding ProgressMaximum, Mode=OneWay}"
+                                 Value="{Binding ProgressValue, Mode=OneWay}"
+                                 IsIndeterminate="{Binding IsProgressIndeterminate, Mode=OneWay}" />
+                </Grid>
+            </Grid>
+        </Border>
+
+        <Grid Margin="10">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="220" MinWidth="160" />
+                <ColumnDefinition Width="5" />
+                <ColumnDefinition Width="*" MinWidth="440" />
+                <ColumnDefinition Width="5" />
+                <ColumnDefinition Width="300" MinWidth="230" />
+            </Grid.ColumnDefinitions>
+
+            <GroupBox Grid.Row="0" Grid.Column="0" Header="Packages and types" Padding="4">
+                <TreeView x:Name="NavigationTree" ItemsSource="{Binding Navigation}" SelectedItemChanged="NavigationTree_SelectedItemChanged">
+                    <TreeView.Resources>
+                        <HierarchicalDataTemplate DataType="{x:Type browser:NavigationNode}" ItemsSource="{Binding Children}" xmlns:browser="clr-namespace:Deviant.Browser;assembly=Deviant.Browser">
+                            <DockPanel LastChildFill="True">
+                                <TextBlock DockPanel.Dock="Right" Text="{Binding Count, StringFormat={}{0:N0}}" Opacity="0.7" Margin="8,0,0,0" />
+                                <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis" />
+                            </DockPanel>
+                        </HierarchicalDataTemplate>
+                    </TreeView.Resources>
+                </TreeView>
+            </GroupBox>
+            <GridSplitter Grid.Row="0" Grid.Column="1" Width="5" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+
+            <GroupBox Grid.Row="0" Grid.Column="2" Header="Resources" Padding="4">
+                <DockPanel>
+                    <WrapPanel DockPanel.Dock="Top" Margin="4,2,4,7" VerticalAlignment="Center">
+                        <Button Content="Select page" Click="SelectPage_Click" />
+                        <Button Content="Clear selection" Click="ClearSelection_Click" />
+                        <TextBlock Text="{Binding SelectionText}" VerticalAlignment="Center" Margin="8,0,8,0" />
+                        <Button Content="Export selected" Click="ExportSelected_Click" IsEnabled="{Binding CanExportSelected}" />
+                        <Button Content="Export all matching" Click="ExportMatching_Click" IsEnabled="{Binding CanExport}" />
+                        <Button Content="Inspect" Click="Inspect_Click" IsEnabled="{Binding CanInspect}"/>
+                    </WrapPanel>
+                    <ListView x:Name="ResourceGrid" ItemsSource="{Binding Rows}" SelectionMode="Extended"
+                              VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                              ScrollViewer.CanContentScroll="True" Background="{DynamicResource SurfaceBackground}"
+                              Foreground="{DynamicResource WindowForeground}" BorderBrush="{DynamicResource GridLineBrush}"
+                              SelectionChanged="ResourceGrid_SelectionChanged" GotKeyboardFocus="ResourceList_GotKeyboardFocus"
+                              PreviewKeyDown="ResourceGrid_PreviewKeyDown">
+                        <ListView.View>
+                            <GridView AllowsColumnReorder="False">
+                                <GridViewColumn Header="" Width="38">
+                                    <GridViewColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                                      HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                        </DataTemplate>
+                                    </GridViewColumn.CellTemplate>
+                                </GridViewColumn>
+                                <GridViewColumn Header="Ordinal" DisplayMemberBinding="{Binding Ordinal}" Width="72" />
+                                <GridViewColumn Header="ID" DisplayMemberBinding="{Binding Id}" Width="170" />
+                                <GridViewColumn Header="Type" DisplayMemberBinding="{Binding Type}" Width="170" />
+                                <GridViewColumn Header="Package" DisplayMemberBinding="{Binding Package}" Width="64" />
+                                <GridViewColumn Header="Stored bytes" DisplayMemberBinding="{Binding StoredSize}" Width="110" />
+                                <GridViewColumn Header="Validity" DisplayMemberBinding="{Binding Validity}" Width="110" />
+                            </GridView>
+                        </ListView.View>
+                    </ListView>
+                </DockPanel>
+            </GroupBox>
+            <GridSplitter Grid.Row="0" Grid.Column="3" Width="5" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+
+            <GroupBox Grid.Row="0" Grid.Column="4" Header="Details" Padding="12">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel DataContext="{Binding Details}">
+                        <TextBlock Text="Ordinal" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Ordinal}" Margin="0,1,0,9" />
+                        <TextBlock Text="ID" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Id}" Margin="0,1,0,9" />
+                        <TextBlock Text="Type" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Type}" Margin="0,1,0,9" />
+                        <TextBlock Text="Flags" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Flags}" Margin="0,1,0,9" />
+                        <TextBlock Text="Package and volume" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding PackageVolume}" Margin="0,1,0,9" TextWrapping="Wrap" />
+                        <TextBlock Text="Offset" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Offset}" Margin="0,1,0,9" TextWrapping="Wrap" />
+                        <TextBlock Text="Stored size" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding StoredSize}" Margin="0,1,0,9" />
+                        <TextBlock Text="Alternative size" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding AlternativeSize}" Margin="0,1,0,9" />
+                        <TextBlock Text="Validity" FontWeight="SemiBold" />
+                        <TextBlock Text="{Binding Validity}" Margin="0,1,0,9" />
+                        <TextBlock Text="{Binding Diagnostic}" Margin="0,1,0,9" TextWrapping="Wrap" />
+                        <Expander Header="Source" Margin="0,8,0,0">
+                            <StackPanel Margin="0,8,0,0">
+                                <TextBlock Text="Index" FontWeight="SemiBold" />
+                                <TextBlock Text="{Binding IndexName}" Margin="0,1,0,9" TextWrapping="Wrap" />
+                                <TextBlock Text="SHA-256" FontWeight="SemiBold" />
+                                <TextBlock Text="{Binding IndexContentId}" Margin="0,1,0,9" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" />
+                                <TextBlock Text="Stamp" FontWeight="SemiBold" />
+                                <TextBlock Text="{Binding PhysicalSourceStamp}" Margin="0,1,0,9" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" />
+                            </StackPanel>
+                        </Expander>
+                    </StackPanel>
+                </ScrollViewer>
+            </GroupBox>
+
+            <DockPanel Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="5" Margin="0,8,0,0">
+                <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="Rows per page" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <ComboBox x:Name="PageSizeComboBox" Width="82" ItemsSource="{Binding PageSizes}" SelectionChanged="PageSize_SelectionChanged" />
+                    <Button Content="Previous" Click="PreviousPage_Click" IsEnabled="{Binding CanPreviousPage}" />
+                    <TextBlock Text="{Binding PageText}" VerticalAlignment="Center" Margin="8,0" />
+                    <Button Content="Next" Click="NextPage_Click" IsEnabled="{Binding CanNextPage}" />
+                </StackPanel>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <TextBlock Text="Page" VerticalAlignment="Center" Margin="0,0,4,0" />
+                    <TextBox x:Name="GoToPageTextBox" Width="58" Text="1" />
+                    <Button Content="Go" Click="GoToPage_Click" />
+                </StackPanel>
+            </DockPanel>
+        </Grid>
+    </DockPanel>
+</Window>

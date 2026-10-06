@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Deviant.Formats.Models/Deviant.Formats.Models.csproj" />
+    <ProjectReference Include="../Deviant.Export/Deviant.Export.csproj" />
+    <PackageReference Include="SharpGLTF.Core" Version="1.0.7" />
+    <PackageReference Include="SharpGLTF.Toolkit" Version="1.0.7" />
+  </ItemGroup>
+</Project>

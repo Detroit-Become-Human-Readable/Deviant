@@ -1,0 +1,39 @@
+<UserControl x:Class="Deviant.Desktop.StringsView" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Foreground="{DynamicResource WindowForeground}">
+ <DockPanel>
+  <StackPanel DockPanel.Dock="Top" Margin="0,0,0,8"><WrapPanel>
+   <TextBox x:Name="Search" Width="240" ToolTip="Search keys and text" TextChanged="FiltersChanged"/>
+   <ComboBox x:Name="Languages" Width="100" Margin="8,0" SelectionChanged="FiltersChanged"/>
+   <ComboBox x:Name="Sources" Width="200" SelectionChanged="FiltersChanged"><ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" ToolTip="{Binding Label}"/></DataTemplate></ComboBox.ItemTemplate></ComboBox>
+   <ComboBox x:Name="Kinds" Width="110" Margin="8,0" SelectionChanged="FiltersChanged"/>
+   <ComboBox x:Name="Statuses" Width="110" Margin="0,0,8,0" SelectionChanged="FiltersChanged"/>
+  </WrapPanel><WrapPanel Margin="0,6,0,0"><TextBlock Text="Sort" VerticalAlignment="Center" Margin="0,0,6,0"/><ComboBox x:Name="SortBox" DisplayMemberPath="Label" Width="100" SelectionChanged="FiltersChanged"/><CheckBox x:Name="Descending" Content="Descending" VerticalAlignment="Center" Margin="8,0" Checked="FiltersChanged" Unchecked="FiltersChanged"/>
+   <Button x:Name="ExportSelected" Content="Export selected" Click="ExportSelected_Click" IsEnabled="False"/><Button x:Name="ExportMatches" Content="Export matches" Click="ExportMatches_Click" IsEnabled="False"/>
+  </WrapPanel></StackPanel>
+  <Grid DockPanel.Dock="Bottom" Margin="0,8,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+   <TextBlock x:Name="Status" Text="Ready" TextTrimming="CharacterEllipsis"/>
+   <StackPanel Grid.Column="1" Orientation="Horizontal"><TextBlock x:Name="Page" VerticalAlignment="Center"/><Button Content="Previous" Click="Previous_Click"/><Button Content="Next" Click="Next_Click"/><Button Content="Cancel" Click="Cancel_Click"/></StackPanel>
+  </Grid>
+  <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="3*"/><ColumnDefinition Width="8"/><ColumnDefinition Width="2*"/></Grid.ColumnDefinitions>
+   <DataGrid x:Name="Rows" IsReadOnly="True" AutoGenerateColumns="False" SelectionMode="Extended" SelectionUnit="FullRow" EnableRowVirtualization="True" EnableColumnVirtualization="True" SelectionChanged="SelectionChanged" CanUserSortColumns="False">
+    <DataGrid.Columns><DataGridTextColumn Header="Key" Binding="{Binding Key}" Width="1.4*"/><DataGridTextColumn Header="Language" Binding="{Binding Language}" Width="70"/><DataGridTextColumn Header="Text" Binding="{Binding Text}" Width="2*"/><DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="90"/></DataGrid.Columns>
+   </DataGrid>
+   <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Stretch"/>
+   <Grid Grid.Column="2"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="2*"/><RowDefinition Height="Auto"/><RowDefinition Height="3*"/></Grid.RowDefinitions>
+    <TextBlock x:Name="SelectedKey" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,8"/>
+    <TextBox x:Name="FullText" Grid.Row="1" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+    <TextBlock x:Name="PlaceholderSummary" Grid.Row="2" TextWrapping="Wrap" Margin="0,8,0,2"/>
+    <TabControl Grid.Row="3" Margin="0,8,0,0">
+     <TabItem Header="Occurrences"><Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions><TextBlock x:Name="OccurrenceSummary" Text="Language occurrences" Margin="0,0,0,4"/>
+      <ListView x:Name="Variants" Grid.Row="1"><ListView.View><GridView><GridViewColumn Header="Language" DisplayMemberBinding="{Binding Language}" Width="65"/><GridViewColumn Header="Text" DisplayMemberBinding="{Binding Text}" Width="240"/></GridView></ListView.View></ListView>
+      <TextBlock Grid.Row="2" Text="Other occurrences" Margin="0,10,0,4"/>
+      <ListView x:Name="OtherOccurrences" Grid.Row="3"><ListView.View><GridView><GridViewColumn Header="Source" DisplayMemberBinding="{Binding Source}" Width="150"/><GridViewColumn Header="Language" DisplayMemberBinding="{Binding Language}" Width="65"/><GridViewColumn Header="Text" DisplayMemberBinding="{Binding Text}" Width="220"/></GridView></ListView.View></ListView>
+     </Grid></TabItem>
+     <TabItem Header="Related"><DockPanel><TextBlock x:Name="RelatedStatus" DockPanel.Dock="Top" Margin="0,0,0,8" TextWrapping="Wrap"/><Button x:Name="OpenRelated" Content="Open" DockPanel.Dock="Bottom" HorizontalAlignment="Left" Click="OpenRelated_Click" IsEnabled="False"/>
+      <ListBox x:Name="RelatedResources" DisplayMemberPath="Label" SelectionChanged="RelatedSelectionChanged" MouseDoubleClick="Related_DoubleClick"/>
+     </DockPanel></TabItem>
+     <TabItem Header="Advanced"><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel><TextBlock x:Name="Advanced" FontFamily="Consolas" FontSize="11" TextWrapping="Wrap"/><TextBlock x:Name="RelatedEvidence" FontFamily="Consolas" FontSize="11" TextWrapping="Wrap" Margin="0,10,0,0"/></StackPanel></ScrollViewer></TabItem>
+    </TabControl>
+   </Grid>
+  </Grid>
+ </DockPanel>
+</UserControl>

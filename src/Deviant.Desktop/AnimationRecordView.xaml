@@ -1,0 +1,23 @@
+<UserControl x:Class="Deviant.Desktop.AnimationRecordView" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Foreground="{DynamicResource WindowForeground}">
+ <Grid Margin="16">
+  <Grid.ColumnDefinitions><ColumnDefinition Width="270"/><ColumnDefinition Width="12"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+  <DockPanel>
+   <StackPanel DockPanel.Dock="Top"><TextBlock Text="Animations" FontSize="20" FontWeight="SemiBold"/><TextBox x:Name="Search" Margin="0,12,0,8" TextChanged="SearchChanged" AutomationProperties.Name="Search animations"/></StackPanel>
+   <StackPanel DockPanel.Dock="Bottom" Margin="0,10,0,0"><TextBlock x:Name="Page" Margin="0,0,0,6"/><WrapPanel><Button x:Name="Previous" Content="Previous" Click="Previous_Click"/><Button x:Name="Next" Content="Next" Click="Next_Click"/></WrapPanel></StackPanel>
+   <ListBox x:Name="Rows" DisplayMemberPath="Label" SelectionChanged="SelectionChanged" ScrollViewer.CanContentScroll="True" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"/>
+  </DockPanel>
+  <DockPanel Grid.Column="2">
+   <StackPanel DockPanel.Dock="Top"><TextBlock x:Name="SelectedName" Text="Select an animation" FontSize="20" FontWeight="SemiBold"/><WrapPanel Margin="0,12,0,12"><Button x:Name="ExportOriginal" Content="Export original" Click="ExportOriginal_Click" IsEnabled="False"/><Button x:Name="ExportJson" Content="Export JSON" Click="ExportJson_Click" IsEnabled="False"/><CheckBox x:Name="TablesToggle" Content="Tables" IsEnabled="False" Margin="12,0" VerticalAlignment="Center" Checked="TablesToggleChanged" Unchecked="TablesToggleChanged"/><Button Content="Cancel" Click="Cancel_Click"/></WrapPanel></StackPanel>
+   <TextBlock x:Name="Status" DockPanel.Dock="Bottom" Margin="0,10,0,0" TextWrapping="Wrap"/>
+   <Expander Header="Advanced" DockPanel.Dock="Bottom" Margin="0,10,0,0"><TextBox x:Name="Advanced" IsReadOnly="True" FontFamily="Consolas" TextWrapping="NoWrap" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" MaxHeight="240"/></Expander>
+   <TabControl x:Name="InspectorTabs">
+    <TabItem Header="Records"><DataGrid x:Name="Sections" Width="{Binding ActualWidth, ElementName=InspectorTabs}" IsReadOnly="True" AutoGenerateColumns="False" CanUserAddRows="False" ScrollViewer.HorizontalScrollBarVisibility="Disabled"><DataGrid.Columns><DataGridTextColumn Header="Record" Binding="{Binding Tag}" Width="2*"/><DataGridTextColumn Header="Version" Binding="{Binding Version}" Width="*"/><DataGridTextColumn Header="Bytes" Binding="{Binding BodyLength, StringFormat=N0}" Width="*"/></DataGrid.Columns></DataGrid></TabItem>
+    <TabItem Header="Header words"><DataGrid x:Name="Words" Width="{Binding ActualWidth, ElementName=InspectorTabs}" IsReadOnly="True" AutoGenerateColumns="False" CanUserAddRows="False" ScrollViewer.HorizontalScrollBarVisibility="Disabled"><DataGrid.Columns><DataGridTextColumn Header="Word" Binding="{Binding Word}" Width="*"/><DataGridTextColumn Header="Hex" Binding="{Binding Hex}" Width="2*"/></DataGrid.Columns></DataGrid></TabItem>
+    <TabItem x:Name="TableTab" Header="Tables" Visibility="Collapsed"><DockPanel>
+     <WrapPanel DockPanel.Dock="Top" Margin="0,0,0,8"><ComboBox x:Name="TableSelect" Width="180" DisplayMemberPath="Label" SelectionChanged="TableChanged" AutomationProperties.Name="Animation table"/><TextBlock x:Name="TablePage" VerticalAlignment="Center" Margin="12,0"/><Button x:Name="TablePrevious" Content="Previous" Click="TablePrevious_Click" IsEnabled="False"/><Button x:Name="TableNext" Content="Next" Click="TableNext_Click" IsEnabled="False"/></WrapPanel>
+     <DataGrid x:Name="TableRows" Width="{Binding ActualWidth, ElementName=InspectorTabs}" ScrollViewer.HorizontalScrollBarVisibility="Disabled" IsReadOnly="True" AutoGenerateColumns="False" CanUserAddRows="False" CanUserSortColumns="False" SelectionMode="Single" SelectionChanged="TableRowChanged" EnableRowVirtualization="True"><DataGrid.Columns><DataGridTextColumn Header="Row" Binding="{Binding Number}" Width="*"/><DataGridTextColumn Header="Fields" Binding="{Binding FieldCount}" Width="*"/></DataGrid.Columns></DataGrid>
+    </DockPanel></TabItem>
+   </TabControl>
+  </DockPanel>
+ </Grid>
+</UserControl>

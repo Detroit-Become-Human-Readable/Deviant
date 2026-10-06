@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup><ItemGroup><ProjectReference Include="../../src/Deviant.Formats.Containers/Deviant.Formats.Containers.csproj"/><ProjectReference Include="../../src/Deviant.Archives/Deviant.Archives.csproj"/></ItemGroup></Project>

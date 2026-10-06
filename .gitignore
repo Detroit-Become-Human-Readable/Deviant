@@ -1,0 +1,15 @@
+bin/
+obj/
+artifacts/
+.local/
+TestResults/
+.vs/
+*.user
+*.db
+*.db-wal
+*.db-shm
+
+
+#Ignore vscode AI rules
+.reverse-engineering-assistant.ini
+.github/instructions/codacy.instructions.md

@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Deviant.Archives/Deviant.Archives.csproj" />
+    <ProjectReference Include="../Deviant.Catalog/Deviant.Catalog.csproj" />
+    <ProjectReference Include="../Deviant.Export/Deviant.Export.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Deviant.Formats.Containers/Deviant.Formats.Containers.csproj" />
+    <ProjectReference Include="../../src/Deviant.Formats.Models/Deviant.Formats.Models.csproj" />
+    <ProjectReference Include="../../src/Deviant.Archives/Deviant.Archives.csproj" />
+
+  </ItemGroup>
+</Project>

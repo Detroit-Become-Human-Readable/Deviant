@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup><ProjectReference Include="../Deviant.Core/Deviant.Core.csproj" /></ItemGroup>
+  <ItemGroup><ProjectReference Include="../Deviant.Assets/Deviant.Assets.csproj" /></ItemGroup>
+</Project>

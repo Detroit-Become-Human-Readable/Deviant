@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>Deviant</AssemblyName>
+    <RootNamespace>Deviant.Desktop</RootNamespace>
+    <UseWPF>true</UseWPF>
+    <ApplicationIcon>Assets/app-icon.ico</ApplicationIcon>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <GenerateDesktopArtifacts Condition="'$(GenerateDesktopArtifacts)' == ''">true</GenerateDesktopArtifacts>
+    <Description>Designed by CyberLife, disassembled by Deviants.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Deviant.Assets/Deviant.Assets.csproj" />
+    <ProjectReference Include="../Deviant.Audio/Deviant.Audio.csproj" />
+    <ProjectReference Include="../Deviant.Browser/Deviant.Browser.csproj" />
+    <ProjectReference Include="../Deviant.Catalog/Deviant.Catalog.csproj" />
+    <ProjectReference Include="../Deviant.Export.Audio/Deviant.Export.Audio.csproj" />
+    <ProjectReference Include="../Deviant.Formats.Audio/Deviant.Formats.Audio.csproj" />
+    <ProjectReference Include="../Deviant.Formats.Animation/Deviant.Formats.Animation.csproj" />
+    <ProjectReference Include="../Deviant.Export.Animation/Deviant.Export.Animation.csproj" />
+    <ProjectReference Include="../Deviant.Formats.Scenes/Deviant.Formats.Scenes.csproj" />
+    <ProjectReference Include="../Deviant.Graphs/Deviant.Graphs.csproj" />
+    <ProjectReference Include="../Deviant.Formats.Textures/Deviant.Formats.Textures.csproj" />
+    <ProjectReference Include="../Deviant.Export.Textures/Deviant.Export.Textures.csproj" />
+    <ProjectReference Include="../Deviant.Formats.Containers/Deviant.Formats.Containers.csproj" />
+    <ProjectReference Include="../Deviant.Formats.Shaders/Deviant.Formats.Shaders.csproj" />
+  </ItemGroup>
+  <ItemGroup><PackageReference Include="NAudio" Version="2.2.1" /></ItemGroup>
+  <ItemGroup><PackageReference Include="HelixToolkit.Wpf.SharpDX" Version="3.1.2" /></ItemGroup>
+  <ItemGroup><Resource Include="Assets/app-icon.png" /></ItemGroup>
+  <ItemGroup><Resource Include="Assets/processing.gif" /></ItemGroup>
+  <ItemGroup><EmbeddedResource Include="Rendering/*.hlsl" /></ItemGroup>
+  <ItemGroup Condition="'$(GenerateDesktopArtifacts)' == 'true'">
+    <UpToDateCheckOutput Include="$(MSBuildProjectDirectory)/../../artifacts/Deviant/Deviant.exe" />
+    <UpToDateCheckOutput Include="$(MSBuildProjectDirectory)/../../artifacts/Deviant-win-x64.zip" />
+    <UpToDateCheckOutput Include="$(MSBuildProjectDirectory)/../../artifacts/Deviant-source.zip" />
+  </ItemGroup>
+  <Target Name="PublishDesktopArtifacts" AfterTargets="Build" Condition="'$(GenerateDesktopArtifacts)' == 'true' and '$(DesignTimeBuild)' != 'true' and '$(_IsPublishing)' != 'true' and '$(OS)' == 'Windows_NT'">
+    <Exec Command="powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../../scripts/Publish-Desktop.ps1&quot; -Configuration &quot;$(Configuration)&quot;" />
+  </Target>
+</Project>

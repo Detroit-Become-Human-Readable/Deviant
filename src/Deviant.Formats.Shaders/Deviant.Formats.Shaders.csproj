@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="../Deviant.Assets/Deviant.Assets.csproj"/><ProjectReference Include="../Deviant.Formats.Containers/Deviant.Formats.Containers.csproj"/><ProjectReference Include="../Deviant.Formats.Textures/Deviant.Formats.Textures.csproj"/></ItemGroup></Project>

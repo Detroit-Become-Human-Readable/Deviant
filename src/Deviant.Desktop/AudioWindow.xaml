@@ -1,0 +1,193 @@
+<Window x:Class="Deviant.Desktop.AudioWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:Deviant.Desktop"
+        Title="Deviant" Icon="Assets/app-icon.png" Width="1600" Height="900"
+        MinWidth="1280" MinHeight="660" WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" FontSize="13"
+        UseLayoutRounding="True" TextOptions.TextFormattingMode="Display"
+        Background="{DynamicResource WindowBackground}" Foreground="{DynamicResource WindowForeground}"
+        Closing="Window_Closing" PreviewKeyDown="Window_PreviewKeyDown">
+    <Window.Resources>
+        <local:AudioMetadataTextConverter x:Key="AudioMetadataText"/>
+        <Style TargetType="GroupBox">
+            <Setter Property="Foreground" Value="{DynamicResource WindowForeground}"/>
+            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="GroupBox">
+                <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                    <TextBlock Text="{TemplateBinding Header}" Margin="8,0,0,5" FontWeight="SemiBold"/>
+                    <Border Grid.Row="1" BorderBrush="{DynamicResource ControlBorder}" BorderThickness="1" CornerRadius="4" Padding="{TemplateBinding Padding}"><ContentPresenter/></Border>
+                </Grid>
+            </ControlTemplate></Setter.Value></Setter>
+        </Style>
+    </Window.Resources>
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Padding="10,8" BorderBrush="{DynamicResource ControlBorder}" BorderThickness="0,0,0,1">
+            <DockPanel>
+                <StackPanel Orientation="Horizontal" DockPanel.Dock="Left">
+                    <Button Content="Home" Click="Home_Click" />
+                    <Button x:Name="OpenButton" Content="Open archive" Click="Open_Click" />
+                    <Button x:Name="RefreshButton" Content="Refresh" Click="Refresh_Click" />
+                    <TextBlock x:Name="SourceLabel" VerticalAlignment="Center" Margin="10,0,0,0" Text="Home" />
+                    <Button x:Name="BookmarkButton" Content="Bookmark" Click="Bookmark_Click" IsEnabled="False" Margin="12,0,0,0" />
+                    <Button x:Name="SaveFilterButton" Content="Save filter" Click="SaveFilter_Click" IsEnabled="False" />
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <StackPanel x:Name="StringsPlayerSummary" Visibility="Collapsed" Orientation="Horizontal" VerticalAlignment="Center"><TextBlock x:Name="StringsPlayingLabel" Margin="6,0"/><Button Content="Pause" Click="Pause_Click"/><Button Content="Stop" Click="Stop_Click"/></StackPanel>
+                    <Button Content="Cache" Click="Cache_Click" />
+                    <Button Content="Advanced" Click="Advanced_Click" />
+                </StackPanel>
+            </DockPanel>
+        </Border>
+        <Border x:Name="ApplicationStatusBar" DockPanel.Dock="Bottom" Padding="10,6" MinHeight="44" BorderBrush="{DynamicResource ControlBorder}" BorderThickness="0,1,0,0">
+            <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                <StackPanel x:Name="AudioStatusPanel" Grid.Column="0" Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center">
+                    <TextBlock x:Name="PageText" VerticalAlignment="Center" Margin="4" />
+                    <Button x:Name="AudioPrevious" Content="Previous" Click="Previous_Click" IsEnabled="False" />
+                    <Button x:Name="AudioNext" Content="Next" Click="Next_Click" IsEnabled="False" />
+                    <Button Content="Cancel job" Click="Cancel_Click" />
+                </StackPanel>
+                <TextBlock x:Name="PrereleaseNotice" Grid.Column="1" Text="This is a pre-release. It's not finished. There's going to be a lot of bugs."
+                           MaxWidth="450" Margin="10,0" FontSize="11" Opacity="0.7" TextWrapping="Wrap" TextAlignment="Center" VerticalAlignment="Center" />
+                <Grid Grid.Column="2" MaxWidth="380" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <local:ProcessingAnimation x:Name="WindowProcessing" Grid.Column="0" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <TextBlock x:Name="StatusText" Grid.Column="1" Text="Ready" TextTrimming="CharacterEllipsis" TextAlignment="Right" VerticalAlignment="Center" Margin="0,0,8,0" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+                    <ProgressBar x:Name="ProgressBar" Grid.Column="2" Width="110" Height="10" Maximum="100" IsIndeterminate="True" Visibility="Collapsed" VerticalAlignment="Center" />
+                </Grid>
+            </Grid>
+        </Border>
+        <Border DockPanel.Dock="Left" Width="190" Padding="10,12,8,8" BorderBrush="{DynamicResource ControlBorder}" BorderThickness="0,0,1,0">
+            <DockPanel><TextBlock DockPanel.Dock="Top" Text="Explorer" FontWeight="SemiBold" Margin="5,0,0,8"/>
+                <TextBlock x:Name="ExplorerStatus" DockPanel.Dock="Bottom" Text="Open a workspace" TextWrapping="Wrap" FontSize="12" Margin="5,8"/>
+                <TreeView x:Name="ExplorerTree" SelectedItemChanged="Explorer_SelectedItemChanged">
+                    <TreeView.ItemTemplate><HierarchicalDataTemplate ItemsSource="{Binding Children}"><TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Label}"/></HierarchicalDataTemplate></TreeView.ItemTemplate>
+                </TreeView>
+            </DockPanel>
+        </Border>
+        <Grid>
+        <Grid x:Name="HomeHost" Margin="24">
+            <StackPanel MaxWidth="640" HorizontalAlignment="Center" VerticalAlignment="Center">
+                <Grid Height="140" Margin="0,0,0,18">
+                    <Image x:Name="HomeLogo" Source="Assets/app-icon.png" Width="96" Height="96" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    <local:ProcessingAnimation x:Name="HomeProcessing" Width="128" Height="128" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Grid>
+                <TextBlock x:Name="HomeTitle" Text="Deviant" FontSize="32" FontWeight="SemiBold" HorizontalAlignment="Center"/>
+                <TextBlock x:Name="HomeQuestion" Text="What do you want to open?" FontSize="17" HorizontalAlignment="Center" Margin="0,8,0,20" Visibility="Collapsed"/>
+                <StackPanel x:Name="HomeSetupActions" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,20,0,4">
+                    <Button Content="Choose installation" Click="Installation_Click" Padding="18,10"/>
+                    <Button Content="Open archive" Click="Open_Click" Padding="18,10"/>
+                </StackPanel>
+                <StackPanel x:Name="HomeIndexingState" Visibility="Collapsed" Margin="0,14,0,0">
+                    <TextBlock Text="Indexing game files…" FontSize="18" HorizontalAlignment="Center"/>
+                    <TextBlock x:Name="HomeIndexingDetail" HorizontalAlignment="Center" Margin="0,8,0,0" Opacity="0.75"/>
+                    <Button Content="Cancel indexing" Click="Cancel_Click" HorizontalAlignment="Center" Margin="0,14,0,0"/>
+                </StackPanel>
+                <WrapPanel x:Name="HomeLaunchers" MaxWidth="540" HorizontalAlignment="Center" Visibility="Collapsed">
+                    <Button x:Name="HomeAudioButton" Content="Audio" Tag="audio" Click="HomeView_Click" Width="164" Height="44" Margin="6"/>
+                    <Button x:Name="HomeStringsButton" Content="Strings" Tag="strings" Click="HomeView_Click" Width="164" Height="44" Margin="6"/>
+                    <Button x:Name="HomeTexturesButton" Content="Textures" Tag="textures" Click="HomeView_Click" Width="164" Height="44" Margin="6"/>
+                    <Button x:Name="HomeScenesButton" Content="Scenes" Tag="scenes" Click="HomeView_Click" Width="164" Height="44" Margin="6"/>
+                    <Button Content="DDS images" Click="OpenDds_Click" Width="164" Height="44" Margin="6"/>
+                    <Button x:Name="HomeAnimationButton" Content="Animations" Tag="animation" Click="HomeView_Click" Width="164" Height="44" Margin="6"/>
+                    <Button x:Name="HomeShadersButton" Content="Shader sources" Tag="shader-picker" Click="HomeView_Click" Width="164" Height="44" Margin="6"/>
+                    <Button Content="Archive browser" Click="Advanced_Click" Width="164" Height="44" Margin="6"/>
+                </WrapPanel>
+                <TextBlock x:Name="HomePrereleaseNotice" Text="This is an early pre-release. Expect bugs, missing content, and features that may break or not work yet."
+                           MaxWidth="540" TextAlignment="Center" TextWrapping="Wrap" Margin="0,26,0,0" Opacity="0.7"/>
+                <TextBlock x:Name="HomeStatus" TextAlignment="Center" TextWrapping="Wrap" Margin="0,12,0,0"/>
+            </StackPanel>
+        </Grid>
+        <Grid x:Name="LibraryHost" Visibility="Collapsed" Margin="18"><DockPanel>
+            <StackPanel DockPanel.Dock="Top"><TextBlock x:Name="LibraryTitle" FontSize="24" FontWeight="SemiBold"/><StackPanel Orientation="Horizontal" Margin="0,12,0,12"><Button Content="Open" Click="LibraryOpen_Click"/><Button Content="New collection" Click="NewCollection_Click"/><Button Content="Add to collection" Click="AddToCollection_Click"/><Button Content="Remove" Click="LibraryRemove_Click"/></StackPanel><TextBlock x:Name="LibraryEmpty" Margin="0,0,0,10"/></StackPanel>
+            <ListView x:Name="LibraryList" SelectionMode="Extended" MouseDoubleClick="Library_DoubleClick"><ListView.View><GridView><GridViewColumn Header="Name" DisplayMemberBinding="{Binding Label}" Width="360"/><GridViewColumn Header="View" DisplayMemberBinding="{Binding View}" Width="120"/><GridViewColumn Header="Workspace" DisplayMemberBinding="{Binding Workspace}" Width="250"/><GridViewColumn Header="Status" DisplayMemberBinding="{Binding Status}" Width="180"/></GridView></ListView.View></ListView>
+        </DockPanel></Grid>
+        <Grid Margin="10" x:Name="ContentHost" Visibility="Collapsed"><Grid x:Name="AudioLayout">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="245"/><ColumnDefinition Width="6"/><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="300"/></Grid.ColumnDefinitions>
+            <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto">
+                <StackPanel>
+                    <GroupBox Header="Browse" Padding="8" Margin="0,0,0,8">
+                        <StackPanel>
+                            <TextBox x:Name="SearchBox" ToolTip="Search names and aliases" TextChanged="FilterChanged" />
+                            <TextBlock Text="Bank" Margin="0,8,0,2"/><ComboBox x:Name="BankBox" SelectionChanged="FilterChanged"><ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate></ComboBox>
+                            <TextBlock Text="Language" Margin="0,8,0,2"/><ComboBox x:Name="LanguageBox" SelectionChanged="FilterChanged" />
+                            <TextBlock Text="Codec" Margin="0,8,0,2"/><ComboBox x:Name="CodecBox" SelectionChanged="FilterChanged" />
+                            <TextBlock Text="Channels" Margin="0,8,0,2"/><ComboBox x:Name="ChannelsBox" SelectionChanged="FilterChanged" />
+                            <TextBlock Text="Availability" Margin="0,8,0,2"/><ComboBox x:Name="AvailabilityBox" SelectionChanged="FilterChanged" />
+                            <Expander Header="Advanced filters" Margin="0,8,0,0"><StackPanel><TextBlock Text="Media type" Margin="0,4,0,2"/><ComboBox x:Name="CompletenessBox" SelectionChanged="FilterChanged" /></StackPanel></Expander>
+                            <TextBlock Text="Duration (seconds)" Margin="0,8,0,2"/>
+                            <StackPanel Orientation="Horizontal"><TextBox x:Name="MinimumDurationBox" Width="90" TextChanged="FilterChanged"/><TextBlock Text="to" VerticalAlignment="Center" Margin="6,0"/><TextBox x:Name="MaximumDurationBox" Width="90" TextChanged="FilterChanged"/></StackPanel>
+                            <TextBlock Text="Sort" Margin="0,8,0,2"/><ComboBox x:Name="AudioSortBox" DisplayMemberPath="Label" SelectionChanged="FilterChanged"/>
+                            <CheckBox x:Name="AudioDescending" Content="Descending" Margin="0,6,0,0" Checked="FilterChanged" Unchecked="FilterChanged"/>
+                            <Button Content="Reset filters" Click="ResetFilters_Click" HorizontalAlignment="Left" Margin="0,8,0,0" />
+                        </StackPanel>
+                    </GroupBox>
+                    <GroupBox Header="Selection" Padding="8">
+                        <StackPanel>
+                            <TextBlock x:Name="SelectionText" Text="0 selected" />
+                            <TextBlock x:Name="SelectionBadge" TextWrapping="Wrap" Margin="0,4,0,4" Visibility="Collapsed" />
+                            <Button x:Name="ExportSelectedButton" Content="Export selected" Click="ExportSelected_Click" />
+                            <Button x:Name="ExportMatchesButton" Content="Export all matches" Click="ExportMatches_Click" />
+                            <Button Content="View results" Click="Results_Click" />
+                        </StackPanel>
+                    </GroupBox>
+                </StackPanel>
+            </ScrollViewer>
+            <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch" />
+            <Grid Grid.Column="2" Margin="8,0">
+                <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <ListView x:Name="MediaList" SelectionMode="Extended" SelectionChanged="MediaList_SelectionChanged" SizeChanged="MediaList_SizeChanged">
+                    <ListView.View>
+                        <GridView>
+                            <GridViewColumn Header="Name" Width="200"><GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Label}" ToolTip="{Binding Label}" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate></GridViewColumn>
+                            <GridViewColumn Header="Bank" Width="115"><GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Bank}" ToolTip="{Binding Bank}" TextTrimming="CharacterEllipsis"/></DataTemplate></GridViewColumn.CellTemplate></GridViewColumn>
+                            <GridViewColumn Header="Language" DisplayMemberBinding="{Binding Media.Language}" Width="70"/>
+                            <GridViewColumn Header="Codec" DisplayMemberBinding="{Binding Media.Codec, Converter={StaticResource AudioMetadataText}}" Width="75"/>
+                            <GridViewColumn Header="Duration" DisplayMemberBinding="{Binding Media.DurationText}" Width="65"/>
+                            <GridViewColumn Header="Ch" DisplayMemberBinding="{Binding Media.Channels, Converter={StaticResource AudioMetadataText}}" Width="35"/>
+
+                        </GridView>
+                    </ListView.View>
+                </ListView>
+                <Border x:Name="PlayerPanel" Grid.Row="1" Margin="0,8,0,0" Padding="8" BorderBrush="{DynamicResource ControlBorder}" BorderThickness="1" CornerRadius="4">
+                    <Grid>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" Orientation="Horizontal">
+                            <Button x:Name="PlayButton" Content="Play" Click="Play_Click" />
+                            <Button x:Name="PartialButton" Content="Partial preview" Click="Partial_Click" />
+                            <Button x:Name="PauseButton" Content="Pause" Click="Pause_Click" />
+                            <Button Content="Stop" Click="Stop_Click" />
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Margin="6,0" VerticalAlignment="Center"><TextBlock x:Name="PlayingLabel" TextTrimming="CharacterEllipsis" /><TextBlock x:Name="ActionBadge" /></StackPanel>
+                        <ComboBox x:Name="DeviceBox" Grid.Column="2" Grid.ColumnSpan="2" Width="220" HorizontalAlignment="Right" VerticalAlignment="Center" SelectionChanged="Device_SelectionChanged"><ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" /></DataTemplate></ComboBox.ItemTemplate></ComboBox>
+                        <Slider x:Name="SeekSlider" Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="1" Margin="4,8,10,0" VerticalAlignment="Center" ValueChanged="Seek_ValueChanged" />
+                        <TextBlock x:Name="PlayTime" Grid.Row="1" Grid.Column="2" Text="0:00" VerticalAlignment="Center" Margin="0,8,0,0" />
+                        <Slider x:Name="VolumeSlider" Grid.Row="1" Grid.Column="3" Minimum="0" Maximum="1" Value="0.75" Width="80" Margin="8,8,0,0" VerticalAlignment="Center" ValueChanged="Volume_ValueChanged" />
+                    </Grid>
+                </Border>
+            </Grid>
+            <GridSplitter Grid.Column="3" Width="5" HorizontalAlignment="Stretch" />
+            <ScrollViewer Grid.Column="4" VerticalScrollBarVisibility="Auto" Margin="8,0,0,0">
+                <StackPanel>
+                    <GroupBox Header="Details" Padding="8">
+                        <StackPanel>
+                            <TextBlock x:Name="DetailName" FontSize="16" FontWeight="SemiBold" TextWrapping="Wrap" />
+                            <TextBlock x:Name="DetailMetadata" Margin="0,8,0,0" TextWrapping="Wrap" />
+                            <TextBlock x:Name="DetailDiagnostic" Margin="0,8,0,0" TextWrapping="Wrap" />
+                            <TextBox x:Name="AliasBox" Margin="0,12,0,0" ToolTip="Alias" TextChanged="AliasBox_TextChanged" />
+                            <StackPanel Orientation="Horizontal"><Button Content="Save alias" Click="SaveAlias_Click"/><Button Content="Remove" Click="RemoveAlias_Click"/></StackPanel>
+                            <Button x:Name="ExportBankButton" Content="Export original bank" Click="ExportBank_Click" />
+                            <Button x:Name="ExportPartialButton" Content="Export original fragment" Click="ExportPartial_Click" />
+                            <Expander Header="Advanced" Margin="0,10,0,0"><TextBlock x:Name="AdvancedDetails" FontFamily="Consolas" FontSize="11" TextWrapping="Wrap" /></Expander>
+                        </StackPanel>
+                    </GroupBox>
+                    <GroupBox Header="Related" Padding="8" Margin="0,8,0,0"><StackPanel><TextBlock x:Name="RelatedStatus" Text="Select a clip" FontSize="12"/><ListBox x:Name="RelatedList" MaxHeight="240" MouseDoubleClick="Related_DoubleClick"><ListBox.ItemTemplate><DataTemplate><StackPanel Margin="0,3"><TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis"/><TextBlock Text="{Binding Status}" FontSize="11"/></StackPanel></DataTemplate></ListBox.ItemTemplate></ListBox></StackPanel></GroupBox>
+                    <GroupBox Header="Activity" Padding="8" Margin="0,8,0,0">
+                        <TextBlock x:Name="ActivityText" TextWrapping="Wrap" />
+                    </GroupBox>
+                </StackPanel>
+            </ScrollViewer>
+        </Grid><ContentControl x:Name="StringsHost" Visibility="Collapsed" /><ContentControl x:Name="DdsHost" Visibility="Collapsed" /><ContentControl x:Name="AnimationHost" Visibility="Collapsed"/><ContentControl x:Name="ShaderHost" Visibility="Collapsed"/><ContentControl x:Name="ReferencesHost" Visibility="Collapsed"/><ContentControl x:Name="AssetsHost" Visibility="Collapsed"/><ContentControl x:Name="BufferHost" Visibility="Collapsed"/><ContentControl x:Name="ScenesHost" Visibility="Collapsed"/></Grid>
+        </Grid>
+    </DockPanel>
+</Window>

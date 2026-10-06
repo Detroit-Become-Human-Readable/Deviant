@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Deviant.Formats.Textures/Deviant.Formats.Textures.csproj" />
+    <ProjectReference Include="../Deviant.Export/Deviant.Export.csproj" />
+
+  </ItemGroup>
+</Project>

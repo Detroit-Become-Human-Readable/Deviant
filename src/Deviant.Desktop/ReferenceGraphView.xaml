@@ -1,0 +1,8 @@
+<UserControl x:Class="Deviant.Desktop.ReferenceGraphView" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Foreground="{DynamicResource WindowForeground}">
+ <DockPanel>
+  <DockPanel DockPanel.Dock="Top" Margin="0,0,0,8"><TextBlock x:Name="Status" VerticalAlignment="Center"/><WrapPanel HorizontalAlignment="Right"><Button Content="−" Click="ZoomOut_Click" AutomationProperties.Name="Zoom out"/><Button Content="+" Click="ZoomIn_Click" AutomationProperties.Name="Zoom in"/><Button Content="Fit" Click="Fit_Click"/><Button x:Name="OpenNode" Content="Open" IsEnabled="False" Click="Open_Click"/></WrapPanel></DockPanel>
+  <Border x:Name="Viewport" Background="{DynamicResource SurfaceAlternateBackground}" BorderBrush="{DynamicResource ControlBorder}" BorderThickness="1" ClipToBounds="True" Focusable="True" PreviewMouseWheel="MouseWheelZoom" PreviewMouseDown="PanStart" PreviewMouseMove="PanMove" PreviewMouseUp="PanEnd" LostMouseCapture="PanLost" SizeChanged="ViewportChanged">
+   <Canvas x:Name="GraphCanvas" HorizontalAlignment="Left" VerticalAlignment="Top" RenderTransformOrigin="0,0"><Canvas.RenderTransform><TransformGroup><ScaleTransform x:Name="GraphScale" ScaleX="1" ScaleY="1"/><TranslateTransform x:Name="GraphOffset"/></TransformGroup></Canvas.RenderTransform></Canvas>
+  </Border>
+ </DockPanel>
+</UserControl>

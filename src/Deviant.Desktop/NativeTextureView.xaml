@@ -1,0 +1,6 @@
+<UserControl x:Class="Deviant.Desktop.NativeTextureView" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Foreground="{DynamicResource WindowForeground}">
+ <DockPanel>
+  <WrapPanel DockPanel.Dock="Top" Margin="0,0,0,8"><Button x:Name="ExportPng" Content="Export PNG" IsEnabled="False" Click="ExportPng_Click"/><TextBlock x:Name="Status" VerticalAlignment="Center" Margin="8,0" TextWrapping="Wrap"/></WrapPanel>
+  <ContentControl x:Name="ImageHost"/>
+ </DockPanel>
+</UserControl>

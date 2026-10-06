@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup><ItemGroup>
+<ProjectReference Include="../../src/Deviant.Archives/Deviant.Archives.csproj" />
+<ProjectReference Include="../../src/Deviant.Catalog/Deviant.Catalog.csproj" />
+<ProjectReference Include="../../src/Deviant.Formats.Audio/Deviant.Formats.Audio.csproj" />
+<ProjectReference Include="../../src/Deviant.Audio/Deviant.Audio.csproj" />
+<ProjectReference Include="../../src/Deviant.Browser/Deviant.Browser.csproj" />
+<ProjectReference Include="../../src/Deviant.Export.Audio/Deviant.Export.Audio.csproj" />
+</ItemGroup></Project>

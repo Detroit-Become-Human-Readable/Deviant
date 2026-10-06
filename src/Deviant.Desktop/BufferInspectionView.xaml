@@ -1,0 +1,17 @@
+<UserControl x:Class="Deviant.Desktop.BufferInspectionView" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Foreground="{DynamicResource WindowForeground}">
+ <Grid Margin="16">
+  <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <DockPanel Margin="0,0,0,12"><StackPanel><TextBlock x:Name="SourceName" Text="Select a resource" FontSize="20" FontWeight="SemiBold"/><TextBlock x:Name="Summary" Margin="0,4,0,0"/></StackPanel><WrapPanel HorizontalAlignment="Right"><Button x:Name="ExportOriginal" Content="Original" IsEnabled="False" Click="Original_Click"/><Button x:Name="ExportJson" Content="JSON" IsEnabled="False" Click="Json_Click"/><Button Content="Cancel" Click="Cancel_Click"/></WrapPanel></DockPanel>
+  <Grid Grid.Row="1"><Grid.ColumnDefinitions><ColumnDefinition Width="270"/><ColumnDefinition Width="12"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+   <DockPanel><TextBlock Text="Sections" DockPanel.Dock="Top" FontWeight="SemiBold" Margin="0,0,0,8"/><ListBox x:Name="Sections" SelectionChanged="SectionChanged" DisplayMemberPath="Label" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"/></DockPanel>
+   <DockPanel Grid.Column="2">
+    <TextBlock x:Name="SectionName" Text="Select a section" DockPanel.Dock="Top" FontWeight="SemiBold" Margin="0,0,0,8"/>
+    <Expander Header="Advanced" DockPanel.Dock="Bottom" Margin="0,10,0,0"><TextBox x:Name="Advanced" IsReadOnly="True" FontFamily="Consolas" TextWrapping="NoWrap" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" MaxHeight="220"/></Expander>
+    <StackPanel x:Name="RelatedPanel" DockPanel.Dock="Bottom" Visibility="Collapsed" Margin="0,10,0,0"><DockPanel><TextBlock Text="Related" FontWeight="SemiBold" VerticalAlignment="Center"/><Button x:Name="OpenRelated" Content="Open" HorizontalAlignment="Right" IsEnabled="False" Click="Open_Click"/></DockPanel><ListBox x:Name="Related" DisplayMemberPath="Label" SelectionChanged="RelatedChanged" PreviewKeyDown="RelatedKeyDown" MouseDoubleClick="RelatedDoubleClick" MaxHeight="140"/></StackPanel>
+    <DockPanel DockPanel.Dock="Bottom" Margin="0,10,0,0"><TextBlock x:Name="Page" VerticalAlignment="Center"/><WrapPanel HorizontalAlignment="Right"><Button x:Name="Previous" Content="Previous" IsEnabled="False" Click="Previous_Click"/><Button x:Name="Next" Content="Next" IsEnabled="False" Click="Next_Click"/></WrapPanel></DockPanel>
+    <TextBox x:Name="Hex" FontFamily="Consolas" FontSize="13" IsReadOnly="True" TextWrapping="NoWrap" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top" AutomationProperties.Name="Section bytes"/>
+   </DockPanel>
+  </Grid>
+  <TextBlock x:Name="Status" Grid.Row="2" Margin="0,10,0,0" TextWrapping="Wrap"/>
+ </Grid>
+</UserControl>

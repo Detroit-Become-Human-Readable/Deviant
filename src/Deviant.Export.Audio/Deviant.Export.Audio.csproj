@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="../Deviant.Core/Deviant.Core.csproj" />
+    <ProjectReference Include="../Deviant.Assets/Deviant.Assets.csproj" />
+    <ProjectReference Include="../Deviant.Archives/Deviant.Archives.csproj" />
+    <ProjectReference Include="../Deviant.Export/Deviant.Export.csproj" />
+    <ProjectReference Include="../Deviant.Formats.Audio/Deviant.Formats.Audio.csproj" />
+    <ProjectReference Include="../Deviant.Audio/Deviant.Audio.csproj" />
+  </ItemGroup>
+</Project>

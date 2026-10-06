@@ -1,0 +1,29 @@
+<UserControl x:Class="Deviant.Desktop.AssetModelView"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ xmlns:local="clr-namespace:Deviant.Desktop" Foreground="{DynamicResource WindowForeground}">
+ <DockPanel Margin="12">
+  <WrapPanel DockPanel.Dock="Top" Margin="0,0,0,8">
+   <Button Content="Back to scene" Click="Back_Click"/>
+   <TextBlock x:Name="ModelName" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center" Margin="8,0,0,0"/>
+  </WrapPanel>
+  <DockPanel x:Name="ModelLoadingPanel" DockPanel.Dock="Top" Visibility="Collapsed" Margin="0,0,0,8">
+   <local:ProcessingAnimation x:Name="ModelProcessing" DockPanel.Dock="Left" Margin="0,0,8,0"/>
+   <StackPanel VerticalAlignment="Center"><DockPanel Margin="0,0,0,4"><TextBlock x:Name="ModelLoadingCount" DockPanel.Dock="Right" HorizontalAlignment="Right"/><TextBlock x:Name="ModelLoadingStage" Text="Preparing model"/></DockPanel>
+    <ProgressBar x:Name="ModelLoadingProgress" Height="6" IsIndeterminate="True" Minimum="0" Maximum="1"/>
+   </StackPanel>
+  </DockPanel>
+  <TextBlock x:Name="ModelStatus" DockPanel.Dock="Bottom" TextWrapping="Wrap" Margin="0,6,0,0"/>
+  <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="260"/></Grid.ColumnDefinitions>
+   <local:AssetViewport x:Name="ModelViewport"/>
+   <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch"/>
+   <DockPanel Grid.Column="2" Margin="8,0,0,0">
+    <TextBlock x:Name="ModelSummary" DockPanel.Dock="Top" TextWrapping="Wrap" Margin="0,0,0,8"/>
+    <TabControl>
+     <TabItem Header="Textures"><ListBox x:Name="ModelTextures" DisplayMemberPath="Label" MouseDoubleClick="ModelTextures_DoubleClick"/></TabItem>
+     <TabItem Header="Details"><ScrollViewer VerticalScrollBarVisibility="Auto"><TextBox x:Name="ModelDetails" IsReadOnly="True" FontFamily="Consolas" TextWrapping="Wrap" BorderThickness="0"/></ScrollViewer></TabItem>
+    </TabControl>
+   </DockPanel>
+  </Grid>
+ </DockPanel>
+</UserControl>
