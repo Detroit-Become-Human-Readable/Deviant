@@ -31,7 +31,8 @@ jobs:
 
   publish-build:
     needs: build-and-test
-    runs-on: windows-latest
+    # Match the Visual Studio 2022 generator used by Build-Vgmstream.ps1.
+    runs-on: windows-2022
     timeout-minutes: 120
     steps:
       - name: Check out source
