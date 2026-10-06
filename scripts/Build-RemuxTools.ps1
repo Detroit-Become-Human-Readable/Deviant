@@ -30,5 +30,8 @@ if ($LASTEXITCODE -ne 0) { throw 'ReVorb build failed' }
 $def = Join-Path $trees['vgmstream'] 'ext_libs/libvorbis.def'
 & (Join-Path $toolchain 'bin/gcc.exe') -O2 -shared $def '-Wl,--whole-archive' (Join-Path $prefix 'lib/libvorbisfile.a') (Join-Path $prefix 'lib/libvorbis.a') (Join-Path $prefix 'lib/libogg.a') '-Wl,--no-whole-archive' -o (Join-Path $destinationRoot 'vgmstream/libvorbis.dll')
 if ($LASTEXITCODE -ne 0) { throw 'libvorbis DLL build failed' }
-Copy-Item -LiteralPath $VgmstreamCli -Destination (Join-Path $destinationRoot 'vgmstream/vgmstream-cli.exe')
+$vgmstreamDestination = Join-Path $destinationRoot 'vgmstream/vgmstream-cli.exe'
+if (![IO.Path]::GetFullPath($VgmstreamCli).Equals($vgmstreamDestination, [StringComparison]::OrdinalIgnoreCase)) {
+    Copy-Item -LiteralPath $VgmstreamCli -Destination $vgmstreamDestination
+}
 Write-Output 'Remux tools built.'
