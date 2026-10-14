@@ -17,10 +17,21 @@ public sealed class SourceExtentVerifier
         long maximumBytes = DefaultMaximumBytes, int maximumExtentCount = MaximumExtentCount)
     {
         ArgumentNullException.ThrowIfNull(snapshot); ArgumentNullException.ThrowIfNull(extents);
+        using var timing = AssetLoadDiagnostics.Measure("SourceVerification");
         if (maximumBytes is < 1 or > MaximumBytes) throw new ArgumentOutOfRangeException(nameof(maximumBytes));
         if (maximumExtentCount is < 1 or > MaximumLargeExtentCount) throw new ArgumentOutOfRangeException(nameof(maximumExtentCount));
         token.ThrowIfCancellationRequested();
         if (extents.Count is < 1 || extents.Count > maximumExtentCount) throw new ArgumentException("Source extent count is invalid.", nameof(extents));
+        var shared = ArchiveSourceSession.TryAcquire(snapshot);
+        if (shared is not null)
+        {
+            try
+            {
+                await shared.Session.VerifyAsync(extents, token, maximumBytes, maximumExtentCount).ConfigureAwait(false);
+                return new SourceExtentVerificationLease(() => shared.Session.EnsureCurrent(), shared);
+            }
+            catch { shared.Dispose(); throw; }
+        }
         var provider = new FileRevisionProvider();
         var pins = new List<(string Path, FileStamp Stamp, SafeFileHandle Handle)>();
         var transferred = false;
@@ -29,8 +40,10 @@ public sealed class SourceExtentVerifier
             var index = SourceIdentity.OpenPinned(snapshot.IndexPath);
             pins.Add((snapshot.IndexPath, snapshot.IndexStamp, index));
             SourceIdentity.EnsureUnchanged(provider, index, snapshot.IndexPath, snapshot.IndexStamp);
-            if (await SourceIdentity.HashAsync(index, snapshot.IndexStamp.Length, token).ConfigureAwait(false) != snapshot.IndexContentId)
-                throw Changed();
+            using (AssetLoadDiagnostics.Measure("VerificationRead", relativeSource: Path.GetFileName(snapshot.IndexPath),
+                requestedBytes: snapshot.IndexStamp.Length))
+                if (await SourceIdentity.HashAsync(index, snapshot.IndexStamp.Length, token).ConfigureAwait(false) != snapshot.IndexContentId)
+                    throw Changed();
             var volumes = snapshot.Volumes.ToDictionary(volume => volume.RelativeName, StringComparer.OrdinalIgnoreCase);
             var opened = new Dictionary<string, SafeFileHandle>(StringComparer.OrdinalIgnoreCase);
             var buffer = new byte[128 * 1024];
@@ -53,6 +66,8 @@ public sealed class SourceExtentVerifier
                     opened.Add(volume.RelativeName, handle);
                 }
                 using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+                using var extentTiming = AssetLoadDiagnostics.Measure("VerificationRead", relativeSource: extent.RelativeSource,
+                    offset: extent.Offset, requestedBytes: extent.Length);
                 for (long read = 0; read < extent.Length;)
                 {
                     token.ThrowIfCancellationRequested();
@@ -78,14 +93,20 @@ public sealed class SourceExtentVerificationLease : IDisposable, IAsyncDisposabl
 {
     private readonly IReadOnlyList<(string Path, FileStamp Stamp, SafeFileHandle Handle)> pins;
     private readonly ISourceRevisionProvider provider;
+    private readonly Action? checkShared;
+    private readonly IDisposable? sharedOwner;
     private int disposed;
 
     internal SourceExtentVerificationLease(IReadOnlyList<(string Path, FileStamp Stamp, SafeFileHandle Handle)> pins,
         ISourceRevisionProvider provider) { this.pins = pins; this.provider = provider; }
 
+    internal SourceExtentVerificationLease(Action checkShared, IDisposable sharedOwner)
+    { pins = []; provider = new FileRevisionProvider(); this.checkShared = checkShared; this.sharedOwner = sharedOwner; }
+
     public void EnsureUnchanged()
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
+        checkShared?.Invoke();
         foreach (var pin in pins) SourceIdentity.EnsureUnchanged(provider, pin.Handle, pin.Path, pin.Stamp);
     }
 
@@ -93,6 +114,7 @@ public sealed class SourceExtentVerificationLease : IDisposable, IAsyncDisposabl
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         foreach (var pin in pins) pin.Handle.Dispose();
+        sharedOwner?.Dispose();
     }
     public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
 }

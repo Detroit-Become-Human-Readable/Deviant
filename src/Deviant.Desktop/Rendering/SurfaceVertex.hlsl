@@ -6,6 +6,9 @@ struct SurfaceVertexInput
     float3 t2 : BINORMAL;
     float4 c : COLOR;
     float2 t : TEXCOORD0;
+    float2 uv1 : TEXCOORD6;
+    float2 uv2 : TEXCOORD7;
+    float2 uv3 : TEXCOORD8;
     float4 mr0 : TEXCOORD1;
     float4 mr1 : TEXCOORD2;
     float4 mr2 : TEXCOORD3;
@@ -32,7 +35,11 @@ PSInput main(SurfaceVertexInput input)
     }
     output.vEye = float4(normalize(vEyePos - output.wp.xyz), length(vEyePos - output.wp.xyz));
     output.p = mul(output.wp, mViewProjection);
+    output.sp = mul(output.wp, mView);
     output.t = input.t;
+    output.uv1 = input.uv1;
+    output.uv2 = input.uv2;
+    output.uv3 = input.uv3;
     output.c = input.c;
     output.cDiffuse = bHasInstanceParams ? input.diffuseC : vMaterialDiffuse;
     output.c2 = bHasInstanceParams ? input.emissiveC : vMaterialEmissive;

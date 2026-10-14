@@ -6,12 +6,12 @@
  <Grid Background="#171C23">
   <h:Viewport3DX x:Name="RenderView" ShowViewCube="True" ShowCoordinateSystem="False"
    BackgroundColor="#171C23" IsShadowMappingEnabled="False" ModelUpDirection="0,1,0"
-   IsInertiaEnabled="False" ZoomExtentsWhenLoaded="False"
+   IsInertiaEnabled="False" ZoomExtentsWhenLoaded="False" OITRenderMode="None"
    PreviewMouseLeftButtonDown="PointerDown" PreviewMouseLeftButtonUp="PointerUp"
    PreviewMouseRightButtonDown="FlyDown" PreviewMouseRightButtonUp="FlyUp"
    PreviewMouseMove="FlyMove" PreviewKeyDown="KeyDownHandler" PreviewKeyUp="KeyUpHandler">
    <h:Viewport3DX.Camera>
-    <h:PerspectiveCamera Position="3,2,3" LookDirection="-3,-2,-3" UpDirection="0,1,0" NearPlaneDistance="0.01" FarPlaneDistance="10000" />
+    <h:PerspectiveCamera Position="3,2,3" LookDirection="-3,-2,-3" UpDirection="0,1,0" NearPlaneDistance="0.1" FarPlaneDistance="10000" />
    </h:Viewport3DX.Camera>
    <h:AmbientLight3D Color="#404040" />
    <h:DirectionalLight3D Color="#E8E8E8" Direction="-1,-2,-1" />
@@ -20,7 +20,7 @@
   <StackPanel HorizontalAlignment="Left" VerticalAlignment="Top" Orientation="Horizontal" Margin="8">
    <Button Content="Frame" Padding="10,4" Click="FrameClicked" />
    <Button Content="Selection" Padding="10,4" Margin="4,0,0,0" Click="SelectionClicked" />
-   <ToggleButton x:Name="FlyToggle" Content="Fly" Padding="10,4" Margin="4,0,0,0" Unchecked="FlyDisabled" />
+   <ToggleButton x:Name="FlyToggle" Content="Fly" Padding="10,4" Margin="4,0,0,0" Checked="FlyEnabled" Unchecked="FlyDisabled" />
   </StackPanel>
   <TextBlock x:Name="StatusText" HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="10"
    Foreground="#DFE6EF" IsHitTestVisible="False" />

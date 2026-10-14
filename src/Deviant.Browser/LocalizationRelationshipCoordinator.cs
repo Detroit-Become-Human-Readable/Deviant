@@ -15,10 +15,17 @@ public sealed record LocalizationRelationshipDiagnostic(ResourceIdentity Selecte
     ResourceIdentity? DialogueHeaderIdentity, ResourceIdentity? AudioResourceIdentity,
     ResourceIdentity? DialogueEventIdentity, IReadOnlyList<AssetRelationship> EvidencePath);
 
+public sealed record LocalizationPointerCandidate(ResourceIdentity Identity, int LanguageIndex,
+    string RawLanguageCode, bool IsSelectedStoredBlock);
+
 public sealed record LocalizationRelationshipResult(ResourceIdentity SelectedOccurrenceIdentity,
     string? Key, string? RawLanguageCode, IReadOnlyList<ResourceIdentity> PointerOccurrenceIdentities,
     IReadOnlyList<LocalizationSelectedAudioRelationship> Relationships,
-    IReadOnlyList<LocalizationRelationshipDiagnostic> Diagnostics);
+    IReadOnlyList<LocalizationRelationshipDiagnostic> Diagnostics)
+{
+    public IReadOnlyList<LocalizationPointerCandidate> PointerCandidates { get; init; } =
+        Array.Empty<LocalizationPointerCandidate>();
+}
 
 /// <summary>Resolves selected localization occurrences through verified archive reference rows only.</summary>
 public sealed class LocalizationRelationshipCoordinator
@@ -66,6 +73,8 @@ public sealed class LocalizationRelationshipCoordinator
             ? Array.Empty<LocalizationRecord>()
             : (await session.GetRecordsAsync(requestedForSnapshot, cancellationToken).ConfigureAwait(false)).ToArray();
         var byIdentity = loaded.ToDictionary(record => record.Identity.Key, StringComparer.Ordinal);
+        await using var payloadLease = loaded.Length == 0 ? null :
+            await session.AcquirePayloadVerificationAsync(loaded.Select(record => record.ResourceIdentity), cancellationToken).ConfigureAwait(false);
         Task? indexValidation = null;
         Task ValidateIndexAsync(CancellationToken token) =>
             indexValidation ??= referenceReader.ValidateSnapshotIndexHashAsync(snapshot, token);
@@ -92,6 +101,7 @@ public sealed class LocalizationRelationshipCoordinator
             }
             results.Add(await ResolveRecordAsync(session, record, ValidateIndexAsync, cancellationToken).ConfigureAwait(false));
         }
+        payloadLease?.EnsureUnchanged();
         return results.AsReadOnly();
     }
 
@@ -103,44 +113,72 @@ public sealed class LocalizationRelationshipCoordinator
                 Diagnostic(selected.Identity, null, LocalizationReferenceLinkStatus.Unresolved,
                     "LocalizationPending", "The source is still indexing, so same-key pointer occurrences may not be complete."));
 
+        IReadOnlyList<LocalizationRecord> allKeyPointers;
         IReadOnlyList<LocalizationRecord> pointers;
+        bool limitExceeded = false;
         if (selected.Kind == LocalizationRecordKind.Pointer)
+        {
+            allKeyPointers = [selected];
             pointers = [selected];
+        }
         else if (selected.Kind == LocalizationRecordKind.Text && !string.IsNullOrEmpty(selected.Key))
         {
             var pointerSearch = await GetSameSourceKeyPointersAsync(session, selected, token).ConfigureAwait(false);
-            pointers = pointerSearch.Pointers;
-            if (pointerSearch.LimitExceeded)
-            {
-                var diagnostic = Diagnostic(selected.Identity, null, LocalizationReferenceLinkStatus.Ambiguous,
-                    "ExactKeyOccurrenceLimit", "The same-source exact-key occurrence set exceeds the bounded relationship limit.",
-                    candidatePointers: pointers.Select(pointer => pointer.Identity).ToArray());
-                return new(selected.Identity, selected.Key, selected.RawLanguageCode,
-                    pointers.Select(pointer => pointer.Identity).ToArray(),
-                    Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
-            }
+            allKeyPointers = pointerSearch.Pointers;
+            limitExceeded = pointerSearch.LimitExceeded;
+            pointers = allKeyPointers.Where(pointer =>
+                    pointer.LanguageIndex == selected.LanguageIndex &&
+                    string.Equals(pointer.RawLanguageCode, selected.RawLanguageCode, StringComparison.Ordinal))
+                .ToArray();
         }
         else
+        {
+            allKeyPointers = Array.Empty<LocalizationRecord>();
             pointers = Array.Empty<LocalizationRecord>();
+        }
+
+        var pointerCandidates = allKeyPointers.Select(pointer => new LocalizationPointerCandidate(
+            pointer.Identity, pointer.LanguageIndex, pointer.RawLanguageCode,
+            pointer.LanguageIndex == selected.LanguageIndex &&
+            string.Equals(pointer.RawLanguageCode, selected.RawLanguageCode, StringComparison.Ordinal))).ToArray();
+        LocalizationRelationshipResult CreateResult(IReadOnlyList<ResourceIdentity> pointerIdentities,
+            IReadOnlyList<LocalizationSelectedAudioRelationship> relationships,
+            IReadOnlyList<LocalizationRelationshipDiagnostic> diagnostics) =>
+            new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
+                relationships, diagnostics) { PointerCandidates = pointerCandidates };
 
         var pointerIdentities = pointers.Select(pointer => pointer.Identity).ToArray();
+        if (limitExceeded)
+        {
+            var candidates = allKeyPointers.Select(pointer => pointer.Identity).ToArray();
+            var diagnostic = Diagnostic(selected.Identity, null, LocalizationReferenceLinkStatus.Ambiguous,
+                "ExactKeyOccurrenceLimit", "The same-source exact-key occurrence set exceeds the bounded relationship limit.",
+                candidatePointers: candidates);
+            return CreateResult(candidates, Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
+        }
         if (pointers.Count == 0)
         {
-            var diagnostic = Diagnostic(selected.Identity, null, LocalizationReferenceLinkStatus.Unmatched,
+            if (selected.Kind == LocalizationRecordKind.Text && allKeyPointers.Count > 0)
+            {
+                var candidates = allKeyPointers.Select(pointer => pointer.Identity).ToArray();
+                var diagnostic = Diagnostic(selected.Identity, null, LocalizationReferenceLinkStatus.Unmatched,
+                    "NoSameLanguagePointer", "Same-key pointers exist, but none belongs to the selected stored language block.",
+                    candidatePointers: candidates);
+                return CreateResult(pointerIdentities, Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
+            }
+            var noPointer = Diagnostic(selected.Identity, null, LocalizationReferenceLinkStatus.Unmatched,
                 selected.Kind == LocalizationRecordKind.Text ? "NoSameSourcePointer" : "NoDirectPointerReference",
                 selected.Kind == LocalizationRecordKind.Text
                     ? "No pointer occurrence with this exact stored key exists in the same resource."
                     : "This occurrence has no parsed pointer reference.");
-            return new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
-                Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
+            return CreateResult(pointerIdentities, Array.Empty<LocalizationSelectedAudioRelationship>(), [noPointer]);
         }
         if (pointers.Count > 1)
         {
             var ambiguous = Diagnostic(selected.Identity, null, LocalizationReferenceLinkStatus.Ambiguous,
-                "MultipleSameKeyPointers", "More than one pointer occurrence with this exact key exists in the same resource.",
+                "MultipleSameKeyPointers", "More than one pointer occurrence with this exact key exists in the selected stored language block.",
                 candidatePointers: pointerIdentities);
-            return new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
-                Array.Empty<LocalizationSelectedAudioRelationship>(), [ambiguous]);
+            return CreateResult(pointerIdentities, Array.Empty<LocalizationSelectedAudioRelationship>(), [ambiguous]);
         }
 
         var pointer = pointers[0];
@@ -150,8 +188,7 @@ public sealed class LocalizationRelationshipCoordinator
             var code = pointer.PointerKind == 0 ? "NullPointerTarget" : "PointerPayloadUnresolved";
             var unresolved = Diagnostic(selected.Identity, pointer.Identity, LocalizationReferenceLinkStatus.Unresolved,
                 code, "The selected pointer occurrence does not contain a supported 9-byte reference payload.");
-            return new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
-                Array.Empty<LocalizationSelectedAudioRelationship>(), [unresolved]);
+            return CreateResult(pointerIdentities, Array.Empty<LocalizationSelectedAudioRelationship>(), [unresolved]);
         }
 
         LocalizationReferenceReadResult sourceReferences;
@@ -165,16 +202,14 @@ public sealed class LocalizationRelationshipCoordinator
         {
             var diagnostic = Diagnostic(selected.Identity, pointer.Identity, LocalizationReferenceLinkStatus.Unresolved,
                 exception.Code, exception.Message);
-            return new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
-                Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
+            return CreateResult(pointerIdentities, Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
         }
 
         if (sourceReferences.Status != LocalizationReferenceReadStatus.Verified)
         {
             var diagnostic = Diagnostic(selected.Identity, pointer.Identity, LocalizationReferenceLinkStatus.Unmatched,
                 "ReferenceContainerMissing", "The localization resource has no supported reference table.");
-            return new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
-                Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
+            return CreateResult(pointerIdentities, Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
         }
 
         var pointerLink = LocalizationDiscovery.ResolvePointerReferences([pointer], sourceReferences.Relationships).Single();
@@ -182,8 +217,7 @@ public sealed class LocalizationRelationshipCoordinator
             pointerLink.TargetResource is null)
         {
             var diagnostic = CreatePointerDiagnostic(selected, pointer, pointerLink, sourceReferences.Relationships);
-            return new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
-                Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
+            return CreateResult(pointerIdentities, Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
         }
 
         if (pointerLink.TargetResourceType is 1033 or 1031)
@@ -200,16 +234,14 @@ public sealed class LocalizationRelationshipCoordinator
                 evidencePath: [pointerLink.Relationship],
                 audioResource: targetType == 1033 ? pointerLink.TargetResource : null,
                 dialogueEvent: targetType == 1031 ? pointerLink.TargetResource : null);
-            return new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
-                [relation], [companionDiagnostic]);
+            return CreateResult(pointerIdentities, [relation], [companionDiagnostic]);
         }
         if (pointerLink.TargetResourceType != 4091)
         {
             var unsupported = Diagnostic(selected.Identity, pointer.Identity, LocalizationReferenceLinkStatus.Unresolved,
                 "UnsupportedPointerTargetType", "The verified pointer target is not a dialogue header or audio resource.",
                 evidencePath: [pointerLink.Relationship]);
-            return new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
-                Array.Empty<LocalizationSelectedAudioRelationship>(), [unsupported]);
+            return CreateResult(pointerIdentities, Array.Empty<LocalizationSelectedAudioRelationship>(), [unsupported]);
         }
 
         var dialogueHeader = pointerLink.TargetResource;
@@ -225,16 +257,14 @@ public sealed class LocalizationRelationshipCoordinator
             var diagnostic = Diagnostic(selected.Identity, pointer.Identity, LocalizationReferenceLinkStatus.Unresolved,
                 "DialogueHeaderUnreadable", "The unique dialogue-header target did not yield a valid reference table.",
                 dialogueHeader: dialogueHeader, evidencePath: [pointerLink.Relationship]);
-            return new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
-                Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
+            return CreateResult(pointerIdentities, Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
         }
         if (headerReferences.Status != LocalizationReferenceReadStatus.Verified)
         {
             var diagnostic = Diagnostic(selected.Identity, pointer.Identity, LocalizationReferenceLinkStatus.Unmatched,
                 "DialogueHeaderHasNoReferenceTable", "The referenced dialogue header has no supported COM_CONT reference table.",
                 dialogueHeader: dialogueHeader, evidencePath: [pointerLink.Relationship]);
-            return new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
-                Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
+            return CreateResult(pointerIdentities, Array.Empty<LocalizationSelectedAudioRelationship>(), [diagnostic]);
         }
 
         var downstream = LocalizationDiscovery.ResolvePointerDialogueAudioTargets([pointerLink],
@@ -254,8 +284,7 @@ public sealed class LocalizationRelationshipCoordinator
             ? new[] { CreateRelatedAsset(selected, pointer, dialogueHeader, 4091, null, evidence)
                 with { AudioResourceIdentity = audio, DialogueEventIdentity = dialogueEvent } }
             : Array.Empty<LocalizationSelectedAudioRelationship>();
-        return new(selected.Identity, selected.Key, selected.RawLanguageCode, pointerIdentities,
-            relations, diagnostics.AsReadOnly());
+        return CreateResult(pointerIdentities, relations, diagnostics.AsReadOnly());
     }
 
     private async Task<PointerSearchResult> GetSameSourceKeyPointersAsync(LocalizationSession session,
@@ -265,7 +294,8 @@ public sealed class LocalizationRelationshipCoordinator
             Offset: 0, Limit: MaximumExactKeyOccurrences + 1);
         var page = await session.QueryAsync(query, token).ConfigureAwait(false);
         var pointers = page.Records.Where(record => record.Kind == LocalizationRecordKind.Pointer &&
-                record.ResourceIdentity.Key == selected.ResourceIdentity.Key &&
+                record.ResourceIdentity == selected.ResourceIdentity &&
+                record.ResourceOrdinal == selected.ResourceOrdinal &&
                 string.Equals(record.Key, selected.Key, StringComparison.Ordinal)).ToArray();
         return new(pointers, page.Total > MaximumExactKeyOccurrences);
     }

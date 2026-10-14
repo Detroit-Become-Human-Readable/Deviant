@@ -20,6 +20,7 @@ public sealed class SavedSortAndRefreshTests
         WorkspaceCommitTests.Run((window,fixture)=>
         {
             Pump(window.OpenArchiveAsync(fixture.Index));Pump(window.CurrentSession!.EnrichmentTask);
+            Pump((Task)Invoke(window,"DrainLibraryTasksAsync")!);
             Pump((Task)Invoke(window,"QueryAsync",true)!);
             var field=typeof(AudioWindow).GetField("currentQuery",BindingFlags.NonPublic|BindingFlags.Instance)!;
             field.SetValue(window,((AudioExplorerQuery)field.GetValue(window)!) with { Offset=200 });
@@ -46,7 +47,10 @@ public sealed class SavedSortAndRefreshTests
     {
         WorkspaceCommitTests.Run((window,fixture)=>
         {
-            Pump(window.OpenArchiveAsync(fixture.Index));Pump(window.CurrentSession!.EnrichmentTask);Pump(Task.Delay(100));
+            Pump(window.OpenArchiveAsync(fixture.Index));Invoke(window,"ShowBrowse","audio");Pump(window.CurrentSession!.EnrichmentTask);
+            Pump((Task)Invoke(window,"QueryAsync",true)!);
+            using var publicationDeadline=new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            while(window.CurrentRows.Count!=2)Pump(Task.Delay(10,publicationDeadline.Token));
             var list=(ListView)window.FindName("MediaList");list.SelectedItem=window.CurrentRows.Last();var identity=((AudioExplorerRow)list.SelectedItem).Identity;
             var alias=(TextBox)window.FindName("AliasBox");alias.Text="Unsaved draft";
             Pump(window.OpenArchiveAsync(fixture.Index));Pump(Task.Delay(100));

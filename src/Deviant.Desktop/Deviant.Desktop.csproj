@@ -11,6 +11,9 @@
     <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
     <GenerateDesktopArtifacts Condition="'$(GenerateDesktopArtifacts)' == ''">true</GenerateDesktopArtifacts>
     <Description>Designed by CyberLife, disassembled by Deviants.</Description>
+    <AssemblyVersion>0.0.2.0</AssemblyVersion>
+    <FileVersion>0.0.2.0</FileVersion>
+    <Version>0.0.2-alpha.2</Version>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Deviant.Assets/Deviant.Assets.csproj" />

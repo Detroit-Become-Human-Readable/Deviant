@@ -28,6 +28,12 @@ public sealed record SegsDocument(uint Version, ushort SegmentCount, uint Declar
     IReadOnlyList<SegsChunk> Chunks, IReadOnlyList<SegsGap> Gaps, byte[] DecodedPrefix,
     SourceExtent? RawSuffixExtent, byte[] RawSuffix, bool? AlternativeSizeMatchesRawSuffix);
 
+public sealed record SegsDecodedByteRange(long Offset, int Length);
+
+public sealed record SegsDecodedRanges(uint DeclaredDecodedLength, uint DeclaredCompressedSpan,
+    int ActualDecodedLength, IReadOnlyList<SegsDecodedByteRange> Ranges,
+    IReadOnlyList<byte[]> DecodedRanges, int RawSuffixLength);
+
 /// <summary>Reads SEGS v1 zlib and literal segments and retains the raw suffix.</summary>
 public sealed class SegsContainerReader(ISourceRevisionProvider? revisionProvider = null)
 {
@@ -277,6 +283,214 @@ public sealed class SegsContainerReader(ISourceRevisionProvider? revisionProvide
         return new(document, identity, revision, extents, steps, diagnostics, [], unknown);
     }
 
+    /// <summary>
+    /// Validates the complete SEGS table and physical ranges while retaining selected decoded windows only.
+    /// MaximumDecodedBytes limits the combined returned windows; the complete logical package is metadata-checked and
+    /// bounded by the configured segment count without being materialized.
+    /// </summary>
+    public DecodeResult<SegsDecodedRanges> ParseDecodedRanges(ReadOnlyMemory<byte> storedBytes,
+        ResourceIdentity identity, SourceRevision revision, SourceExtent originalExtent,
+        IReadOnlyList<SegsDecodedByteRange> requestedRanges, long expectedDecodedLength,
+        SegsDecodeLimits? limits = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        ArgumentNullException.ThrowIfNull(revision);
+        ArgumentNullException.ThrowIfNull(originalExtent);
+        ArgumentNullException.ThrowIfNull(requestedRanges);
+        limits ??= new();
+        limits.Validate();
+        var extent = originalExtent with { Length = storedBytes.Length };
+        var extents = new[] { extent };
+        DecodeStep Step(string options, string? digest = null) => new(nameof(SegsContainerReader), Version,
+            "version1;full-table-validation;selected-decoded-ranges", digest);
+        DecodeResult<SegsDecodedRanges> Failure(string code, string message) =>
+            new(null, identity, revision, extents, [Step("little-endian;selected-decoded-ranges")],
+                [code + ": " + message], [], new Dictionary<string, string>());
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (identity.IndexContentId != revision.IndexContentId ||
+            originalExtent.Offset < 0 || originalExtent.Length != storedBytes.Length ||
+            originalExtent.Offset > long.MaxValue - originalExtent.Length)
+            return Failure("InvalidSourceExtent", "The source identity and extent must describe the supplied SEGS bytes.");
+        if (storedBytes.Length < HeaderLength || storedBytes.Length > limits.MaximumStoredBytes)
+            return Failure("StoredSizeLimit", "The selected SEGS resource exceeds the configured stored-byte limit.");
+        if (expectedDecodedLength is < 1 or > int.MaxValue ||
+            expectedDecodedLength > (long)DefaultDecodedSegmentBytes * limits.MaximumSegments)
+            return Failure("DecodedSizeLimit", "The declared decoded package exceeds the selected range reader limits.");
+        if (requestedRanges.Count is < 1 or > 6)
+            return Failure("RangeCountLimit", "The selected decoded range count is outside its configured limit.");
+
+        long selectedBytes = 0;
+        foreach (var range in requestedRanges)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (range.Offset < 0 || range.Length < 1 || range.Offset > expectedDecodedLength - range.Length)
+                return Failure("DecodedRangeOutOfBounds", "A selected decoded range exceeds the declared package.");
+            try { selectedBytes = checked(selectedBytes + range.Length); }
+            catch (OverflowException) { return Failure("DecodedRangeSizeOverflow", "The selected decoded ranges exceed their supported size."); }
+        }
+        if (selectedBytes > limits.MaximumDecodedBytes)
+            return Failure("DecodedRangeLimit", "The selected decoded output exceeds its configured byte limit.");
+
+        var bytes = storedBytes.Span;
+        var payloadHash = Sha256(bytes);
+        if (originalExtent.PayloadSha256 is { } expectedHash &&
+            !StringComparer.OrdinalIgnoreCase.Equals(expectedHash, payloadHash))
+            return Failure("PayloadHashMismatch", "The supplied extent digest does not match the stored bytes.");
+        if (!bytes[..4].SequenceEqual(Magic)) return Failure("InvalidSignature", "The resource does not begin with SEGS.");
+        var version = BinaryPrimitives.ReadUInt16LittleEndian(bytes[4..]);
+        if (version != 1) return Failure("UnsupportedVersion", $"SEGS version {version} is not supported.");
+        var segmentCount = BinaryPrimitives.ReadUInt16LittleEndian(bytes[6..]);
+        var declaredDecodedLength = BinaryPrimitives.ReadUInt32LittleEndian(bytes[8..]);
+        var declaredCompressedSpan = BinaryPrimitives.ReadUInt32LittleEndian(bytes[12..]);
+        if (segmentCount is 0 || segmentCount > limits.MaximumSegments)
+            return Failure("SegmentCountLimit", "The SEGS chunk count exceeds the configured limit.");
+        if (declaredDecodedLength != expectedDecodedLength)
+            return Failure("DecodedTotalMismatch", "The declared decoded package size differs from the metadata size.");
+
+        long tableEndLong, dataStartLong;
+        try
+        {
+            tableEndLong = checked((long)HeaderLength + (long)segmentCount * TableEntryLength);
+            dataStartLong = checked((tableEndLong + 15) & ~15L);
+        }
+        catch (OverflowException) { return Failure("TableLengthOverflow", "The SEGS chunk table overflows the supported range."); }
+        if (tableEndLong > bytes.Length || dataStartLong > bytes.Length || dataStartLong > int.MaxValue)
+            return Failure("TruncatedTable", "The SEGS chunk table or aligned data start exceeds the stored resource.");
+
+        var physicalRanges = new List<(int Start, int End, int Index)>(segmentCount);
+        var segmentRanges = new (int Start, int Length, int StoredOffset, int StoredLength, bool Compressed)[segmentCount];
+        long decodedTotal = 0;
+        long maximumRelativeEnd = 0;
+        for (var ordinal = 0; ordinal < segmentCount; ordinal++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var entryOffset = checked(HeaderLength + ordinal * TableEntryLength);
+            var compressedLength = BinaryPrimitives.ReadUInt16LittleEndian(bytes[entryOffset..]);
+            var decodedLengthWord = BinaryPrimitives.ReadUInt16LittleEndian(bytes[(entryOffset + 2)..]);
+            var encodedOffsetTag = BinaryPrimitives.ReadUInt32LittleEndian(bytes[(entryOffset + 4)..]);
+            var isCompressed = (encodedOffsetTag & 1) != 0;
+            var relativeOffsetValue = encodedOffsetTag & 0xFFFFFFFEu;
+            if (relativeOffsetValue > int.MaxValue)
+                return Failure("SegmentOffsetLimit", $"Segment {ordinal} offset exceeds the supported range.");
+            var relativeOffset = checked((int)relativeOffsetValue);
+            var decodedLength = decodedLengthWord == 0 ? DefaultDecodedSegmentBytes : decodedLengthWord;
+            var storedLength = !isCompressed && compressedLength == 0 ? DefaultDecodedSegmentBytes : compressedLength;
+            if (isCompressed && compressedLength == 0)
+                return Failure("EmptyCompressedSegment", $"Segment {ordinal} declares an empty zlib extent.");
+            if (!isCompressed && storedLength != decodedLength)
+                return Failure("LiteralSegmentLengthMismatch", $"Segment {ordinal} literal and decoded lengths differ.");
+            if (decodedLength <= 0 || decodedLength > DefaultDecodedSegmentBytes)
+                return Failure("DecodedSegmentLengthLimit", $"Segment {ordinal} exceeds the 64 KiB decoded chunk limit.");
+            if (decodedTotal > expectedDecodedLength - decodedLength)
+                return Failure("DecodedSizeLimit", "The segment lengths exceed the metadata-declared package size.");
+
+            long relativeEnd, physicalStart, physicalEnd;
+            try
+            {
+                relativeEnd = checked((long)relativeOffset + storedLength);
+                physicalStart = checked(dataStartLong + relativeOffset);
+                physicalEnd = checked(physicalStart + storedLength);
+            }
+            catch (OverflowException) { return Failure("SegmentExtentOverflow", $"Segment {ordinal} extent overflows."); }
+            if (relativeEnd > declaredCompressedSpan || physicalEnd > bytes.Length)
+                return Failure("SegmentExtentOutOfRange", $"Segment {ordinal} extent exceeds the declared or stored range.");
+            var start = checked((int)physicalStart);
+            var end = checked((int)physicalEnd);
+            if (physicalRanges.Any(range => start < range.End && range.Start < end))
+                return Failure("SegmentExtentOverlap", $"Segment {ordinal} overlaps an earlier physical extent.");
+
+            segmentRanges[ordinal] = (checked((int)decodedTotal), decodedLength, start, storedLength, isCompressed);
+            physicalRanges.Add((start, end, ordinal));
+            decodedTotal += decodedLength;
+            maximumRelativeEnd = Math.Max(maximumRelativeEnd, relativeEnd);
+        }
+
+        if (decodedTotal != declaredDecodedLength)
+            return Failure("DecodedTotalMismatch", $"Segment lengths total {decodedTotal}; header declares {declaredDecodedLength}.");
+        if (maximumRelativeEnd != declaredCompressedSpan)
+            return Failure("CompressedSpanMismatch", $"Segment extents end at {maximumRelativeEnd}; header declares {declaredCompressedSpan}.");
+
+        physicalRanges.Sort(static (left, right) => left.Start.CompareTo(right.Start));
+        var previousEnd = checked((int)dataStartLong);
+        foreach (var range in physicalRanges)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (range.Start < previousEnd)
+                return Failure("SegmentExtentOverlap", $"Segment {range.Index} overlaps an earlier physical extent.");
+            previousEnd = range.End;
+        }
+
+        var compressedEnd = checked((int)(dataStartLong + declaredCompressedSpan));
+        var outputs = requestedRanges.Select(range => new byte[range.Length]).ToArray();
+        var copied = new int[requestedRanges.Count];
+        byte[]? rangeDecodeScratch = null;
+        for (var ordinal = 0; ordinal < segmentRanges.Length; ordinal++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var segment = segmentRanges[ordinal];
+            bool needed = requestedRanges.Any(range => range.Offset < segment.Start + segment.Length &&
+                segment.Start < range.Offset + range.Length);
+            if (!needed) continue;
+            var compressed = bytes.Slice(segment.StoredOffset, segment.StoredLength);
+            if (!segment.Compressed)
+            {
+                CopyIntersections(compressed, segment);
+                continue;
+            }
+
+            var scratch = rangeDecodeScratch ??= new byte[DefaultDecodedSegmentBytes];
+            try
+            {
+                using var input = new ReadOnlyMemoryStream(storedBytes.Slice(segment.StoredOffset, segment.StoredLength));
+                using var zlib = new ZLibStream(input, CompressionMode.Decompress, leaveOpen: false);
+                var written = 0;
+                while (written < segment.Length)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var count = zlib.Read(scratch, written, segment.Length - written);
+                    if (count == 0) throw new InvalidDataException("The zlib stream ended before its declared decoded length.");
+                    written += count;
+                }
+                if (zlib.ReadByte() != -1) throw new InvalidDataException("The zlib stream exceeds its declared decoded length.");
+                var expectedAdler = BinaryPrimitives.ReadUInt32BigEndian(compressed[^4..]);
+                if (Adler32(scratch.AsSpan(0, segment.Length)) != expectedAdler)
+                    throw new InvalidDataException("The zlib Adler-32 trailer does not match the selected chunk.");
+            }
+            catch (InvalidDataException error)
+            { return Failure("InvalidZlibSegment", $"Segment {ordinal}: {error.Message}"); }
+            catch (IOException error)
+            { return Failure("InvalidZlibSegment", $"Segment {ordinal}: {error.Message}"); }
+            CopyIntersections(scratch.AsSpan(0, segment.Length), segment);
+        }
+
+        if (copied.Where((count, index) => count != requestedRanges[index].Length).Any())
+            return Failure("DecodedRangeIncomplete", "The validated segment table does not fully cover every selected range.");
+        var suffixLength = bytes.Length - compressedEnd;
+        var document = new SegsDecodedRanges(declaredDecodedLength, declaredCompressedSpan,
+            checked((int)declaredDecodedLength), requestedRanges.ToArray(), outputs, suffixLength);
+        var step = Step("version1;full-table-and-physical-overlap-validation;64KiB-selected-chunk-scratch", payloadHash);
+        return new(document, identity, revision, extents, [step], [], [],
+            new Dictionary<string, string> { ["retainedDecodedRanges"] = outputs.Sum(output => output.Length).ToString(System.Globalization.CultureInfo.InvariantCulture) });
+
+        void CopyIntersections(ReadOnlySpan<byte> source,
+            (int Start, int Length, int StoredOffset, int StoredLength, bool Compressed) segment)
+        {
+            foreach (var rangeIndex in Enumerable.Range(0, requestedRanges.Count))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var range = requestedRanges[rangeIndex];
+                var start = Math.Max(range.Offset, segment.Start);
+                var end = Math.Min(range.Offset + range.Length, segment.Start + (long)segment.Length);
+                if (start >= end) continue;
+                var length = checked((int)(end - start));
+                source.Slice(checked((int)(start - segment.Start)), length)
+                    .CopyTo(outputs[rangeIndex].AsSpan(checked((int)(start - range.Offset)), length));
+                copied[rangeIndex] = checked(copied[rangeIndex] + length);
+            }
+        }
+    }
+
     private static byte[] DecompressOne(ReadOnlySpan<byte> compressed, int expectedLength)
     {
         if (compressed.Length < 6)
@@ -317,6 +531,30 @@ public sealed class SegsContainerReader(ISourceRevisionProvider? revisionProvide
             b = (b + a) % modulus;
         }
         return (b << 16) | a;
+    }
+
+    private sealed class ReadOnlyMemoryStream(ReadOnlyMemory<byte> memory) : Stream
+    {
+        private int position;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => memory.Length;
+        public override long Position { get => position; set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+        public override int Read(Span<byte> buffer)
+        {
+            var count = Math.Min(buffer.Length, memory.Length - position);
+            if (count <= 0) return 0;
+            memory.Span.Slice(position, count).CopyTo(buffer);
+            position += count;
+            return count;
+        }
+        public override int ReadByte() => position >= memory.Length ? -1 : memory.Span[position++];
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     private static string Sha256(ReadOnlySpan<byte> bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();

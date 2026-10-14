@@ -1,7 +1,9 @@
 using System.Buffers.Binary;
+using System.Reflection;
 using System.Security.Cryptography;
 using Deviant.Assets;
 using Deviant.Browser;
+using Deviant.Core;
 using Deviant.Formats.Textures;
 using Xunit;
 
@@ -9,6 +11,122 @@ namespace Deviant.Texture.Tests;
 
 public sealed class ConvertedTextureDecoderTests
 {
+    [Theory]
+    [InlineData(21, 18)]
+    [InlineData(7, 5)]
+    public void SceneTextureDecoderUsesSelectedConvertedMipAllowanceAndReservesWorkingSet(ushort selector, byte nativeFormat)
+    {
+        var source = ConvertedTextureFixture.Source(soleRaw: true, selector: selector,
+            width: 4096, height: 4096, emptyPayload: true);
+        Assert.Equal(nativeFormat, source.Metadata.FirstByte);
+
+        var decoder = ConvertedTextureFixture.SceneTextureDecoder(source, 1024);
+        var estimatedWorkingSet = decoder.EstimatePreviewWorkingSetBytes(source, 1024);
+        Assert.Equal(3L * 4096 * 4096 * 4 + 1024 * 1024, estimatedWorkingSet);
+
+        var admitted = new AssetMemoryBudget(estimatedWorkingSet);
+        using (admitted.Reserve(estimatedWorkingSet, "generated converted scene preview"))
+            Assert.Equal(estimatedWorkingSet, admitted.UsedBytes);
+        Assert.Equal(0, admitted.UsedBytes);
+
+        var insufficient = new AssetMemoryBudget(estimatedWorkingSet - 1);
+        Assert.Throws<ArchiveException>(() =>
+        {
+            using var rejected = insufficient.Reserve(estimatedWorkingSet, "generated converted scene preview");
+        });
+        Assert.Equal(0, insufficient.UsedBytes);
+    }
+
+    [Fact]
+    public void SceneTextureDecoderRejectsConvertedMipAboveExisting128MiBCeiling()
+    {
+        var source = ConvertedTextureFixture.Source(soleRaw: true, selector: 21,
+            width: 8192, height: 8192, emptyPayload: true);
+        var error = Assert.Throws<TextureFormatException>(() => ConvertedTextureFixture.SceneTextureDecoder(source, 1024));
+        Assert.Equal("NativeTextureDecodeBudget", error.Code);
+    }
+
+    [Fact]
+    public void ThreeLumaPlanesPreserveRgbWithoutTheChromaTransform()
+    {
+        var packet = ConvertedTextureFixture.Packet(16, 8, 19, red: 40, green: 120, blue: 220);
+        var result = new ConvertedTextureDecoder().Read(packet, 19, 16, 8, 512);
+        Assert.All(Enumerable.Range(0, 128), pixel =>
+            Assert.Equal(new byte[] { 40, 120, 220, 0 }, result.Rgba8.Slice(pixel * 4, 4).ToArray()));
+        var native = new NativeTextureDecoder().ReadDetailed(ConvertedTextureFixture.Source(soleRaw: true, selector: 19));
+        Assert.Equal(new byte[] { 64, 192, 96, 255 }, native.Document.OriginalBytes.Slice(148, 4).ToArray());
+    }
+    [Theory]
+    [InlineData(0)]
+    [InlineData(37)]
+    [InlineData(200)]
+    [InlineData(255)]
+    public void SingleRedPlanePreservesItsScalarSamplesAndSamplingChannels(byte red)
+    {
+        var packet = ConvertedTextureFixture.Packet(16, 8, 15, red: red);
+        var result = new ConvertedTextureDecoder().Read(packet, 15, 16, 8, 512);
+        Assert.All(Enumerable.Range(0, 128), pixel =>
+            Assert.Equal(new byte[] { red, 0, 0, 255 }, result.Rgba8.Slice(pixel * 4, 4).ToArray()));
+        Assert.Equal(512, Assert.Single(result.Info.Chunks).NormalizedLength);
+        var source = ConvertedTextureFixture.Source(soleRaw: true, selector: 15);
+        var native = new NativeTextureDecoder().ReadDetailed(source);
+        Assert.Equal(15, native.Conversion!.Selector);
+        Assert.Equal(new byte[] { 64, 0, 0, 255 }, native.Document.OriginalBytes.Slice(148, 4).ToArray());
+    }
+
+    [Theory]
+    [InlineData(64)]
+    [InlineData(-64)]
+    public void SingleRedPlaneKeepsSignedVerticalFrequencyAndRowOrder(int coefficient)
+    {
+        var result = new ConvertedTextureDecoder().Read(
+            ConvertedTextureFixture.Packet(8, 8, 15, verticalAc: coefficient, red: 128), 15, 8, 8, 256);
+        int[] rows = [139, 137, 134, 130, 126, 122, 119, 117];
+        for (var row = 0; row < 8; row++)
+            for (var column = 0; column < 8; column++)
+                Assert.Equal(new byte[] { (byte)(coefficient > 0 ? rows[row] : rows[7 - row]), 0, 0, 255 },
+                    result.Rgba8.Slice((row * 8 + column) * 4, 4).ToArray());
+    }
+
+    [Theory]
+    [InlineData(64, 192)]
+    [InlineData(200, 40)]
+    public void TwoLumaPlanesKeepIndependentPredictorsAndPackedChannels(byte red, byte green)
+    {
+        var packet = ConvertedTextureFixture.Packet(16, 8, 17, red: red, green: green);
+        var decoded = new ConvertedTextureDecoder().Read(packet, 17, 16, 8, 512);
+        Assert.All(Enumerable.Range(0, 128), pixel =>
+            Assert.Equal(new byte[] { red, green, 0, 0 }, decoded.Rgba8.Slice(pixel * 4, 4).ToArray()));
+        Assert.Equal(64, Assert.Single(decoded.Info.Chunks).NormalizedLength);
+        Assert.Equal(packet.Length, decoded.Info.ConsumedBodyBytes);
+    }
+
+    [Fact]
+    public void NativeTwoPlaneTextureUsesExistingMipSelectionAndSourceChecks()
+    {
+        var source = ConvertedTextureFixture.Source(selector: 17);
+        var decoded = new NativeTextureDecoder().ReadDetailed(source, maximumPreviewDimension: 16);
+        Assert.Equal(17, decoded.Conversion!.Selector);
+        Assert.Equal(16, decoded.Document.Info.Width);
+        Assert.Equal(1, Assert.Single(decoded.SupportedMips).MipIndex);
+        Assert.Equal(new byte[] { 64, 192, 0, 255 }, decoded.Document.OriginalBytes.Slice(148, 4).ToArray());
+        Assert.Equal(Convert.ToHexString(SHA256.HashData(decoded.Document.OriginalBytes.Span[148..])).ToLowerInvariant(),
+            Assert.Single(decoded.SupportedMips).DecodedSha256);
+    }
+
+    [Theory]
+    [InlineData("normalized-size")]
+    [InlineData("truncated")]
+    [InlineData("budget")]
+    public void TwoPlanePacketsRetainRangeAndBudgetLimits(string defect)
+    {
+        var packet = ConvertedTextureFixture.Packet(8, 8, 17);
+        if (defect == "normalized-size") BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(60), 1);
+        if (defect == "truncated") packet = packet[..^1];
+        Assert.Throws<TextureFormatException>(() => new ConvertedTextureDecoder().Read(
+            packet, 17, 8, 8, defect == "budget" ? 255 : 256));
+    }
+
     [Theory]
     [InlineData(7, 255)]
     [InlineData(1, 0)]
@@ -32,6 +150,39 @@ public sealed class ConvertedTextureDecoderTests
         var decoded = new ConvertedTextureDecoder().Read(ConvertedTextureFixture.Packet(8, 8, 21), 21, 8, 8, 256);
         Assert.All(Enumerable.Range(0, 64), pixel =>
             Assert.Equal(new byte[] { 128, 0, 0, 255 }, decoded.Rgba8.Slice(pixel * 4, 4).ToArray()));
+    }
+
+    [Fact]
+    public void TwoChannelMaskUsesIndependentLumaPlanesAndOpaqueSamplingAlpha()
+    {
+        var packet = ConvertedTextureFixture.Packet(8, 8, 23, red: 37, green: 209);
+        var decoded = new ConvertedTextureDecoder().Read(packet, 23, 8, 8, 256);
+        Assert.All(Enumerable.Range(0, 64), pixel =>
+            Assert.Equal(new byte[] { 37, 209, 0, 255 }, decoded.Rgba8.Slice(pixel * 4, 4).ToArray()));
+        Assert.Equal(64, Assert.Single(decoded.Info.Chunks).NormalizedLength);
+    }
+
+    [Fact]
+    public void NativeTwoChannelConversionPreservesLinearSamplesAndSourceMipCoverage()
+    {
+        var source = ConvertedTextureFixture.Source(selector: 23);
+        var decoded = new NativeTextureDecoder().ReadDetailed(source);
+        var surface = new DdsTextureDecoder().DecodeMip(decoded.Document);
+        Assert.False(surface.IsSrgb);
+        Assert.Equal(32, surface.Width);
+        Assert.Equal(new byte[] { 64, 192, 0, 255 }, surface.Rgba8.Slice(0, 4).ToArray());
+        Assert.Equal(23, decoded.Conversion!.Selector);
+        Assert.Single(decoded.SupportedMips);
+        Assert.Equal(5, decoded.OmittedMipIndices.Count);
+    }
+
+    [Fact]
+    public void TwoChannelConversionRejectsSingleChannelNormalizedExtent()
+    {
+        var packet = ConvertedTextureFixture.Packet(8, 8, 23);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(60), 32);
+        Assert.Equal("InvalidConvertedTextureRange", Assert.Throws<TextureFormatException>(() =>
+            new ConvertedTextureDecoder().Read(packet, 23, 8, 8, 256)).Code);
     }
 
     [Fact]
@@ -131,6 +282,18 @@ public sealed class ConvertedTextureDecoderTests
     }
 
     [Fact]
+    public void SourceLoadedLegacyConvertedPreviewStillRejectsRgbaOutputAboveBudget()
+    {
+        var source = ConvertedTextureFixture.LargeLegacyBc4Source();
+        var decoder = new NativeTextureDecoder();
+
+        var estimate = Assert.Throws<TextureFormatException>(() => decoder.EstimatePreviewWorkingSetBytes(source, 1024));
+        Assert.Equal("NativeTextureDecodeBudget", estimate.Code);
+        var preview = Assert.Throws<TextureFormatException>(() => decoder.ReadPreview(source, 1024));
+        Assert.Equal("NativeTextureDecodeBudget", preview.Code);
+    }
+
+    [Fact]
     public void SoleRawBaseRetainsTrailingEncodedDataWithoutClaimingItsMips()
     {
         var source = ConvertedTextureFixture.Source(soleRaw: true);
@@ -169,17 +332,55 @@ public sealed class ConvertedTextureDecoderTests
 
 internal static class ConvertedTextureFixture
 {
-    internal static byte[] Packet(int width, int height, ushort selector, byte alpha = 127, int verticalAc = 0)
+    internal static NativeTextureSource LargeLegacyBc4Source()
     {
-        var bits = new List<int>(); var predictors = new int[4]; var edge = selector == 21 ? 8 : 16;
-        for (var tile = 0; tile < width * height / (edge * edge); tile++)
-        for (var plane = 0; plane < (selector == 21 ? 1 : selector == 1 ? 10 : 6); plane++)
+        const int width = 4096;
+        const int height = 4096;
+        const string index = "generated-bc4-legacy-index";
+        const ushort selector = 21;
+        const byte format = 18;
+        var catalog = new ResourceIdentity(index, 0);
+        var container = new ResourceIdentity(index, 1);
+        var revision = new SourceRevision(index, "generated-bc4-legacy-source");
+        var raw = Payload(new(index, 2), 2229, 10, Wrap(new byte[96], raw: true));
+        var prefix = new byte[84]; prefix[0] = format;
+        BinaryPrimitives.WriteUInt16LittleEndian(prefix.AsSpan(1), width);
+        BinaryPrimitives.WriteUInt16LittleEndian(prefix.AsSpan(3), height);
+        BinaryPrimitives.WriteUInt16LittleEndian(prefix.AsSpan(5), 1);
+        prefix[7] = 1; prefix[12] = 1;
+        using var encodedStream = new MemoryStream();
+        using (var writer = new BinaryWriter(encodedStream, System.Text.Encoding.UTF8, true))
         {
-            var component = plane < 4 ? 0 : plane == 4 ? 1 : plane == 5 ? 2 : 3;
-            var value = component == 0 ? 1024 : component == 3 ? alpha * 8 : 0;
+            writer.Write("FILETEXT"u8); writer.Write(24u); writer.Write(prefix);
+            writer.Write((byte)1); writer.Write((byte)0); writer.Write((byte)1);
+            writer.Write((ushort)width); writer.Write((ushort)height); writer.Write((ushort)1); writer.Write((byte)1);
+            writer.Write(true); writer.Write((byte)60); writer.Write((byte)selector);
+            writer.Write(0u); writer.Write(2229u); writer.Write(10u); writer.Write(8_388_608u);
+        }
+        var encoded = encodedStream.ToArray();
+        var row = new TextureCatalogReference(0, TextureCatalogEntryKind.Raw,
+            new(IdentifierNamespace.Archive, raw.Id.ToString(), catalog, raw.Type), ReferenceStatus.Unique,
+            [raw.Identity], 0, new("generated.dat", 0, 9), false, null);
+        var membership = new TextureCatalogMembership(catalog, revision, 1, new("generated.dat", 0, 9), 1, 0, [row]);
+        var metadata = new TextureFileTextV24Reader().Parse(encoded, 0, encoded.Length, container, revision,
+            new(container, 0, encoded.Length), [new("generated.dat", 0, encoded.Length)], membership).Value!;
+        return new(raw.Identity, revision, catalog, "generated-bc4-legacy-catalog",
+            Payload(container, 29, 2, [1, 2, 3]), metadata, encoded, Hash(encoded), [raw]);
+    }
+
+    internal static byte[] Packet(int width, int height, ushort selector, byte alpha = 127, int verticalAc = 0,
+        byte red = 64, byte green = 192, byte blue = 96)
+    {
+        var bits = new List<int>(); var predictors = new int[4]; var edge = selector is 15 or 17 or 19 or 21 or 23 ? 8 : 16;
+        for (var tile = 0; tile < width * height / (edge * edge); tile++)
+        for (var plane = 0; plane < (selector is 17 or 23 ? 2 : selector == 19 ? 3 : selector is 15 or 21 ? 1 : selector == 1 ? 10 : 6); plane++)
+        {
+            var component = selector is 17 or 19 or 23 ? plane : plane < 4 ? 0 : plane == 4 ? 1 : plane == 5 ? 2 : 3;
+            var chroma = selector is not (17 or 19 or 23) && component is 1 or 2;
+            var value = selector == 15 ? red * 8 : selector is 17 or 19 or 23 ? (plane == 0 ? red : plane == 1 ? green : blue) * 8 : component == 0 ? 1024 : component == 3 ? alpha * 8 : 0;
             var difference = value - predictors[component]; predictors[component] = value;
             var category = difference == 0 ? 0 : System.Numerics.BitOperations.Log2((uint)Math.Abs(difference)) + 1;
-            var code = component is 1 or 2 ? ChromaDc[category] : LumaDc[category];
+            var code = chroma ? ChromaDc[category] : LumaDc[category];
             Write(code);
             if (category > 0)
             {
@@ -188,11 +389,11 @@ internal static class ConvertedTextureFixture
             }
             if (component == 0 && verticalAc != 0)
             {
-                if (verticalAc != 64) throw new ArgumentOutOfRangeException(nameof(verticalAc));
+                if (verticalAc is not (64 or -64)) throw new ArgumentOutOfRangeException(nameof(verticalAc));
                 // One coefficient at zigzag position 2 (vertical frequency 1), run 1 / size 7.
-                Write("1111111110000101"); Write("1000000");
+                Write("1111111110000101"); Write(verticalAc > 0 ? "1000000" : "0111111");
             }
-            Write(component is 1 or 2 ? "00" : "1010");
+            Write(chroma ? "00" : "1010");
         }
         var encodedBytes = new byte[(bits.Count + 7) / 8];
         for (var bit = 0; bit < bits.Count; bit++) encodedBytes[bit / 8] |= (byte)(bits[bit] << (7 - bit % 8));
@@ -201,7 +402,7 @@ internal static class ConvertedTextureFixture
         for (var field = 0; field < 3; field++)
         { BinaryPrimitives.WriteSingleLittleEndian(packet.AsSpan(12 + field * 4), new float[] { 0.2f, 0.3f, 0.4f }[field]); BinaryPrimitives.WriteSingleLittleEndian(packet.AsSpan(24 + field * 4), new float[] { 0.1f, 0.2f, 0.3f }[field]); }
         U16(52, (ushort)(width * height / (edge * edge))); U32(56, (uint)encodedBytes.Length);
-        U32(60, (uint)(width * height * (selector == 1 ? 1 : 0.5))); U32(64, 80);
+        U32(60, (uint)(width * height * (selector == 15 ? 4 : selector is 1 or 23 ? 1 : 0.5))); U32(64, 80);
         encodedBytes.CopyTo(packet, 80); return packet;
         void Write(string code) { foreach (var bit in code) bits.Add(bit - '0'); }
         void U16(int at, ushort value) => BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(at), value);
@@ -210,29 +411,36 @@ internal static class ConvertedTextureFixture
     private static readonly string[] LumaDc = ["00", "010", "011", "100", "101", "110", "1110", "11110", "111110", "1111110", "11111110", "111111110"];
     private static readonly string[] ChromaDc = ["00", "01", "10", "110", "1110", "11110", "111110", "1111110", "11111110", "111111110", "1111111110", "11111111110"];
 
-    internal static NativeTextureSource Source(bool soleRaw = false, ushort firstLodDepth = 1)
+    internal static NativeTextureSource Source(bool soleRaw = false, ushort firstLodDepth = 1, ushort selector = 1,
+        int width = 32, int height = 32, bool emptyPayload = false)
     {
         const string index = "generated-converted-index";
         var catalog = new ResourceIdentity(index, 0); var container = new ResourceIdentity(index, 1);
         var revision = new SourceRevision(index, "generated-source");
         var payloads = new List<NativeTexturePayload> { Payload(new(index, 2), 2229, 10,
-            soleRaw ? Wrap(Packet(32, 32, 1).Concat(new byte[] { 7, 8, 9, 10 }).ToArray(), true) : [1, 2]) };
+            soleRaw ? Wrap(emptyPayload ? [1, 2, 3] : Packet(width, height, selector).Concat(new byte[] { 7, 8, 9, 10 }).ToArray(), true) : [1, 2]) };
         if (!soleRaw)
-        { payloads.Add(Payload(new(index, 3), 2230, 11, Wrap(Packet(32, 32, 1), false))); payloads.Add(Payload(new(index, 4), 2230, 12, Wrap(Packet(16, 16, 1), false))); }
-        var descriptors = soleRaw ? new TextureFileTextV24LodDescriptor[] { new(32, 32, firstLodDepth, 6) } :
-            new TextureFileTextV24LodDescriptor[] { new(32, 32, firstLodDepth, 6), new(16, 16, 1, 5), new(8, 8, 1, 4) };
-        var prefix = new byte[84]; prefix[0] = 7; BinaryPrimitives.WriteUInt16LittleEndian(prefix.AsSpan(1), 32);
-        BinaryPrimitives.WriteUInt16LittleEndian(prefix.AsSpan(3), 32); BinaryPrimitives.WriteUInt16LittleEndian(prefix.AsSpan(5), 1);
-        prefix[7] = 6; prefix[12] = 1; prefix[14] = 1;
+        { payloads.Add(Payload(new(index, 3), 2230, 11, Wrap(Packet(width, height, selector), false))); payloads.Add(Payload(new(index, 4), 2230, 12, Wrap(Packet(width / 2, height / 2, selector), false))); }
+        var descriptors = soleRaw ? new TextureFileTextV24LodDescriptor[] { new((ushort)width, (ushort)height, firstLodDepth, 6) } :
+            new TextureFileTextV24LodDescriptor[] { new((ushort)width, (ushort)height, firstLodDepth, 6), new((ushort)(width / 2), (ushort)(height / 2), 1, 5), new((ushort)(width / 4), (ushort)(height / 4), 1, 4) };
+        var format = selector switch
+        { 15 => (byte)11, 21 => (byte)18, 23 => (byte)19, 7 or 17 or 19 => (byte)5, _ => (byte)7 };
+        var prefix = new byte[84]; prefix[0] = format; BinaryPrimitives.WriteUInt16LittleEndian(prefix.AsSpan(1), (ushort)width);
+        BinaryPrimitives.WriteUInt16LittleEndian(prefix.AsSpan(3), (ushort)height); BinaryPrimitives.WriteUInt16LittleEndian(prefix.AsSpan(5), 1);
+        prefix[7] = 6; prefix[12] = 1; prefix[14] = selector == 15 ? (byte)0 : (byte)1;
         using var stream = new MemoryStream();
         using (var writer = new BinaryWriter(stream, System.Text.Encoding.UTF8, true))
         {
             writer.Write("FILETEXT"u8); writer.Write(24u); writer.Write(prefix); writer.Write((byte)1); writer.Write((byte)0); writer.Write((byte)descriptors.Length);
             foreach (var descriptor in descriptors) { writer.Write(descriptor.Width); writer.Write(descriptor.Height); writer.Write(descriptor.ThirdU16); writer.Write(descriptor.TrailingByte); }
-            writer.Write(true); writer.Write((byte)60); writer.Write((byte)1);
+            writer.Write(true); writer.Write((byte)60); writer.Write((byte)selector);
             for (var mip = 0; mip < 6; mip++) writer.Write(0u);
-            writer.Write(2229u); writer.Write(10u); writer.Write(soleRaw ? 1536u : 256u);
-            if (!soleRaw) { writer.Write(2230u); writer.Write(11u); writer.Write(1024u); writer.Write(2230u); writer.Write(12u); writer.Write(256u); }
+            writer.Write(2229u); writer.Write(10u); writer.Write(NativeMipBytes(prefix[0], width, height));
+            if (!soleRaw)
+            {
+                writer.Write(2230u); writer.Write(11u); writer.Write(NativeMipBytes(prefix[0], width, height));
+                writer.Write(2230u); writer.Write(12u); writer.Write(NativeMipBytes(prefix[0], width / 2, height / 2));
+            }
         }
         var bytes = stream.ToArray();
         var references = payloads.Select((payload, sequence) => new TextureCatalogReference(sequence,
@@ -244,6 +452,27 @@ internal static class ConvertedTextureFixture
             new(container, 0, bytes.Length), [new("generated.dat", 0, 3)], membership).Value!;
         return new(payloads[0].Identity, revision, catalog, "generated-catalog", Payload(container, 29, 2, [1, 2, 3]), metadata, bytes, Hash(bytes), payloads);
     }
+
+    internal static NativeTextureDecoder SceneTextureDecoder(NativeTextureSource source, int maximumPreviewDimension)
+    {
+        var method = typeof(NativeModelSession).GetMethod("CreateSourceLoadedTextureDecoder",
+            BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+        try
+        {
+            return Assert.IsType<NativeTextureDecoder>(method!.Invoke(null,
+                [source, maximumPreviewDimension, CancellationToken.None]));
+        }
+        catch (TargetInvocationException error) when (error.InnerException is not null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error.InnerException).Throw();
+            throw;
+        }
+    }
+
+    private static uint NativeMipBytes(byte format, int width, int height) => checked((uint)(format is 5 or 7 or 18 or 19 or 25
+        ? ((width + 3L) / 4) * ((height + 3L) / 4) * (format is 7 or 19 or 25 ? 16 : 8)
+        : (long)width * height * (format == 11 ? 1 : 4)));
     private static NativeTexturePayload Payload(ResourceIdentity identity, uint type, uint id, byte[] bytes) =>
         new(identity, type, id, new("generated.dat", 0, bytes.Length, Hash(bytes)), bytes, Hash(bytes));
     private static byte[] Wrap(byte[] body, bool raw)

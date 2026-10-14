@@ -56,6 +56,7 @@ public sealed class TextureCatalogWorkflowTests
     public void SelectingAnotherTextureCancelsTheOriginOfPendingRelatedNavigation() => WorkspaceCommitTests.Run((window, fixture) =>
     {
         OpenNative(window, fixture); var index = window.CurrentSession!.Snapshot.IndexContentId;
+        Pump(window.TextureBrowser.ApplyFilterAsync(new Dictionary<string, string> { ["kind"] = "2" }));
         Pump(window.TextureBrowser.SelectResourceAsync(new(index, 2)));
         Pump(WaitAsync(() => window.TextureBrowser.NativeImageBrowser.CurrentSource is not null));
         var source = window.TextureBrowser.NativeImageBrowser.CurrentSource!;
@@ -111,7 +112,7 @@ public sealed class TextureCatalogWorkflowTests
         WriteCatalogArchive(fixture.Index); Pump(window.OpenArchiveAsync(fixture.Index)); Pump(window.ShowTexturesAsync());
         var catalogs = Field<TextureCatalogSession>(window, "textureCatalogs"); Pump(catalogs.EnrichmentTask);
         var group = catalogs.Groups.Single(item => item.CatalogIdentity.Ordinal == 0);
-        Pump(window.TextureBrowser.ApplyFilterAsync(new Dictionary<string, string> { ["group"] = group.CatalogIdentity.Key }));
+        Pump(window.TextureBrowser.ApplyFilterAsync(new Dictionary<string, string> { ["group"] = group.CatalogIdentity.Key, ["kind"] = "2" }));
         Assert.Equal(new long[] { 2, 5 }, window.TextureBrowser.CurrentResources.Select(item => item.Identity.Ordinal));
         var filters = window.TextureBrowser.CaptureFilter(); var library = new LibraryStore(fixture.Library);
         var workspace = Pump(library.ReadAsync()).Workspaces.Single(); var saved = Pump(library.SaveFilterAsync(workspace.Id, "textures", "Catalog selection", filters));

@@ -7,6 +7,7 @@ public sealed class AssetMemoryBudget
 {
     public const long DefaultMaximumBytes = 512L * 1024 * 1024;
     private readonly object sync = new();
+    private readonly Dictionary<string, long> categoryUsage = new(StringComparer.Ordinal);
     private long used;
     private long peak;
     private long maximumBytes;
@@ -24,6 +25,10 @@ public sealed class AssetMemoryBudget
     public long MaximumBytes { get { lock (sync) return maximumBytes; } }
     public long UsedBytes { get { lock (sync) return used; } }
     public long PeakBytes { get { lock (sync) return peak; } }
+    public IReadOnlyDictionary<string, long> CategoryUsage
+    {
+        get { lock (sync) return new Dictionary<string, long>(categoryUsage, StringComparer.Ordinal); }
+    }
 
     public Reservation Reserve(long bytes, string category)
     {
@@ -32,10 +37,16 @@ public sealed class AssetMemoryBudget
         lock (sync)
         {
             if (bytes > maximumBytes - used)
-                throw new ArchiveException("AssetMemoryLimit", $"The {category} exceeds the asset memory limit.");
+            {
+                var error = new ArchiveException("AssetMemoryLimit", $"The {category} exceeds the asset memory limit.");
+                error.Data["MemoryAdmission"] = new AssetMemoryAdmission(category, bytes, used, maximumBytes,
+                    new Dictionary<string, long>(categoryUsage, StringComparer.Ordinal));
+                throw error;
+            }
             used += bytes;
+            if (bytes > 0) categoryUsage[category] = checked(categoryUsage.GetValueOrDefault(category) + bytes);
             peak = Math.Max(peak, used);
-            return new Reservation(this, bytes);
+            return new Reservation(this, bytes, category);
         }
     }
 
@@ -72,8 +83,10 @@ public sealed class AssetMemoryBudget
     {
         private readonly AssetMemoryBudget owner;
         private long bytes;
+        private readonly string category;
         private bool disposed;
-        internal Reservation(AssetMemoryBudget owner, long bytes) { this.owner = owner; this.bytes = bytes; }
+        internal Reservation(AssetMemoryBudget owner, long bytes, string category)
+        { this.owner = owner; this.bytes = bytes; this.category = category; }
         public long Bytes { get { lock (owner.sync) return bytes; } }
 
         public void ReduceTo(long retainedBytes)
@@ -83,6 +96,7 @@ public sealed class AssetMemoryBudget
                 ObjectDisposedException.ThrowIf(disposed, this);
                 if (retainedBytes < 0 || retainedBytes > bytes) throw new ArgumentOutOfRangeException(nameof(retainedBytes));
                 owner.used -= bytes - retainedBytes;
+                ReleaseCategory(bytes - retainedBytes);
                 bytes = retainedBytes;
             }
         }
@@ -94,8 +108,20 @@ public sealed class AssetMemoryBudget
                 if (disposed) return;
                 disposed = true;
                 owner.used -= bytes;
+                ReleaseCategory(bytes);
                 bytes = 0;
             }
         }
+
+        private void ReleaseCategory(long released)
+        {
+            if (released == 0) return;
+            var remaining = owner.categoryUsage[category] - released;
+            if (remaining == 0) owner.categoryUsage.Remove(category);
+            else owner.categoryUsage[category] = remaining;
+        }
     }
 }
+
+public sealed record AssetMemoryAdmission(string Category, long RequestedBytes, long UsedBytes,
+    long MaximumBytes, IReadOnlyDictionary<string, long> Categories);

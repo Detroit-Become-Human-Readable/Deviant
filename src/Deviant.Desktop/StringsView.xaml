@@ -17,7 +17,7 @@
    <DataGrid x:Name="Rows" IsReadOnly="True" AutoGenerateColumns="False" SelectionMode="Extended" SelectionUnit="FullRow" EnableRowVirtualization="True" EnableColumnVirtualization="True" SelectionChanged="SelectionChanged" CanUserSortColumns="False">
     <DataGrid.Columns><DataGridTextColumn Header="Key" Binding="{Binding Key}" Width="1.4*"/><DataGridTextColumn Header="Language" Binding="{Binding Language}" Width="70"/><DataGridTextColumn Header="Text" Binding="{Binding Text}" Width="2*"/><DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="90"/></DataGrid.Columns>
    </DataGrid>
-   <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Stretch"/>
+   <GridSplitter Grid.Column="1" Width="8" HorizontalAlignment="Stretch" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" VerticalAlignment="Stretch"/>
    <Grid Grid.Column="2"><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="2*"/><RowDefinition Height="Auto"/><RowDefinition Height="3*"/></Grid.RowDefinitions>
     <TextBlock x:Name="SelectedKey" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,8"/>
     <TextBox x:Name="FullText" Grid.Row="1" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
@@ -28,10 +28,20 @@
       <TextBlock Grid.Row="2" Text="Other occurrences" Margin="0,10,0,4"/>
       <ListView x:Name="OtherOccurrences" Grid.Row="3"><ListView.View><GridView><GridViewColumn Header="Source" DisplayMemberBinding="{Binding Source}" Width="150"/><GridViewColumn Header="Language" DisplayMemberBinding="{Binding Language}" Width="65"/><GridViewColumn Header="Text" DisplayMemberBinding="{Binding Text}" Width="220"/></GridView></ListView.View></ListView>
      </Grid></TabItem>
-     <TabItem Header="Related"><DockPanel><TextBlock x:Name="RelatedStatus" DockPanel.Dock="Top" Margin="0,0,0,8" TextWrapping="Wrap"/><Button x:Name="OpenRelated" Content="Open" DockPanel.Dock="Bottom" HorizontalAlignment="Left" Click="OpenRelated_Click" IsEnabled="False"/>
-      <ListBox x:Name="RelatedResources" DisplayMemberPath="Label" SelectionChanged="RelatedSelectionChanged" MouseDoubleClick="Related_DoubleClick"/>
-     </DockPanel></TabItem>
-     <TabItem Header="Advanced"><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel><TextBlock x:Name="Advanced" FontFamily="Consolas" FontSize="11" TextWrapping="Wrap"/><TextBlock x:Name="RelatedEvidence" FontFamily="Consolas" FontSize="11" TextWrapping="Wrap" Margin="0,10,0,0"/></StackPanel></ScrollViewer></TabItem>
+      <TabItem Header="Related"><Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+       <TextBlock x:Name="RelatedStatus" TextWrapping="Wrap" Margin="0,0,0,6"/>
+       <Expander x:Name="PointerCandidatesExpander" Grid.Row="1" Header="Choose occurrence" Margin="0,0,0,6" Visibility="Collapsed">
+        <StackPanel>
+         <TextBlock x:Name="PointerCandidateSummary" Margin="0,0,0,4" Text="Same-key occurrences" TextWrapping="Wrap"/>
+         <ComboBox x:Name="PointerContextFilter" DisplayMemberPath="Label" Margin="0,0,0,6" SelectionChanged="PointerContextFilter_SelectionChanged"/>
+         <ListBox x:Name="PointerCandidateRows" Height="90" DisplayMemberPath="Label" SelectionChanged="PointerCandidateSelectionChanged" MouseDoubleClick="PointerCandidate_DoubleClick"/>
+         <Button x:Name="OpenPointerCandidate" Content="Open occurrence" HorizontalAlignment="Left" Margin="0,6,0,0" Click="OpenPointerCandidate_Click" IsEnabled="False"/>
+        </StackPanel>
+       </Expander>
+       <ListBox x:Name="RelatedResources" Grid.Row="2" DisplayMemberPath="Label" SelectionChanged="RelatedSelectionChanged" MouseDoubleClick="Related_DoubleClick"/>
+       <Button x:Name="OpenRelated" Grid.Row="3" Content="Open link" HorizontalAlignment="Left" Margin="0,6,0,0" Click="OpenRelated_Click" IsEnabled="False"/>
+      </Grid></TabItem>
+     <TabItem Header="Advanced"><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel><TextBlock x:Name="Advanced" FontFamily="Consolas" FontSize="11" TextWrapping="Wrap"/><TextBlock x:Name="PointerCandidateEvidence" FontFamily="Consolas" FontSize="11" TextWrapping="Wrap" Margin="0,10,0,0"/><TextBlock x:Name="RelatedEvidence" FontFamily="Consolas" FontSize="11" TextWrapping="Wrap" Margin="0,10,0,0"/></StackPanel></ScrollViewer></TabItem>
     </TabControl>
    </Grid>
   </Grid>

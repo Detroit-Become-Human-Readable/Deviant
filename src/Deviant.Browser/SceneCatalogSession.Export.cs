@@ -33,6 +33,8 @@ public sealed partial class SceneCatalogSession
                     document.Environment.References },
                 Names = section.NamesByNode.Select(pair => new { Identity = pair.Key, Names = pair.Value }),
                 References = section.ReferencesByNode.Select(pair => new { Identity = pair.Key, Relationships = pair.Value }),
+                IblLights = section.IblLightsByEntity.Select(pair => new
+                { Identity = pair.Key, pair.Value.Result, pair.Value.TextureResolutions }),
                 Objects = document.Objects.Select(frame => new
                 { frame.Identity, frame.NativeType, frame.NativeId, frame.PayloadExtent, frame.DirectoryEntryExtent }),
                 document.Diagnostics

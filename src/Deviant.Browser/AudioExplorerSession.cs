@@ -15,12 +15,12 @@ using AudioNameEvidence = Deviant.Formats.Audio.Model.NameEvidence;
 namespace Deviant.Browser;
 
 /// <summary>Owns one immutable archive revision and its cached audio metadata feature set.</summary>
-public sealed class AudioExplorerSession : IAsyncDisposable
+public sealed partial class AudioExplorerSession : IAsyncDisposable
 {
     public const string AssetFamily = "audio.media";
     private const string SnapshotFeature = "audio.snapshot.ready";
-    private const string SnapshotVersion = "audio-snapshot-m1.4-v2";
-    private const string AssetIndexVersion = "audio-asset-index-v5";
+    private const string SnapshotVersion = "audio-snapshot-m1.4-v3-midi";
+    private const string AssetIndexVersion = "audio-asset-index-v7-midi";
     private const string PreviewVersion = "audio-preview-m1-v1";
     private const long MaximumPreviewSourceBytes = 512L * 1024 * 1024;
 
@@ -30,11 +30,15 @@ public sealed class AudioExplorerSession : IAsyncDisposable
     private readonly CacheManager cache;
     private readonly AudioService audioService;
     private readonly AudioToolPaths audioTools;
-    private readonly string previewToolFingerprint;
+    private Lazy<Task>? audioInitialization;
+    private bool cachedNamesReady;
+    private readonly Dictionary<AudioToolUse, Lazy<Task<string>>> toolFingerprints = [];
     private readonly Dictionary<string, MediaEntry> mediaByIdentity;
     private readonly Dictionary<string, string> mediaFingerprints = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> bankLabelsByKey = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> labelsByIdentity = new(StringComparer.Ordinal);
+    private readonly Dictionary<(string Bank, uint Id), SortedDictionary<(long Ordinal, string MemberPath), MediaEntry>> fallbackLabelGroups = [];
+    private readonly Dictionary<string, ((string Bank, uint Id) Group, (long Ordinal, string MemberPath) Order)> fallbackLabelMembership = new(StringComparer.Ordinal);
     private readonly object catalogGate = new();
     private readonly CancellationTokenSource lifetime = new();
     private readonly CancellationTokenSource metadataCancellation;
@@ -44,7 +48,6 @@ public sealed class AudioExplorerSession : IAsyncDisposable
     private Lazy<Task>? enrichmentTask;
     private int disposed;
     private int enrichmentComplete;
-    private bool capabilitiesReady;
     private long updateGeneration;
     private long enrichmentProgressCompleted;
     private long enrichmentProgressTotal;
@@ -53,9 +56,19 @@ public sealed class AudioExplorerSession : IAsyncDisposable
     private readonly HashSet<string> stagedLanguages = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> stagedCodecs = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<int> stagedChannels = [];
+    private readonly Dictionary<string, long> stagedLanguageCounts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, long> stagedCodecCounts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<int, long> stagedChannelCounts = [];
+    private readonly Dictionary<string, StagedMediaFilterEntry> stagedMediaFilters = new(StringComparer.Ordinal);
+
+    private sealed record StagedMediaFilterEntry(string Group, string? Language, string? Codec, int? Channels);
+    private sealed record AudioUserLabelDelta(Dictionary<string, string> Labels,
+        Dictionary<string, MediaEntry> Entries,
+        Dictionary<(string Bank, uint Id), SortedDictionary<(long Ordinal, string MemberPath), MediaEntry>?> Groups,
+        Dictionary<string, ((string Bank, uint Id) Group, (long Ordinal, string MemberPath) Order)?> Membership);
 
     private AudioExplorerSession(ArchiveSnapshot snapshot, CatalogSession archiveSession, FeatureStore featureStore,
-        AudioSnapshotResult result, AliasStore aliases, CacheManager cache, AudioToolPaths tools, string previewToolFingerprint)
+        AudioSnapshotResult result, AliasStore aliases, CacheManager cache, AudioToolPaths tools)
     {
         Snapshot = snapshot;
         metadataCancellation = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
@@ -66,7 +79,6 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         this.cache = cache;
         audioTools = tools;
         audioService = new AudioService(tools);
-        this.previewToolFingerprint = previewToolFingerprint;
         mediaByIdentity = new Dictionary<string, MediaEntry>(StringComparer.Ordinal);
         AudioResult = result;
         var labels = BuildUserLabels(result.Catalog);
@@ -140,29 +152,21 @@ public sealed class AudioExplorerSession : IAsyncDisposable
             cancellationToken.ThrowIfCancellationRequested();
 
             var featureKey = BuildSnapshotFeatureKey(snapshot);
-            var result = await LoadCachedSnapshotAsync(featureStore, featureKey, snapshot, cancellationToken).ConfigureAwait(false);
-            var toolFingerprint = await GetPreviewToolFingerprintAsync(audioTools, cancellationToken).ConfigureAwait(false);
-            var session = new AudioExplorerSession(snapshot, archiveSession, featureStore, result ?? EmptyAudioResult(snapshot), aliases, cache, audioTools, toolFingerprint);
-            if (result is not null)
+            var session = new AudioExplorerSession(snapshot, archiveSession, featureStore, EmptyAudioResult(snapshot), aliases, cache, audioTools);
+            session.ConfigureDeferredAudio(featureKey, progress);
+            if (startEnrichment)
             {
-                var marker = await Task.Run(() => featureStore.Load<AudioFeatureMarker>("audio-feature-index", AssetIndexVersion, cancellationToken), cancellationToken).ConfigureAwait(false);
-                if (marker?.MediaCount == result.Catalog.Media.Count)
+                try
                 {
-                    lock (session.catalogGate) session.capabilitiesReady = true;
+                    await session.EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
+                    _ = session.EnrichmentTask;
                 }
-                else await session.ReplaceSnapshotAsync(result, initializeFeatures: true, cancellationToken).ConfigureAwait(false);
-                Interlocked.Exchange(ref session.enrichmentComplete, 1);
-                Volatile.Write(ref session.currentProgress, new("Catalogue ready", result.Catalog.Media.Count, result.Catalog.Media.Count));
-                Interlocked.Exchange(ref session.enrichmentProgressCompleted, result.Catalog.Media.Count);
-                Interlocked.Exchange(ref session.enrichmentProgressTotal, result.Catalog.Media.Count);
-                session.PublishUpdate("Loaded cached audio metadata", null);
-            }
-            else
-            {
-                session.enrichmentTask = new(() => Task.Run(
-                    () => session.EnrichAsync(featureKey, progress, session.metadataCancellation.Token), session.metadataCancellation.Token),
-                    LazyThreadSafetyMode.ExecutionAndPublication);
-                if (startEnrichment) _ = session.EnrichmentTask;
+                catch
+                {
+                    await session.DisposeAsync().ConfigureAwait(false);
+                    featureStore = null; archiveSession = null;
+                    throw;
+                }
             }
             return session;
         }
@@ -210,18 +214,19 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         }
     }
 
-    private async Task EnrichAsync(string featureKey, IProgress<AudioExplorerProgress>? progress, CancellationToken token)
+    private async Task EnrichAsync(string featureKey, IProgress<AudioExplorerProgress>? progress, CancellationToken token, bool upgradeNames = false)
     {
         var reader = new DetroitAudioSnapshotReader();
         try
         {
-            var result = await reader.ReadSnapshotAsync(Snapshot, new InlineProgress<AudioReadProgress>(value =>
+            var readerProgress = new InlineProgress<AudioReadProgress>(value =>
             {
                 token.ThrowIfCancellationRequested();
                 if (value.Snapshot is not null)
                 {
                     var staged = new AudioSnapshotResult(value.Snapshot, value.Snapshot.Diagnostics.AsReadOnly());
-                    ReplaceSnapshotAsync(staged, initializeFeatures: false, token).GetAwaiter().GetResult();
+                    ReplaceSnapshotAsync(staged, initializeFeatures: false, token,
+                        changedMedia: value.ChangedMedia).GetAwaiter().GetResult();
                 }
                 Interlocked.Exchange(ref enrichmentProgressCompleted, value.Completed);
                 Interlocked.Exchange(ref enrichmentProgressTotal, value.Total);
@@ -229,13 +234,21 @@ public sealed class AudioExplorerSession : IAsyncDisposable
                 if (value.Snapshot is not null)
                     PublishUpdate(value.Phase, value.Detail, value.Completed, value.Total);
                 progress?.Report(new(value.Phase, value.Completed, value.Total, value.Detail));
-            }), token).ConfigureAwait(false);
+            });
+            var result = upgradeNames
+                ? await reader.ReadCachedEventLinksAsync(Snapshot, Catalog, readerProgress, token).ConfigureAwait(false)
+                : await reader.ReadSnapshotAsync(Snapshot, readerProgress, token).ConfigureAwait(false);
             token.ThrowIfCancellationRequested();
+            if (result.Catalog.DialogueHeaderVersion != DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion)
+            {
+                result.Catalog.DialogueHeaderAssociations = (await reader.ReadDialogueHeaderAssociationsAsync(Snapshot, token).ConfigureAwait(false)).ToList();
+                result.Catalog.DialogueHeaderVersion = DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion;
+            }
             ReportEnrichmentProgress("Preparing audio library", 0, 0, progress);
             await ReplaceSnapshotAsync(result, initializeFeatures: true, token).ConfigureAwait(false);
             await SaveSnapshotItemsAsync(featureKey, result, progress, token).ConfigureAwait(false);
+            await SaveDialogueHeadersAsync(featureStore, featureKey, Snapshot, result.Catalog, token).ConfigureAwait(false);
             Interlocked.Exchange(ref enrichmentComplete, 1);
-            lock (catalogGate) capabilitiesReady = true;
             Volatile.Write(ref currentProgress, new("Catalogue ready", result.Catalog.Media.Count, result.Catalog.Media.Count));
             Interlocked.Exchange(ref enrichmentProgressCompleted, result.Catalog.Media.Count);
             Interlocked.Exchange(ref enrichmentProgressTotal, result.Catalog.Media.Count);
@@ -259,15 +272,32 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         }
     }
 
-    private async Task ReplaceSnapshotAsync(AudioSnapshotResult result, bool initializeFeatures, CancellationToken token)
+    private async Task ReplaceSnapshotAsync(AudioSnapshotResult result, bool initializeFeatures, CancellationToken token,
+        bool persistFeatures = true, IReadOnlyList<MediaEntry>? changedMedia = null)
     {
         if (result.Catalog.IndexContentId != Snapshot.IndexContentId || result.Catalog.PhysicalSourceStamp != Snapshot.PhysicalSourceStamp)
             throw new InvalidDataException("Audio snapshot does not belong to the opened archive revision.");
-        var ready = initializeFeatures;
-        var labels = BuildUserLabels(result.Catalog);
+        var fullUpdate = initializeFeatures || changedMedia is null;
+        AudioUserLabelDelta? labelDelta = null;
+        Dictionary<string, string> labels;
+        if (fullUpdate)
+        {
+            lock (catalogGate) labels = BuildUserLabels(result.Catalog);
+        }
+        else
+        {
+            labelDelta = PrepareUserLabelDelta(changedMedia!);
+            labels = labelDelta.Labels;
+        }
+
+        var candidates = new Dictionary<string, MediaEntry>(StringComparer.Ordinal);
+        foreach (var media in fullUpdate ? result.Catalog.Media : changedMedia!)
+            if (media.Identity is { } identity) candidates[identity.Key] = media;
+        if (labelDelta is not null)
+            foreach (var pair in labelDelta.Entries) candidates[pair.Key] = pair.Value;
         var mediaToIndex = new List<MediaEntry>();
         var fingerprints = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var media in result.Catalog.Media)
+        foreach (var media in candidates.Values)
         {
             if (media.Identity is null) continue;
             var label = labels.GetValueOrDefault(media.Identity.Key, UserLabel(media));
@@ -277,16 +307,16 @@ public sealed class AudioExplorerSession : IAsyncDisposable
             if (initializeFeatures || !mediaFingerprints.TryGetValue(media.Identity.Key, out var previous) || previous != fingerprint)
                 mediaToIndex.Add(media);
         }
-        IEnumerable<AssetDescriptor> Descriptors() => mediaToIndex.Select(media => Describe(media, ready,
+        IEnumerable<AssetDescriptor> Descriptors() => mediaToIndex.Select(media => Describe(media,
             media.Identity is not null && labels.TryGetValue(media.Identity.Key, out var label) ? label : null));
         await featureGate.WaitAsync(token).ConfigureAwait(false);
         try
         {
-            if (initializeFeatures)
+            if (persistFeatures && initializeFeatures)
                 await Task.Run(() => featureStore.ReplaceAssets(AssetFamily, Descriptors(), token), token).ConfigureAwait(false);
-            else if (mediaToIndex.Count > 0)
+            else if (persistFeatures && mediaToIndex.Count > 0)
                 await Task.Run(() => featureStore.UpsertAssets(Descriptors(), token), token).ConfigureAwait(false);
-            if (initializeFeatures)
+            if (persistFeatures && initializeFeatures)
                 await Task.Run(() => featureStore.Save("audio-feature-index", AssetIndexVersion, new AudioFeatureMarker(mediaToIndex.Count), token), token).ConfigureAwait(false);
             lock (catalogGate)
             {
@@ -298,27 +328,29 @@ public sealed class AudioExplorerSession : IAsyncDisposable
                         mediaByIdentity[media.Identity.Key] = media;
                         mediaFingerprints[media.Identity.Key] = fingerprints[media.Identity.Key];
                     }
-                capabilitiesReady = ready;
-                labelsByIdentity.Clear();
-                foreach (var pair in labels) labelsByIdentity[pair.Key] = pair.Value;
-                if (initializeFeatures) InitializeFilterOptions();
-                else UpdateStagedFilterOptions(result.Catalog);
+                if (fullUpdate)
+                {
+                    labelsByIdentity.Clear();
+                    foreach (var pair in labels) labelsByIdentity[pair.Key] = pair.Value;
+                }
+                else if (labelDelta is not null) ApplyUserLabelDelta(labelDelta);
+                if (initializeFeatures) InitializeFilterOptions(labelsAlreadyBuilt: true);
+                else UpdateStagedFilterOptions(result.Catalog, fullUpdate ? null : changedMedia);
             }
         }
         finally { featureGate.Release(); }
     }
 
-    private void UpdateStagedFilterOptions(AudioCatalog catalog)
+    private void UpdateStagedFilterOptions(AudioCatalog catalog, IReadOnlyCollection<MediaEntry>? changedMedia = null)
     {
-        stagedGroupCounts.Clear(); stagedLanguages.Clear(); stagedCodecs.Clear(); stagedChannels.Clear();
-        foreach (var media in catalog.Media)
+        if (changedMedia is null)
         {
-            var group = GroupKey(media);
-            stagedGroupCounts[group] = stagedGroupCounts.GetValueOrDefault(group) + 1;
-            if (!string.IsNullOrWhiteSpace(media.Language)) stagedLanguages.Add(media.Language);
-            if (!string.IsNullOrWhiteSpace(media.Codec) && media.Codec != "Unknown") stagedCodecs.Add(media.Codec);
-            if (media.Channels > 0) stagedChannels.Add(media.Channels);
+            stagedGroupCounts.Clear(); stagedLanguages.Clear(); stagedCodecs.Clear(); stagedChannels.Clear();
+            stagedLanguageCounts.Clear(); stagedCodecCounts.Clear(); stagedChannelCounts.Clear(); stagedMediaFilters.Clear();
+            foreach (var media in catalog.Media) UpdateStagedMediaFilter(media);
         }
+        else foreach (var media in changedMedia) UpdateStagedMediaFilter(media);
+
         var banks = catalog.Banks.OrderBy(bank => bank.Name, StringComparer.OrdinalIgnoreCase).ToArray();
         bankLabelsByKey.Clear();
         var choices = new List<AudioBankChoice>(banks.Length + 1);
@@ -338,6 +370,42 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         ChannelCounts = stagedChannels.Order().ToArray();
     }
 
+    private void UpdateStagedMediaFilter(MediaEntry media)
+    {
+        if (media.Identity is not { } identity) return;
+        if (stagedMediaFilters.Remove(identity.Key, out var prior))
+        {
+            Decrement(stagedGroupCounts, prior.Group, out _);
+            if (prior.Language is { } oldLanguage && Decrement(stagedLanguageCounts, oldLanguage, out var noLanguage) && noLanguage)
+                stagedLanguages.Remove(oldLanguage);
+            if (prior.Codec is { } oldCodec && Decrement(stagedCodecCounts, oldCodec, out var noCodec) && noCodec)
+                stagedCodecs.Remove(oldCodec);
+            if (prior.Channels is { } oldChannels && Decrement(stagedChannelCounts, oldChannels, out var noChannels) && noChannels)
+                stagedChannels.Remove(oldChannels);
+        }
+
+        var current = new StagedMediaFilterEntry(GroupKey(media),
+            string.IsNullOrWhiteSpace(media.Language) ? null : media.Language,
+            string.IsNullOrWhiteSpace(media.Codec) || media.Codec == "Unknown" ? null : media.Codec,
+            media.Channels > 0 ? media.Channels : null);
+        stagedMediaFilters[identity.Key] = current;
+        Increment(stagedGroupCounts, current.Group);
+        if (current.Language is { } language) { Increment(stagedLanguageCounts, language); stagedLanguages.Add(language); }
+        if (current.Codec is { } codec) { Increment(stagedCodecCounts, codec); stagedCodecs.Add(codec); }
+        if (current.Channels is { } channels) { Increment(stagedChannelCounts, channels); stagedChannels.Add(channels); }
+    }
+
+    private static void Increment<TKey>(Dictionary<TKey, long> counts, TKey key) where TKey : notnull =>
+        counts[key] = counts.GetValueOrDefault(key) + 1;
+
+    private static bool Decrement<TKey>(Dictionary<TKey, long> counts, TKey key, out bool removed) where TKey : notnull
+    {
+        if (!counts.TryGetValue(key, out var count)) { removed = false; return false; }
+        if (count <= 1) { counts.Remove(key); removed = true; }
+        else { counts[key] = count - 1; removed = false; }
+        return true;
+    }
+
     private static async Task<AudioSnapshotResult?> LoadCachedSnapshotAsync(FeatureStore store, string featureKey,
         ArchiveSnapshot snapshot, CancellationToken token)
     {
@@ -348,7 +416,8 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         {
             SourcePath = head.SourcePath, Fingerprint = head.Fingerprint, IndexContentId = head.IndexContentId,
             PhysicalSourceStamp = head.PhysicalSourceStamp, IndexStamp = head.IndexStamp,
-            SourceVolumes = head.SourceVolumes, IndexedResourceCount = head.IndexedResourceCount
+            SourceVolumes = head.SourceVolumes, IndexedResourceCount = head.IndexedResourceCount,
+            EventMediaVersion = head.EventMediaVersion
         };
         var loads = await Task.Run(() => new AudioSnapshotRows(
             store.LoadItems<BankInfo>("audio.banks", SnapshotVersion, token),
@@ -359,6 +428,10 @@ public sealed class AudioExplorerSession : IAsyncDisposable
             store.LoadItems<Diagnostic>("audio.diagnostics", SnapshotVersion, token),
             store.LoadItems<MediaSourceEvidence>("audio.source-declarations", SnapshotVersion, token)), token).ConfigureAwait(false);
         catalog.Banks.AddRange(loads.Banks); catalog.Media.AddRange(loads.Media); catalog.Events.AddRange(loads.Events);
+        foreach (var media in catalog.Media)
+            if (media.Completeness == MediaCompleteness.Unverified &&
+                media.State is (MediaState.CompleteEmbedded or MediaState.CompleteExternal) && MediaPolicy.CanPreview(media))
+                media.SourceDeclarationProcessingComplete = true;
         catalog.Names.AddRange(loads.Names); catalog.Localization.AddRange(loads.Localization);
         catalog.Diagnostics.AddRange(loads.Diagnostics); catalog.SourceDeclarations.AddRange(loads.SourceDeclarations);
         return new(catalog, catalog.Diagnostics.AsReadOnly());
@@ -400,7 +473,7 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         await Task.Run(() => featureStore.SaveItems("audio.diagnostics", SnapshotVersion, Track(catalog.Diagnostics), token), token).ConfigureAwait(false);
         await Task.Run(() => featureStore.SaveItems("audio.source-declarations", SnapshotVersion, Track(catalog.SourceDeclarations), token), token).ConfigureAwait(false);
         var head = new AudioSnapshotHead(catalog.SourcePath, catalog.Fingerprint, catalog.IndexContentId,
-            catalog.PhysicalSourceStamp, catalog.IndexStamp, catalog.SourceVolumes, catalog.IndexedResourceCount);
+            catalog.PhysicalSourceStamp, catalog.IndexStamp, catalog.SourceVolumes, catalog.IndexedResourceCount, catalog.EventMediaVersion);
         await Task.Run(() => featureStore.Save(featureKey, SnapshotVersion, head, token), token).ConfigureAwait(false);
     }
 
@@ -430,6 +503,7 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(query);
         ValidateQuery(query);
         ThrowIfDisposed();
+        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
         var assetQuery = ToAssetQuery(query);
         await featureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -448,6 +522,7 @@ public sealed class AudioExplorerSession : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(query);
         ThrowIfDisposed();
+        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
         var unpaged = ToAssetQuery(query with { Offset = 0, Limit = 10_000 });
         await featureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -472,6 +547,7 @@ public sealed class AudioExplorerSession : IAsyncDisposable
     public async Task SetAliasAsync(ResourceIdentity identity, string? alias, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
         await featureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -493,6 +569,7 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
         MediaEntry media;
         AssetCapabilities capabilities;
         lock (catalogGate)
@@ -505,10 +582,12 @@ public sealed class AudioExplorerSession : IAsyncDisposable
             throw new AudioToolException("Choose Partial preview to audition this fragment.");
         if (partialPreview && media.Completeness != MediaCompleteness.Fragment)
             throw new AudioToolException("This media is not classified as a fragment.");
+        if (media.Completeness == MediaCompleteness.Unverified && !media.SourceDeclarationProcessingComplete)
+            throw new AudioToolException("Audio source declarations are still being checked.");
+        if (!MediaPolicy.CanPreview(media)) throw new AudioToolException(MediaPolicy.GetUnavailableReason(media));
         if (partialPreview && !capabilities.HasFlag(AssetCapabilities.PartialPreview) ||
             !partialPreview && !capabilities.HasFlag(AssetCapabilities.Preview))
-            throw new AudioToolException("Audio processing is unavailable until source declarations finish loading.");
-        if (!MediaPolicy.CanPreview(media)) throw new AudioToolException(MediaPolicy.GetUnavailableReason(media));
+            throw new AudioToolException("The audio source could not be validated for preview.");
         using var metadataVerifier = new AudioMetadataVerifier(Snapshot).CreateLease();
         await metadataVerifier.VerifyMediaAsync(media,cancellationToken).ConfigureAwait(false);
 
@@ -523,7 +602,8 @@ public sealed class AudioExplorerSession : IAsyncDisposable
             SourceIdentity.EnsureUnchanged(new FileRevisionProvider(), source.VolumeHandle, source.Volume.FilePath, source.Volume.Stamp);
             var sourceRevision = SourceIdentity.DerivedCacheKey(Snapshot.IndexContentId, Snapshot.PhysicalSourceStamp);
             var options = $"wav={format};partial={partialPreview};channels=source";
-            var cacheKey = CacheManager.Key(sourceRevision, payloadHash, previewToolFingerprint, options);
+            var fingerprint = await GetToolFingerprintAsync(AudioToolUse.Wav, token).ConfigureAwait(false);
+            var cacheKey = CacheManager.Key(sourceRevision, payloadHash, fingerprint, options);
             var lease = await cache.AcquireAsync(cacheKey, async (destination, cacheToken) =>
             {
                 var purpose = partialPreview ? DecodePurpose.PartialPreview : DecodePurpose.Preview;
@@ -556,6 +636,7 @@ public sealed class AudioExplorerSession : IAsyncDisposable
     public AudioExportReview Review(IReadOnlyList<AudioExplorerRow> rows)
     {
         ThrowIfDisposed();
+        EnsureAudioInitialized();
         if (!IsEnrichmentComplete && rows.Count > 0)
             throw new ArchiveException("ClassificationPending", "Audio rows are not exportable until source declarations finish loading.");
         var byteTotal = 0L;
@@ -571,6 +652,7 @@ public sealed class AudioExplorerSession : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(identities);
         ThrowIfDisposed();
+        EnsureAudioInitialized();
         lock (catalogGate)
         {
             var result = new List<AudioExplorerRow>();
@@ -590,6 +672,7 @@ public sealed class AudioExplorerSession : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(identityKeys);
         ThrowIfDisposed();
+        EnsureAudioInitialized();
         lock (catalogGate)
         {
             var rows = new List<AudioExplorerRow>();
@@ -604,19 +687,22 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         }
     }
 
-    public Task<IReadOnlyList<AudioExplorerRow>> ReadSelectionAsync(IEnumerable<string> identityKeys,
+    public async Task<IReadOnlyList<AudioExplorerRow>> ReadSelectionAsync(IEnumerable<string> identityKeys,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(identityKeys);
         var keys = identityKeys.ToArray();
-        return Task.Run<IReadOnlyList<AudioExplorerRow>>(() => ResolveSelectionKeys(keys), cancellationToken);
+        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
+        return await Task.Run<IReadOnlyList<AudioExplorerRow>>(() => ResolveSelectionKeys(keys), cancellationToken).ConfigureAwait(false);
     }
 
-    public Task<AudioExportReport> ExportAsync(AudioExportReview review, AudioExportOptions options,
+    public async Task<AudioExportReport> ExportAsync(AudioExportReview review, AudioExportOptions options,
         IProgress<AudioProgress>? progress = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(review);
+        ArgumentNullException.ThrowIfNull(options);
         ThrowIfDisposed();
+        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
         if (!ReferenceEquals(review.Snapshot, Snapshot) || review.Snapshot.IndexContentId != Snapshot.IndexContentId ||
             review.Snapshot.PhysicalSourceStamp != Snapshot.PhysicalSourceStamp)
             throw new ArchiveException("StaleReview", "The export review belongs to a different archive revision. Review the selection again.");
@@ -628,21 +714,25 @@ public sealed class AudioExplorerSession : IAsyncDisposable
             audioTools.VgmstreamCli, audioTools.Ffmpeg, audioTools.Ffprobe, audioTools.Ww2Ogg, audioTools.Revorb,
             audioTools.PackedCodebooks, audioTools.PackedCodebooksAoTuV }
             .Where(path => !string.IsNullOrWhiteSpace(path)).Select(path => Directory.Exists(path) ? path! : Path.GetDirectoryName(path!)!);
-        return new AudioExportService(audioService, previewToolFingerprint, privateRoots: toolRoots).ExportAsync(request, options, progress, cancellationToken);
+        var fingerprint = options.Format == AudioExportFormat.Original ? "audio-original-copy-v1" :
+            !review.Rows.Any(row => MediaPolicy.CanConvert(row.Media)) ? "audio-no-conversion-v1" :
+            await GetToolFingerprintAsync(options.Format == AudioExportFormat.Wav ? AudioToolUse.Wav : AudioToolUse.Ogg, cancellationToken).ConfigureAwait(false);
+        return await new AudioExportService(audioService, fingerprint, privateRoots: toolRoots).ExportAsync(request, options, progress, cancellationToken).ConfigureAwait(false);
     }
 
-    public Task<AudioExportReport> ExportBankAsync(string bankKey, string outputDirectory, bool overwrite = false,
+    public async Task<AudioExportReport> ExportBankAsync(string bankKey, string outputDirectory, bool overwrite = false,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
         var bank = Catalog.Banks.FirstOrDefault(candidate => candidate.Key == bankKey)
             ?? throw new ArchiveException("MissingBank", "The selected bank is not part of the current audio snapshot.");
         var toolRoots = new[] { AppContext.BaseDirectory, Environment.CurrentDirectory, audioTools.ConfiguredDirectory,
             audioTools.VgmstreamCli, audioTools.Ffmpeg, audioTools.Ffprobe, audioTools.Ww2Ogg, audioTools.Revorb,
             audioTools.PackedCodebooks, audioTools.PackedCodebooksAoTuV }
             .Where(path => !string.IsNullOrWhiteSpace(path)).Select(path => Directory.Exists(path) ? path! : Path.GetDirectoryName(path!)!);
-        return new AudioExportService(audioService, previewToolFingerprint, privateRoots: toolRoots)
-            .ExportBankAsync(Snapshot, bank, outputDirectory, overwrite, cancellationToken);
+        return await new AudioExportService(audioService, "audio-original-copy-v1", privateRoots: toolRoots)
+            .ExportBankAsync(Snapshot, bank, outputDirectory, overwrite, cancellationToken).ConfigureAwait(false);
     }
 
     public ValueTask DisposeAsync()
@@ -656,15 +746,18 @@ public sealed class AudioExplorerSession : IAsyncDisposable
 
     private async Task DisposeCoreAsync()
     {
-        Task? started;
+        Task[] started;
         lock (disposeGate)
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
             lifetime.Cancel();
-            started = enrichmentTask?.IsValueCreated == true ? enrichmentTask.Value : null;
+            started = new[] { enrichmentTask, audioInitialization }.OfType<Lazy<Task>>()
+                .Where(task => task.IsValueCreated).Select(task => task.Value)
+                .Concat(toolFingerprints.Values.Where(task => task.IsValueCreated).Select(task => (Task)task.Value)).ToArray();
         }
-        try { if (started is not null) await started.ConfigureAwait(false); }
+        try { await Task.WhenAll(started).ConfigureAwait(false); }
         catch { /* Disposal drains a failed enrichment just as it drains cancellation. */ }
+        await WaitForSharedFeatureLeasesAsync().ConfigureAwait(false);
         await featureGate.WaitAsync().ConfigureAwait(false);
         try
         {
@@ -679,34 +772,17 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         }
     }
 
-    private void InitializeFilterOptions()
+    private void InitializeFilterOptions(bool labelsAlreadyBuilt = false)
     {
-        var grouped = Catalog.Media.GroupBy(media => GroupKey(media)).ToDictionary(group => group.Key, group => (long)group.LongCount(), StringComparer.Ordinal);
-        labelsByIdentity.Clear();
-        foreach (var pair in BuildUserLabels(Catalog)) labelsByIdentity[pair.Key] = pair.Value;
-        bankLabelsByKey.Clear();
-        var sourceBanks = Catalog.Banks.OrderBy(bank => bank.Name, StringComparer.OrdinalIgnoreCase).ToArray();
-        var friendlyBanks = new List<AudioBankChoice>(sourceBanks.Length);
-        for (var index = 0; index < sourceBanks.Length; index++)
+        if (!labelsAlreadyBuilt)
         {
-            var bank = sourceBanks[index];
-            var label = string.IsNullOrWhiteSpace(bank.Name) || bank.Name == bank.Id.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                ? $"Bank {index + 1}" : bank.Name;
-            bankLabelsByKey[bank.Key] = label;
-            friendlyBanks.Add(new AudioBankChoice(bank.Key, label, grouped.GetValueOrDefault(bank.Key), bank.Id, bank.Name,
-                bank.Diagnostics.FirstOrDefault()?.Message ?? (bank.ContainerIdentity is null ? "Bank payload unavailable." : null)));
+            labelsByIdentity.Clear();
+            foreach (var pair in BuildUserLabels(Catalog)) labelsByIdentity[pair.Key] = pair.Value;
         }
-        Banks = friendlyBanks;
-        if (grouped.TryGetValue(StandaloneGroupKey, out var standaloneCount))
-            Banks = Banks.Append(new AudioBankChoice(StandaloneGroupKey, "Standalone", standaloneCount, 0, "Standalone")).ToArray();
-        Languages = Catalog.Media.Select(media => media.Language).Where(value => !string.IsNullOrWhiteSpace(value))
-            .Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToArray();
-        Codecs = Catalog.Media.Select(media => media.Codec).Where(value => !string.IsNullOrWhiteSpace(value) && value != "Unknown")
-            .Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToArray();
-        ChannelCounts = Catalog.Media.Select(media => media.Channels).Where(value => value > 0).Distinct().Order().ToArray();
+        UpdateStagedFilterOptions(Catalog);
     }
 
-    private AssetDescriptor Describe(MediaEntry media, bool? readyOverride = null, string? labelOverride = null)
+    private AssetDescriptor Describe(MediaEntry media, string? labelOverride = null)
     {
         var identity = media.Identity ?? throw new InvalidDataException($"Audio reader did not assign a stable identity to media {media.Id:X8}.");
         if (identity.IndexContentId != Snapshot.IndexContentId || identity.Ordinal < 0 || identity.Ordinal >= Snapshot.Records.Count)
@@ -715,19 +791,25 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         var owner = AudioResourceBinding.ResolveOwner(Snapshot, payloadIdentity);
         var relative = owner.Volume?.RelativeName ?? owner.Resource.VolumeName;
         IReadOnlyList<SourceExtent> extents = Array.Empty<SourceExtent>();
+        var sourceBindingResolved = false;
         if (media.PayloadIdentity is not null && MediaPolicy.HasBytes(media))
         {
             var binding = AudioResourceBinding.Resolve(Snapshot, media);
             extents = [new SourceExtent(binding.Volume.RelativeName, binding.Extent.Offset, binding.Extent.Length)];
+            sourceBindingResolved = true;
         }
         var names = media.Names.Select(evidence => new Deviant.Assets.NameEvidence(evidence.Text, MapOrigin(evidence.Kind), evidence.Source, evidence.CollisionGroup)).ToList();
         var alias = aliases.Get(identity);
         if (!string.IsNullOrWhiteSpace(alias)) names.Add(new(alias, NameOrigin.UserAlias, "User alias"));
-        var ready = readyOverride ?? capabilitiesReady;
-        var canPreview = ready && MediaPolicy.CanPreview(media);
-        var canConvert = ready && MediaPolicy.CanConvert(media);
+        var sourceMetadataReady = media.MetadataReadCoverageComplete && media.MetadataReadDigests.Count > 0 ||
+            Snapshot.IndexStamp.Reliable && Snapshot.ReliableVolumeStamps;
+        var sourceReady = sourceBindingResolved && sourceMetadataReady;
+        var mediaClassified = media.Completeness is MediaCompleteness.Complete or MediaCompleteness.Fragment ||
+            media.SourceDeclarationProcessingComplete;
+        var canPreview = sourceReady && mediaClassified && MediaPolicy.CanPreview(media);
+        var canConvert = sourceReady && mediaClassified && MediaPolicy.CanConvert(media);
         var capabilities = AssetCapabilities.None;
-        if (ready && MediaPolicy.HasBytes(media)) capabilities |= AssetCapabilities.Original;
+        if (sourceReady && MediaPolicy.HasBytes(media)) capabilities |= AssetCapabilities.Original;
         if (canPreview && media.Completeness != MediaCompleteness.Fragment) capabilities |= AssetCapabilities.Preview;
         if (canPreview && media.Completeness == MediaCompleteness.Fragment) capabilities |= AssetCapabilities.PartialPreview;
         if (canConvert) capabilities |= AssetCapabilities.Wav | AssetCapabilities.Ogg;
@@ -742,7 +824,11 @@ public sealed class AudioExplorerSession : IAsyncDisposable
             }, capabilities, names, extents,
             media.Language, media.Codec, media.Duration, media.Channels,
             media.ResolutionDetails.Length == 0 ? null : media.ResolutionDetails,
-            NaturalOrder.Key(label));
+            NaturalOrder.Key(label))
+        {
+            SearchTerms = string.Join('\n', names.Select(name => name.Text).Concat(media.Aliases)
+                .Prepend(label).Append(identity.Key).Append(media.IdText).Append(media.Name).Append(media.BankName))
+        };
     }
 
     private AudioExplorerRow[] HydrateRows(IReadOnlyList<string> identityKeys, CancellationToken token)
@@ -796,34 +882,140 @@ public sealed class AudioExplorerSession : IAsyncDisposable
             string.Equals(trimmed, id.ToString(System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal);
     }
 
-    private static Dictionary<string, string> BuildUserLabels(AudioCatalog catalog)
+    private Dictionary<string, string> BuildUserLabels(AudioCatalog catalog)
     {
         var labels = new Dictionary<string, string>(StringComparer.Ordinal);
-        var fallbackOccurrences = new Dictionary<(string Bank, uint Id), int>();
+        fallbackLabelGroups.Clear();
+        fallbackLabelMembership.Clear();
         foreach (var media in catalog.Media.OrderBy(media => media.Identity?.Ordinal ?? long.MaxValue))
         {
             if (media.Identity is null) continue;
-            var stored = media.NameKind is NameKind.Stored or NameKind.Verified or NameKind.Description
-                ? new[] { media.DisplayLabel, media.Name }.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value) && !LooksLikeNumericId(value, media.Id))
-                : null;
-            stored ??= media.Names.Where(name => name.Kind is NameKind.Verified or NameKind.Stored or NameKind.Description)
-                .Select(name => name.Text).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value) && !LooksLikeNumericId(value, media.Id));
-            stored ??= media.Aliases.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value) && !LooksLikeNumericId(value, media.Id));
+            var stored = StoredUserLabel(media);
             if (stored is not null) { labels[media.Identity.Key] = stored; continue; }
-            var bank = string.IsNullOrWhiteSpace(media.BankName) ? "Unknown bank" : media.BankName.Trim();
-            var key = (media.BankKey, media.Id);
-            var occurrence = fallbackOccurrences.GetValueOrDefault(key) + 1;
-            fallbackOccurrences[key] = occurrence;
-            var baseLabel = $"{bank} · {media.Id}";
-            labels[media.Identity.Key] = occurrence == 1 ? baseLabel : $"{baseLabel} · {occurrence}";
+            var group = (media.BankKey, media.Id);
+            var order = (media.Identity.Ordinal, media.Identity.MemberPath ?? "");
+            if (!fallbackLabelGroups.TryGetValue(group, out var entries))
+                fallbackLabelGroups[group] = entries = [];
+            entries[order] = media;
+            fallbackLabelMembership[media.Identity.Key] = (group, order);
+        }
+        foreach (var entries in fallbackLabelGroups.Values)
+        {
+            var occurrence = 0;
+            foreach (var (order, media) in entries)
+            {
+                if (media.Identity is { } identity)
+                    labels[identity.Key] = FallbackMediaLabel(media, ++occurrence);
+            }
         }
         return labels;
+    }
+
+    private AudioUserLabelDelta PrepareUserLabelDelta(IReadOnlyList<MediaEntry> changedMedia)
+    {
+        lock (catalogGate)
+        {
+            var labels = new Dictionary<string, string>(StringComparer.Ordinal);
+            var entries = new Dictionary<string, MediaEntry>(StringComparer.Ordinal);
+            var groupUpdates = new Dictionary<(string Bank, uint Id), SortedDictionary<(long Ordinal, string MemberPath), MediaEntry>? >();
+            var membershipUpdates = new Dictionary<string, ((string Bank, uint Id) Group, (long Ordinal, string MemberPath) Order)?>(StringComparer.Ordinal);
+            var affectedGroups = new HashSet<(string Bank, uint Id)>();
+
+            SortedDictionary<(long Ordinal, string MemberPath), MediaEntry> WritableGroup((string Bank, uint Id) group)
+            {
+                if (groupUpdates.TryGetValue(group, out var pending))
+                {
+                    if (pending is not null) return pending;
+                    var empty = new SortedDictionary<(long Ordinal, string MemberPath), MediaEntry>();
+                    groupUpdates[group] = empty;
+                    return empty;
+                }
+                var copy = fallbackLabelGroups.TryGetValue(group, out var existing)
+                    ? new SortedDictionary<(long Ordinal, string MemberPath), MediaEntry>(existing)
+                    : new SortedDictionary<(long Ordinal, string MemberPath), MediaEntry>();
+                groupUpdates[group] = copy;
+                return copy;
+            }
+
+            foreach (var media in changedMedia)
+            {
+                if (media.Identity is not { } identity) continue;
+                if (!entries.TryAdd(identity.Key, media)) entries[identity.Key] = media;
+                if (fallbackLabelMembership.TryGetValue(identity.Key, out var oldMembership))
+                {
+                    WritableGroup(oldMembership.Group).Remove(oldMembership.Order);
+                    affectedGroups.Add(oldMembership.Group);
+                    membershipUpdates[identity.Key] = null;
+                }
+
+                if (StoredUserLabel(media) is { } stored)
+                {
+                    labels[identity.Key] = stored;
+                    continue;
+                }
+
+                var group = (media.BankKey, media.Id);
+                var order = (identity.Ordinal, identity.MemberPath ?? "");
+                WritableGroup(group)[order] = media;
+                membershipUpdates[identity.Key] = (group, order);
+                affectedGroups.Add(group);
+            }
+
+            foreach (var group in affectedGroups)
+            {
+                var groupEntries = groupUpdates[group];
+                if (groupEntries is null) continue;
+                var occurrence = 0;
+                foreach (var (order, media) in groupEntries)
+                {
+                    if (media.Identity is not { } identity) continue;
+                    var label = FallbackMediaLabel(media, ++occurrence);
+                    entries[identity.Key] = media;
+                    if (!labelsByIdentity.TryGetValue(identity.Key, out var previous) || previous != label)
+                        labels[identity.Key] = label;
+                }
+            }
+
+            return new(labels, entries, groupUpdates, membershipUpdates);
+        }
+    }
+
+    private void ApplyUserLabelDelta(AudioUserLabelDelta delta)
+    {
+        foreach (var (group, entries) in delta.Groups)
+        {
+            if (entries is null || entries.Count == 0) fallbackLabelGroups.Remove(group);
+            else fallbackLabelGroups[group] = entries;
+        }
+        foreach (var (identity, membership) in delta.Membership)
+        {
+            if (membership is null) fallbackLabelMembership.Remove(identity);
+            else fallbackLabelMembership[identity] = membership.Value;
+        }
+        foreach (var (identity, label) in delta.Labels) labelsByIdentity[identity] = label;
+    }
+
+    private static string? StoredUserLabel(MediaEntry media)
+    {
+        var stored = media.NameKind is NameKind.Stored or NameKind.Verified or NameKind.Description
+            ? new[] { media.DisplayLabel, media.Name }.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value) && !LooksLikeNumericId(value, media.Id))
+            : null;
+        stored ??= media.Names.Where(name => name.Kind is NameKind.Verified or NameKind.Stored or NameKind.Description)
+            .Select(name => name.Text).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value) && !LooksLikeNumericId(value, media.Id));
+        stored ??= media.Aliases.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value) && !LooksLikeNumericId(value, media.Id));
+        return stored;
     }
 
     private static string FallbackMediaLabel(MediaEntry media)
     {
         var bank = string.IsNullOrWhiteSpace(media.BankName) ? "Unknown bank" : media.BankName.Trim();
         return $"{bank} · {media.Id}";
+    }
+
+    private static string FallbackMediaLabel(MediaEntry media, int occurrence)
+    {
+        var label = FallbackMediaLabel(media);
+        return occurrence == 1 ? label : $"{label} · {occurrence}";
     }
 
     private static string StagedMediaFingerprint(MediaEntry media, string label)
@@ -834,7 +1026,8 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         {
             media.Identity?.Key ?? "", media.PayloadIdentity?.Key ?? "", label, media.BankKey, media.BankName,
             media.Name, media.DisplayLabel, media.Language, media.Category, media.Codec, media.State.ToString(),
-            media.Completeness.ToString(), media.ContainerValidity.ToString(), media.Availability.ToString(),
+            media.Completeness.ToString(), media.SourceDeclarationProcessingComplete.ToString(),
+            media.ContainerValidity.ToString(), media.Availability.ToString(),
             media.NameKind.ToString(), media.ResolutionDetails, media.Subtitle,
             media.SampleRate.ToString(System.Globalization.CultureInfo.InvariantCulture),
             media.Channels.ToString(System.Globalization.CultureInfo.InvariantCulture),
@@ -953,15 +1146,20 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         return SourceIdentity.HashFields("deviant-audio-snapshot-v1", fields);
     }
 
-    private static async Task<string> GetPreviewToolFingerprintAsync(AudioToolPaths tools, CancellationToken token)
+    private static async Task<string> GetPreviewToolFingerprintAsync(AudioToolPaths tools, AudioToolUse use, CancellationToken token)
     {
+        using var timing = AssetLoadDiagnostics.Measure("AudioToolFingerprint", use.ToString());
         var components = new (string Name, string? Path)[]
         {
             ("vgmstream-cli", tools.VgmstreamCli), ("ffmpeg", tools.Ffmpeg), ("ffprobe", tools.Ffprobe),
             ("ww2ogg", tools.Ww2Ogg), ("revorb", tools.Revorb), ("packed-codebooks", tools.PackedCodebooks),
             ("packed-codebooks-aotuv", tools.PackedCodebooksAoTuV)
         };
-        var fields = new List<string>();
+        if (use == AudioToolUse.Wav) components = [components[0]];
+        var fields = new List<string> { PreviewVersion, use.ToString() };
+        var relevantFiles = components.Where(component => !string.IsNullOrWhiteSpace(component.Path))
+            .Select(component => Path.GetFullPath(component.Path!)).ToHashSet(
+                OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
         var directories = components.Where(component => !string.IsNullOrWhiteSpace(component.Path) && File.Exists(component.Path))
             .Select(component => Path.GetDirectoryName(Path.GetFullPath(component.Path!))!)
             .Distinct(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal)
@@ -971,6 +1169,8 @@ public sealed class AudioExplorerSession : IAsyncDisposable
             token.ThrowIfCancellationRequested();
             fields.Add(Path.GetFileName(directory));
             var files = Directory.EnumerateFiles(directory, "*", SearchOption.TopDirectoryOnly)
+                .Where(path => relevantFiles.Contains(Path.GetFullPath(path)) ||
+                    Path.GetExtension(path).ToLowerInvariant() is ".dll" or ".so" or ".dylib")
                 .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase).ToArray();
             foreach (var path in files)
             {
@@ -983,7 +1183,7 @@ public sealed class AudioExplorerSession : IAsyncDisposable
         }
         foreach (var (name, path) in components.Where(component => string.IsNullOrWhiteSpace(component.Path) || !File.Exists(component.Path)))
         { fields.Add(name); fields.Add("unavailable"); }
-        return SourceIdentity.HashFields("deviant-audio-toolchain-v1", fields);
+        return SourceIdentity.HashFields("deviant-audio-toolchain-v2", fields);
     }
 
     private void ThrowIfDisposed()
@@ -994,7 +1194,7 @@ public sealed class AudioExplorerSession : IAsyncDisposable
     private static string StandaloneGroupKey => "__deviant_standalone__";
     private sealed record AudioFeatureMarker(int MediaCount);
     private sealed record AudioSnapshotHead(string SourcePath, string Fingerprint, string IndexContentId,
-        string PhysicalSourceStamp, FileStamp IndexStamp, List<VolumeSource> SourceVolumes, int IndexedResourceCount);
+        string PhysicalSourceStamp, FileStamp IndexStamp, List<VolumeSource> SourceVolumes, int IndexedResourceCount, int EventMediaVersion = 0);
     private sealed record AudioSnapshotRows(List<BankInfo> Banks, List<MediaEntry> Media, List<AudioEvent> Events,
         List<NameEvidence> Names, List<LocalizedText> Localization, List<Diagnostic> Diagnostics,
         List<MediaSourceEvidence> SourceDeclarations);

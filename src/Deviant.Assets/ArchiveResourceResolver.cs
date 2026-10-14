@@ -6,6 +6,8 @@ public sealed class ArchiveResourceResolver(ArchiveSnapshot snapshot, ISourceRev
     private readonly ISourceRevisionProvider revisions = revisionProvider ?? new FileRevisionProvider();
     public ReferenceResolution Resolve(ResourceReference reference)
     {
+        using var shared = revisionProvider is null ? ArchiveSourceSession.TryAcquire(snapshot) : null;
+        if (shared is not null) return shared.Session.Resolve(reference);
         if (reference.Namespace != IdentifierNamespace.Archive || !uint.TryParse(reference.Id, out var id))
             return new(ReferenceStatus.Unresolved, [], "This identifier requires a format-specific resolver.");
         var candidates = snapshot.Records.Where(r => r.Id == id && (reference.ResourceType is null || reference.ResourceType == r.Type))
@@ -14,13 +16,25 @@ public sealed class ArchiveResourceResolver(ArchiveSnapshot snapshot, ISourceRev
     }
     public async Task<byte[]> ReadAsync(ResourceIdentity identity, long resourceOffset, int length, CancellationToken token = default)
     {
+        using var shared = revisionProvider is null ? ArchiveSourceSession.TryAcquire(snapshot) : null;
+        if (shared is not null) return await shared.Session.ReadAsync(identity, resourceOffset, length, token).ConfigureAwait(false);
         if (identity.IndexContentId != snapshot.IndexContentId || identity.MemberPath is not null)
             throw new ArchiveException("InvalidIdentity", "Resource does not belong to this archive.");
-        var row = snapshot.Records.SingleOrDefault(r => r.Ordinal == identity.Ordinal)
-            ?? throw new ArchiveException("MissingResource", "Resource is missing.");
+        ResourceRecord row;
+        using (AssetLoadDiagnostics.Measure("ArchiveLookup", identity.Key))
+        {
+            // ArchiveReader assigns each record its position in the index.
+            // Retain the general lookup for sparse or reordered snapshots.
+            row = identity.Ordinal >= 0 && identity.Ordinal < snapshot.Records.Count &&
+                snapshot.Records[(int)identity.Ordinal] is { } indexed && indexed.Ordinal == identity.Ordinal
+                ? indexed : snapshot.Records.SingleOrDefault(r => r.Ordinal == identity.Ordinal)
+                    ?? throw new ArchiveException("MissingResource", "Resource is missing.");
+        }
         if (length < 0 || length > 16 * 1024 * 1024 || resourceOffset < 0 || resourceOffset > row.StoredSize - length)
             throw new ArchiveException("InvalidRange", "Read exceeds the resource extent.");
         var volume = snapshot.Volumes.Single(v => v.Package == row.Package);
+        using var timing = AssetLoadDiagnostics.Measure("ArchiveRead", identity.Key, volume.RelativeName,
+            checked(row.Offset + resourceOffset), length);
         if (revisions.Capture(snapshot.IndexPath) != snapshot.IndexStamp)
             throw new ArchiveException("SourceChanged", "Archive index changed. Reopen it before continuing.");
         using var handle = File.OpenHandle(volume.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);

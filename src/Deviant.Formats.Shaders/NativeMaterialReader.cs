@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Globalization;
 using System.Numerics;
 using System.Security.Cryptography;
@@ -10,8 +11,10 @@ namespace Deviant.Formats.Shaders;
 /// <summary>Recognizes bounded stored material graphs and retains every native texture reference.</summary>
 public sealed partial class NativeMaterialReader
 {
-    public const string Version = "native-material-2";
+    public const string Version = "native-material-7";
     public bool UseSerializedScalarInitialValues { get; init; }
+    public float? ProjectionDepthNormalizationDistance { get; init; }
+    public IReadOnlyList<Vector3>? JointWorldPositions { get; init; }
     public const int MaximumSourceRegions = 128;
     public const int MaximumSourceBytes = 512 * 1024;
     public const int MaximumSourceTokens = 65536;
@@ -30,8 +33,10 @@ public sealed partial class NativeMaterialReader
         var references = new List<ResourceReference>();
         var bindings = new List<MaterialTextureBinding>();
         MaterialSurfaceGraph? surfaceGraph = null;
+        NativeMaterialRenderParameters? renderParameters = null;
         DecodeResult<MaterialAsset> Finish() => new(
-            new(frame.Identity, revision, surfaceGraph?.BaseColor is not null ? "surface-expression" : bindings.Count == 0 ? "neutral" : "direct-normal", bindings, references, diagnostics) { SurfaceGraph = surfaceGraph },
+            new(frame.Identity, revision, surfaceGraph?.BaseColor is not null ? "surface-expression" : bindings.Count == 0 ? "neutral" : "direct-normal", bindings, references, diagnostics)
+            { SurfaceGraph = surfaceGraph, NativeRenderParameters = renderParameters },
             frame.Identity, revision, sources.SourceExtents,
             [.. sources.DecodeSteps, new(nameof(NativeMaterialReader), Version, "ordered-native-slots; stored-normal-dataflow")],
             diagnostics, [], new Dictionary<string, string>());
@@ -40,6 +45,14 @@ public sealed partial class NativeMaterialReader
             frame.RawPayload, frame.WrapperFlag, frame.WrapperCount, frame.WrapperKey, frame.ClassCount);
         var usage = new TextureUsageReader().ParseShaderSlots(adapter, revision, sources.SourceExtents, cancellationToken);
         if (usage.Value is not { } slots) { diagnostics.AddRange(usage.Diagnostics); return Finish(); }
+        var fixedFields = slots.RawFixedFields35.AsSpan();
+        renderParameters = new(
+            BinaryPrimitives.ReadUInt32LittleEndian(fixedFields),
+            BinaryPrimitives.ReadUInt32LittleEndian(fixedFields[4..]),
+            BinaryPrimitives.ReadUInt32LittleEndian(fixedFields[12..]),
+            BinaryPrimitives.ReadUInt32LittleEndian(fixedFields[20..]), fixedFields[30],
+            new(frame.Identity, checked(slots.TagExtent.Offset + slots.TagExtent.Length), fixedFields.Length))
+        { RenderOptions = BinaryPrimitives.ReadUInt32LittleEndian(fixedFields[26..]) };
         foreach (var slot in slots.Slots)
             references.Add(new(IdentifierNamespace.Native, slot.Reference.Id.ToString(CultureInfo.InvariantCulture),
                 frame.Identity, slot.Reference.Type));
@@ -109,12 +122,13 @@ public sealed partial class NativeMaterialReader
     private sealed record Candidate(int Slot, int UvSet, Vector2 Scale, Vector2 Offset, int Start, int End);
     private sealed record Token(string Text, int Start, int End);
     private sealed class GraphException(string code) : Exception(code);
-    private enum ValueKind { Unknown, Constant, Coordinates, Sample, Expression, Matrix2, ViewPosition, ViewNormal }
+    private enum ValueKind { Unknown, Constant, Coordinates, Sample, Expression, Matrix2, ViewPosition, ViewNormal, Lanes, PassDepthSample, ProjectionSetup }
     private sealed record Value(ValueKind Kind, float[]? Numbers = null, int UvSet = 0,
-        Vector2 Scale = default, Vector2 Offset = default, int Slot = -1, string Channels = "", MaterialExpression? Node = null)
+        Vector2 Scale = default, Vector2 Offset = default, int Slot = -1, string Channels = "", MaterialExpression? Node = null,
+        IReadOnlyList<Value>? Lanes = null)
     {
         public static Value Unknown { get; } = new(ValueKind.Unknown);
-        public int Width => Kind == ValueKind.Constant ? Numbers!.Length : Kind == ValueKind.Sample ? Channels.Length : Node is not null ? (int)Node.ValueType : 0;
+        public int Width => Kind == ValueKind.Lanes ? Lanes!.Count : Kind == ValueKind.Constant ? Numbers!.Length : Kind == ValueKind.Sample ? Channels.Length : Kind == ValueKind.PassDepthSample ? 1 : Kind == ValueKind.ProjectionSetup ? 3 : Node is not null ? (int)Node.ValueType : 0;
     }
 
     private static List<Token> Lex(string text, CancellationToken token)
@@ -383,9 +397,10 @@ public sealed partial class NativeMaterialReader
         return true;
     }
 
-    private static int? MaterialFieldOffset(List<Token> tokens, string field)
+    private static int? MaterialFieldOffset(List<Token> tokens, string field,
+        string structure = "S_MATERIAL", string fieldType = "uint")
     {
-        var start = tokens.FindIndex(item => item.Text == "S_MATERIAL");
+        var start = tokens.FindIndex(item => item.Text == structure);
         if (start < 1 || tokens[start - 1].Text != "struct" || start + 1 >= tokens.Count || tokens[start + 1].Text != "{") return null;
         var cursor = start + 2; var offset = 0;
         while (cursor + 2 < tokens.Count && tokens[cursor].Text != "}")
@@ -394,7 +409,7 @@ public sealed partial class NativeMaterialReader
             if (tokens[cursor++].Text != ";") return null;
             var length = type switch { "vec4" => 16, "float" or "uint" => 4, _ => 0 };
             if (length == 0 || type == "vec4" && offset % 16 != 0) return null;
-            if (name == field) return type == "uint" ? offset : null;
+            if (name == field) return type == fieldType ? offset : null;
             offset = checked(offset + length);
         }
         return null;
@@ -416,6 +431,7 @@ public sealed partial class NativeMaterialReader
             _ => (MaterialInput?)null
         };
         if (input.HasValue) return InputValue(input.Value);
+        if (name == "g_P._vProjectionSetup.xyz") return new(ValueKind.ProjectionSetup);
         if (name == "Surface.fVsPosition") return new(ValueKind.ViewPosition);
         if (name is "Surface.fVsNormal" or "Surface.fVsGeometryNormal") return new(ValueKind.ViewNormal);
         var dot = name.LastIndexOf('.');
@@ -423,6 +439,8 @@ public sealed partial class NativeMaterialReader
         var original = ReadValue(name[..dot], values);
         var channels = name[(dot + 1)..].Select(c => c switch { 'x' => 'r', 'y' => 'g', 'z' => 'b', 'w' => 'a', _ => c }).ToArray();
         var indices = channels.Select(c => "rgba".IndexOf(c)).ToArray();
+        if (original.Kind == ValueKind.Lanes && indices.All(i => i >= 0 && i < original.Width))
+            return JoinLanes(indices.Select(i => original.Lanes![i]).ToArray());
         if (original.Kind == ValueKind.Constant && indices.All(i => i >= 0 && i < original.Width))
             return new(ValueKind.Constant, indices.Select(i => original.Numbers![i]).ToArray());
         if (original.Kind == ValueKind.Sample && indices.All(i => i >= 0 && i < original.Width))
@@ -437,6 +455,13 @@ public sealed partial class NativeMaterialReader
     private static Value Binary(string op, Value left, Value right)
     {
         if (op == "*" && (left.Kind == ValueKind.Matrix2 || right.Kind == ValueKind.Matrix2)) return MatrixMultiply(left, right);
+        if (left.Kind == ValueKind.Lanes || right.Kind == ValueKind.Lanes)
+        {
+            var width = Math.Max(left.Width, right.Width);
+            if (left.Width != right.Width && left.Width != 1 && right.Width != 1) return Value.Unknown;
+            return JoinLanes(Enumerable.Range(0, width).Select(i =>
+                Binary(op, ReadLane(left, left.Width == 1 ? 0 : i), ReadLane(right, right.Width == 1 ? 0 : i))).ToArray());
+        }
         if (left.Kind == ValueKind.Constant && right.Kind == ValueKind.Constant)
         {
             var width = Math.Max(left.Width, right.Width);
@@ -446,8 +471,10 @@ public sealed partial class NativeMaterialReader
             {
                 var a = left.Numbers![left.Width == 1 ? 0 : i]; var b = right.Numbers![right.Width == 1 ? 0 : i];
                 numbers[i] = op switch { "+" => a + b, "-" => a - b, "*" => a * b, "/" => a / b, _ => float.NaN };
-                if (!float.IsFinite(numbers[i])) return Value.Unknown;
             }
+            if (numbers.Any(value => !float.IsFinite(value)))
+                return JoinLanes(numbers.Select(value => float.IsFinite(value)
+                    ? new Value(ValueKind.Constant, [value]) : Value.Unknown).ToArray());
             return new(ValueKind.Constant, numbers);
         }
         if (op == "*" && left.Kind == ValueKind.Constant && right.Kind == ValueKind.Coordinates) return Binary(op, right, left);
@@ -465,7 +492,8 @@ public sealed partial class NativeMaterialReader
         return float.IsFinite(result.Scale.X) && float.IsFinite(result.Scale.Y) && float.IsFinite(result.Offset.X) && float.IsFinite(result.Offset.Y) ? result : Value.Unknown;
     }
 
-    private sealed class Expression(List<Token> tokens, Dictionary<string, Value> values, IReadOnlySet<string>? identityCalls = null)
+    private sealed class Expression(List<Token> tokens, Dictionary<string, Value> values, IReadOnlySet<string>? identityCalls = null,
+        string? linearizedDepthFunction = null, float? normalizationDistance = null)
     {
         private int cursor;
         private int nodes;
@@ -511,6 +539,12 @@ public sealed partial class NativeMaterialReader
                 cursor++; var arguments = new List<Value>();
                 do { arguments.Add(ReadBinary(0, depth + 1)); if (!Peek(",")) break; cursor++; } while (arguments.Count <= 4);
                 Need(")");
+                if (name == linearizedDepthFunction && arguments.Count == 2 &&
+                    arguments[0].Kind == ValueKind.PassDepthSample && arguments[1].Kind == ValueKind.ProjectionSetup &&
+                    normalizationDistance is > 0 && float.IsFinite(normalizationDistance.Value))
+                    return Postfix(ExpressionValue(new(MaterialExpressionOperation.Divide, MaterialValueType.Scalar,
+                        [new(MaterialExpressionOperation.Input, MaterialValueType.Scalar, [], Input: MaterialInput.SceneViewDepth),
+                         ConstantNode(normalizationDistance.Value)])));
                 return Postfix(identityCalls?.Contains(name) == true && arguments.Count == 1 ? arguments[0] :
                     name is "vec2" or "vec3" or "vec4" ? ConstructValue(name[3] - '0', arguments) : PureCall(name, arguments));
             }

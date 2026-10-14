@@ -56,6 +56,11 @@ public static class AudioResourceBinding
             if (extent.Offset != payloadOwner.Resource.Offset || extent.Length != payloadOwner.Resource.StoredSize)
                 throw new ArchiveException("InvalidPayloadExtent", "A top-level payload must match its owning archive resource extent.");
         }
+        else if (payload.MemberPath == "midi")
+        {
+            if (payloadOwner.Resource.Type != 65)
+                throw new ArchiveException("InvalidPayloadIdentity", "A MIDI member must be owned by a type-65 resource.");
+        }
         else if (payload.MemberPath == "wem")
         {
             if (payloadOwner.Resource.Type != 1033)

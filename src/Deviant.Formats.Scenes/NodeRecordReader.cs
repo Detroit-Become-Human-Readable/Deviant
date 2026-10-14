@@ -44,7 +44,23 @@ public sealed class NodeRecordReader
             !payload.Slice(4, 8).SequenceEqual("NODE    "u8))
             return Fail("NodeClassEnvelopeUnsupported");
         if (Word(payload, 12) != 5) return Fail("NodeVersionUnsupported");
-        var body = payload[BodyOffset..];
+        var value = ReadBody(frame, revision);
+        token.ThrowIfCancellationRequested();
+        var hash = Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
+        var references = new[] { value.Parent, value.FirstChild, value.NextSibling }.OfType<ResourceReference>().ToArray();
+        return new(value, frame.Identity, revision, physical,
+            [.. preceding, new(nameof(NodeRecordReader), Version, "NODE-v5; little-endian; reversed-matrix-words", hash)],
+            [], references, new Dictionary<string, string>
+            {
+                ["Word172"] = value.Word172.ToString("X8", CultureInfo.InvariantCulture),
+                ["Word176"] = value.Word176.ToString("X8", CultureInfo.InvariantCulture)
+            });
+    }
+
+    // Each public profile validates its own envelope before sharing the established NODE v5 body.
+    internal static SceneNodeRecord ReadBody(NativeObjectFrame frame, SourceRevision revision)
+    {
+        var body = frame.RawPayload.Span.Slice(BodyOffset, 180);
         var fields = new Dictionary<string, DecodedExtent>
         {
             ["Flags"] = At(0, 4), ["Pivot"] = At(4, 12), ["StoredLocalTransform"] = At(16, 64),
@@ -55,21 +71,10 @@ public sealed class NodeRecordReader
         var parent = Reference(body, 144, frame.Identity);
         var firstChild = Reference(body, 156, frame.Identity);
         var nextSibling = Reference(body, 164, frame.Identity);
-        var value = new SceneNodeRecord(frame.Identity, revision, frame.NativeId, Word(body, 0),
+        return new SceneNodeRecord(frame.Identity, revision, frame.NativeId, Word(body, 0),
             new(Float(body, 4), Float(body, 8), Float(body, 12)), Matrix(body[16..80]), Matrix(body[80..144]),
             parent, firstChild, nextSibling, BinaryPrimitives.ReadInt32LittleEndian(body[152..]),
             Word(body, 172), Word(body, 176), frame.PayloadExtent, fields, frame.RawPayload);
-        token.ThrowIfCancellationRequested();
-        var hash = Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
-        var references = new[] { parent, firstChild, nextSibling }.OfType<ResourceReference>().ToArray();
-        return new(value, frame.Identity, revision, physical,
-            [.. preceding, new(nameof(NodeRecordReader), Version, "NODE-v5; little-endian; reversed-matrix-words", hash)],
-            [], references, new Dictionary<string, string>
-            {
-                ["Word172"] = value.Word172.ToString("X8", CultureInfo.InvariantCulture),
-                ["Word176"] = value.Word176.ToString("X8", CultureInfo.InvariantCulture)
-            });
-
         DecodedExtent At(int offset, int length) => new(frame.PayloadExtent.Container,
             checked(frame.PayloadExtent.Offset + BodyOffset + offset), length);
     }

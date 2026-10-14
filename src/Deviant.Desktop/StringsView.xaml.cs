@@ -22,6 +22,7 @@ public partial class StringsView:UserControl,IAsyncDisposable
  private long offset;
  private bool refreshing,choicesPending;
  private Task? activeJob;
+ internal Func<ArchiveSnapshot,string,IProgress<LocalizationReadProgress>?,CancellationToken,ISourceRevisionProvider?,Task<LocalizationSession>>? LocalizationSessionFactoryOverride { get; set; }
  public StringsView(){InitializeComponent();refreshing=true;Kinds.ItemsSource=new[]{"All records","Text","Pointer","Opaque"};Kinds.SelectedIndex=0;Statuses.ItemsSource=new[]{"All statuses","Complete","Unresolved","Malformed","Unsupported"};Statuses.SelectedIndex=0;SortBox.ItemsSource=new[]{new AssetSortChoice("Language",AssetSort.Default),new("Key",AssetSort.Name),new("Status",AssetSort.Availability)};SortBox.SelectedIndex=0;refreshing=false;debounce.Tick+=async(_,_)=>{debounce.Stop();if(choicesPending){choicesPending=false;UpdateChoices();}await RefreshAsync();};}
  public LocalizationSession? CurrentSession=>session;
  public LocalizationRecord? SelectedRecord=>Rows.SelectedItem as LocalizationRecord;
@@ -49,22 +50,53 @@ public partial class StringsView:UserControl,IAsyncDisposable
  public IReadOnlyList<LocalizationRecord> CurrentRecords=>Rows.ItemsSource is IEnumerable<LocalizationRecord> records?records.ToArray():[];
  public async Task LoadAsync(ArchiveSnapshot snapshot,string cacheLocation,CancellationToken token=default)
  {
-  var generation=++loadGeneration;loadCancellation?.Cancel();await loading.WaitAsync(token);
+  var activity=BeginActivity("Opening strings",100);string? terminal=null;
+  var generation=++loadGeneration;loadCancellation?.Cancel();
   try
   {
+   await loading.WaitAsync(token);
+   try
+   {
    if(generation!=loadGeneration)return;
    await DisposeSessionCoreAsync();loadCancellation=CancellationTokenSource.CreateLinkedTokenSource(token);
    Status.Text="Reading strings…";
-   var opened=await LocalizationSession.OpenAsync(snapshot,cacheLocation,cancellationToken:loadCancellation.Token);
+   var opened=LocalizationSessionFactoryOverride is{}factory
+    ?await factory(snapshot,cacheLocation,null,loadCancellation.Token,null)
+    :await LocalizationSession.OpenAsync(snapshot,cacheLocation,cancellationToken:loadCancellation.Token);
    if(generation!=loadGeneration||loadCancellation.IsCancellationRequested){await opened.DisposeAsync();return;}
-  session=opened;session.Updated+=Updated;UpdateChoices();await RefreshAsync();_=ObserveAsync(opened);
+   session=opened;session.Updated+=Updated;UpdateChoices();_=ObserveAsync(opened);await RefreshAsync();
+   }
+   finally{loading.Release();}
   }
-  finally{loading.Release();}
+  catch(OperationCanceledException){terminal=generation==loadGeneration?"Cancelled":null;throw;}
+  catch{terminal=generation==loadGeneration?"Failed":null;throw;}
+  finally{EndActivity(activity,terminal);}
  }
  private async Task ObserveAsync(LocalizationSession current)
- {try{await current.EnrichmentTask;}catch(OperationCanceledException){return;}catch(Exception e){await Dispatcher.InvokeAsync(()=>{if(ReferenceEquals(current,session))Status.Text=e.Message;});return;}await Dispatcher.InvokeAsync(async()=>{if(!ReferenceEquals(current,session))return;UpdateChoices();await RefreshAsync();}).Task.Unwrap();}
+ {
+  var activity=0L;
+  if(!current.EnrichmentTask.IsCompleted)
+  {
+   var initial=current.CompletedResources;var total=current.Resources.Count;
+   activity=BeginActivity("Indexing strings",80,initial,total);
+   if(ReferenceEquals(current,session))enrichmentActivityId=activity;
+  }
+  try
+  {
+   await current.EnrichmentTask;
+   EndActivity(activity);
+   await Dispatcher.InvokeAsync(async()=>{if(!ReferenceEquals(current,session))return;UpdateChoices();await RefreshAsync();}).Task.Unwrap();
+  }
+  catch(OperationCanceledException){EndActivity(activity,ReferenceEquals(current,session)?"Cancelled":null);}
+  catch(Exception e)
+  {
+   EndActivity(activity,ReferenceEquals(current,session)?"Failed":null);
+   await Dispatcher.InvokeAsync(()=>{if(ReferenceEquals(current,session))Status.Text=e.Message;});
+  }
+  finally{if(enrichmentActivityId==activity)enrichmentActivityId=0;}
+ }
  private void Updated(object? sender,LocalizationSessionUpdate update)
- {_=Dispatcher.InvokeAsync(()=>{if(!ReferenceEquals(sender,session))return;choicesPending=true;Status.Text=$"{update.RecordCount:N0} strings · {update.CompletedResources:N0} / {update.TotalResources:N0} sources";if(!debounce.IsEnabled)debounce.Start();});}
+ {_=Dispatcher.InvokeAsync(()=>{if(!ReferenceEquals(sender,session))return;choicesPending=true;Status.Text=$"{update.RecordCount:N0} strings · {update.CompletedResources:N0} / {update.TotalResources:N0} sources";if(enrichmentActivityId!=0)UpdateActivity(enrichmentActivityId,"Indexing strings",update.CompletedResources,update.TotalResources);if(!debounce.IsEnabled)debounce.Start();});}
  private void UpdateChoices()
  {
   if(session is null)return;refreshing=true;
@@ -80,13 +112,15 @@ public partial class StringsView:UserControl,IAsyncDisposable
   Availability:Statuses.SelectedIndex switch{1=>AssetAvailability.Available,2=>AssetAvailability.Missing,3=>AssetAvailability.Malformed,4=>AssetAvailability.Unsupported,_=>null},Offset:offset,Limit:100,Sort:(SortBox.SelectedItem as AssetSortChoice)?.Sort??AssetSort.Default,Descending:Descending.IsChecked==true);
  public async Task RefreshAsync()
  {
-  if(session is not{}current)return;queryCancellation?.Cancel();queryCancellation?.Dispose();queryCancellation=new();var token=queryCancellation.Token;var generation=++queryGeneration;
+  if(session is not{}current)return;queryCancellation?.Cancel();queryCancellation?.Dispose();queryCancellation=new();var token=queryCancellation.Token;var generation=++queryGeneration;var activity=BeginActivity("Searching strings",60);
+  string? terminal=null;
   try{var page=await current.QueryAsync(Query(),token);if(generation!=queryGeneration||!ReferenceEquals(current,session))return;
    if(offset>0&&offset>=page.Total){offset=Math.Max(0,(page.Total-1)/100*100);await RefreshAsync();return;}
    var previous=(Rows.SelectedItem as LocalizationRecord)?.Identity;
    refreshing=true;try{Rows.ItemsSource=page.Records;foreach(var row in page.Records.Where(r=>selected.Contains(r.Identity)))Rows.SelectedItems.Add(row);if(previous is not null&&page.Records.FirstOrDefault(r=>r.Identity==previous) is{}restored)Rows.SelectedItem=restored;}finally{refreshing=false;}
    Page.Text=$"{(page.Total==0?0:offset+1):N0}–{Math.Min(offset+page.Records.Count,page.Total):N0} / {page.Total:N0}";Status.Text=current.IsEnrichmentComplete?$"{page.Total:N0} strings":$"{page.Total:N0} strings · indexing";UpdateChoices();await UpdateDetailsAsync();}
-  catch(OperationCanceledException){}catch(Exception e){if(generation==queryGeneration)Status.Text=e.Message;}
+  catch(OperationCanceledException){if(generation==queryGeneration)terminal="Cancelled";}catch(Exception e){if(generation==queryGeneration){Status.Text=e.Message;terminal="Failed";}}
+  finally{EndActivity(activity,terminal);}
  }
  private void FiltersChanged(object sender,RoutedEventArgs e){if(refreshing)return;queryCancellation?.Cancel();offset=0;debounce.Stop();debounce.Start();}
  private void FiltersChanged(object sender,SelectionChangedEventArgs e)=>FiltersChanged(sender,new RoutedEventArgs());
@@ -107,7 +141,12 @@ public partial class StringsView:UserControl,IAsyncDisposable
   if(placeholders.Length>0)Advanced.Text+="\n"+string.Join("\n",placeholders.Select(item=>$"{item.Syntax} · {item.Token} · UTF-16 offset {item.Utf16Offset}"));
   Variants.ItemsSource=OtherOccurrences.ItemsSource=null;OccurrenceSummary.Text="Language occurrences";
   UpdateRelatedSelection(row,current,generation,token);if(row is null||current is null)return;
-  try{var variants=await current.GetVariantsAsync(row.Identity,token);var others=await current.GetOtherOccurrencesAsync(row.Identity,token);if(generation==detailGeneration&&ReferenceEquals(current,session)){Variants.ItemsSource=variants;var sourceLabels=current.Sources.ToDictionary(source=>source.Identity.Ordinal,source=>source.Label);OtherOccurrences.ItemsSource=others.Select(record=>new{Source=sourceLabels.GetValueOrDefault(record.ResourceOrdinal,"Source"),record.Language,record.Text});var duplicates=variants.GroupBy(r=>r.RawLanguageCode).Sum(g=>Math.Max(0,g.Count()-1));OccurrenceSummary.Text=$"{variants.Count:N0} language occurrences · {duplicates:N0} duplicates";}}catch(OperationCanceledException){}catch(Exception error){if(generation==detailGeneration&&ReferenceEquals(current,session))Status.Text=error.Message;}
+  var activity=BeginActivity("Loading details",40);
+  string? terminal=null;
+  try{var variants=await current.GetVariantsAsync(row.Identity,token);var others=await current.GetOtherOccurrencesAsync(row.Identity,token);if(generation==detailGeneration&&ReferenceEquals(current,session)){Variants.ItemsSource=variants;var sourceLabels=current.Sources.ToDictionary(source=>source.Identity.Ordinal,source=>source.Label);OtherOccurrences.ItemsSource=others.Select(record=>new{Source=sourceLabels.GetValueOrDefault(record.ResourceOrdinal,"Source"),record.Language,record.Text});var duplicates=variants.GroupBy(r=>r.RawLanguageCode).Sum(g=>Math.Max(0,g.Count()-1));OccurrenceSummary.Text=$"{variants.Count:N0} language occurrences · {duplicates:N0} duplicates";}}
+  catch(OperationCanceledException){if(generation==detailGeneration&&ReferenceEquals(current,session))terminal="Cancelled";}
+  catch(Exception error){if(generation==detailGeneration&&ReferenceEquals(current,session)){Status.Text=error.Message;terminal="Failed";}}
+  finally{EndActivity(activity,terminal);}
  }
  private async void Previous_Click(object sender,RoutedEventArgs e){if(offset>=100){offset-=100;await RefreshAsync();}}
  private async void Next_Click(object sender,RoutedEventArgs e){offset+=100;await RefreshAsync();}
@@ -118,11 +157,14 @@ public partial class StringsView:UserControl,IAsyncDisposable
   if(session is not{}current||activeJob is{IsCompleted:false})return;
   var dialog=new SaveFileDialog{Title="Export strings",Filter="JSON (*.json)|*.json|CSV (*.csv)|*.csv",FileName="strings.json",AddExtension=true,OverwritePrompt=true};if(dialog.ShowDialog(Window.GetWindow(this))!=true)return;
   jobCancellation=new();var token=jobCancellation.Token;Status.Text="Exporting strings…";
+  var activity=BeginActivity("Exporting strings",90);
   var task=current.ExportAsync(selection,dialog.FilterIndex==2?LocalizationExportFormat.Csv:LocalizationExportFormat.Json,dialog.FileName,cancellationToken:token);activeJob=task;
-  try{var report=await task;Status.Text=$"{report.Manifest.CompletedCount:N0} completed · {report.Manifest.FailedCount:N0} failed · {report.Manifest.CancelledCount:N0} cancelled";}
-  catch(Exception e){Status.Text=e.Message;}finally{activeJob=null;jobCancellation.Dispose();jobCancellation=null;}
+  try{var report=await task;Status.Text=$"{report.Manifest.CompletedCount:N0} completed · {report.Manifest.FailedCount:N0} failed · {report.Manifest.CancelledCount:N0} cancelled";EndActivity(activity,report.Manifest.CancelledCount>0?"Cancelled":null);}
+  catch(OperationCanceledException){Status.Text="Export cancelled";EndActivity(activity,"Cancelled");}
+  catch(Exception e){Status.Text=e.Message;EndActivity(activity,"Failed");}
+  finally{activeJob=null;jobCancellation.Dispose();jobCancellation=null;}
  }
- private void Cancel_Click(object sender,RoutedEventArgs e){jobCancellation?.Cancel();queryCancellation?.Cancel();detailCancellation?.Cancel();loadCancellation?.Cancel();Status.Text="Cancelling…";}
- private async Task DisposeSessionCoreAsync(){debounce.Stop();choicesPending=false;++queryGeneration;++detailGeneration;queryCancellation?.Cancel();detailCancellation?.Cancel();jobCancellation?.Cancel();loadCancellation?.Cancel();if(activeJob is not null)try{await activeJob;}catch{}await DrainRelatedAsync();var old=session;session=null;relationshipCoordinator=null;if(old is not null){old.Updated-=Updated;await old.DisposeAsync();}loadCancellation?.Dispose();loadCancellation=null;selected.Clear();offset=0;refreshing=true;try{Rows.ItemsSource=null;Sources.ItemsSource=null;Languages.ItemsSource=null;}finally{refreshing=false;}await UpdateDetailsAsync();}
+ private void Cancel_Click(object sender,RoutedEventArgs e)=>CancelActivity();
+ private async Task DisposeSessionCoreAsync(){debounce.Stop();choicesPending=false;++queryGeneration;++detailGeneration;queryCancellation?.Cancel();detailCancellation?.Cancel();jobCancellation?.Cancel();loadCancellation?.Cancel();await DrainLocalizationRetryAsync();if(activeJob is not null)try{await activeJob;}catch{}await DrainRelatedAsync();var old=session;session=null;relationshipCoordinator=null;if(old is not null){old.Updated-=Updated;await old.DisposeAsync();}loadCancellation?.Dispose();loadCancellation=null;selected.Clear();offset=0;refreshing=true;try{Rows.ItemsSource=null;Sources.ItemsSource=null;Languages.ItemsSource=null;}finally{refreshing=false;}await UpdateDetailsAsync();}
  public async ValueTask DisposeAsync(){++loadGeneration;loadCancellation?.Cancel();await loading.WaitAsync();try{await DisposeSessionCoreAsync();}finally{loading.Release();}}
 }

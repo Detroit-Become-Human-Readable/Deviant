@@ -31,8 +31,8 @@ public sealed class RenderTextureRowTests
         {
             Assert.Same(textures[row.SlotOrdinal], row.Texture);
             Assert.Equal(identity, row.Material);
-            Assert.Equal(10 + row.SlotOrdinal, row.Texture.SourceIdentity!.Ordinal);
-            Assert.Equal(20, row.Texture.CatalogIdentity!.Ordinal);
+            Assert.Equal(10 + row.SlotOrdinal, row.Texture!.SourceIdentity!.Ordinal);
+            Assert.Equal(20, row.Texture!.CatalogIdentity!.Ordinal);
         });
     }
 
@@ -52,12 +52,14 @@ public sealed class RenderTextureRowTests
     }
 
     [Fact]
-    public void MissingDecodedGraphSlotRemainsInSourceGraphAndProducesNoBrokenPixelRow()
+    public void MissingDecodedGraphSlotRemainsVisibleWithItsFailure()
     {
         var identity = new ResourceIdentity("generated-index", 1);
         var asset = new MaterialAsset(identity, new("generated-index", "revision"), "generated", [], [], ["Texture source unavailable"])
         { SurfaceGraph = new(Colour(Sample(2)), null, null, [MaterialInput.Uv0], [2], []) };
-        Assert.Empty(SceneView.BuildTextureRows([new(asset, new Dictionary<int, RenderTexture>())]));
+        var row = Assert.Single(SceneView.BuildTextureRows([new(asset, new Dictionary<int, RenderTexture>())]));
+        Assert.Equal(2, row.SlotOrdinal); Assert.Null(row.Texture);
+        Assert.Contains("Unavailable", row.Label); Assert.Contains("Texture source unavailable", row.Details);
         Assert.Equal(2, Assert.Single(asset.SurfaceGraph.TextureSlots));
         Assert.Equal("Texture source unavailable", Assert.Single(asset.Diagnostics));
     }

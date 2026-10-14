@@ -39,10 +39,13 @@ public partial class DdsImageView : UserControl, IAsyncDisposable
         finally { updating = false; }
     }
     public event EventHandler? SurfaceChanged;
+    public event EventHandler? ActivityChanged;
     public DdsTextureDocument? CurrentDocument => document;
     public TextureSurface? CurrentSurface => surface;
     public TextureSurface? CurrentDisplaySurface => displaySurface;
     public bool IsDocumentBacked => documentBacked;
+    public bool IsBusy => operations.Any(operation => !operation.IsCompleted);
+    public TexturePreviewFailure? CurrentFailure { get; private set; }
 
     public Task OpenAsync(string path, CancellationToken token = default)
     {
@@ -78,7 +81,7 @@ public partial class DdsImageView : UserControl, IAsyncDisposable
         finally { if (ReferenceEquals(openCancellation, own)) openCancellation = null; own.Dispose(); }
     }
 
-    public Task LoadDocumentAsync(DdsTextureDocument value, string label, CancellationToken token = default)
+    public Task LoadDocumentAsync(DdsTextureDocument value, string label, CancellationToken token = default, int? initialMip = null)
     {
         ArgumentNullException.ThrowIfNull(value);
         if (string.IsNullOrWhiteSpace(label)) throw new ArgumentException("A preview label is required.", nameof(label));
@@ -86,16 +89,18 @@ public partial class DdsImageView : UserControl, IAsyncDisposable
             (identity.IndexContentId != revision.IndexContentId || identity.Ordinal < 0 || string.IsNullOrWhiteSpace(identity.IndexContentId) || string.IsNullOrWhiteSpace(revision.PhysicalSourceStamp)))
             throw new ArgumentException("The document identity and revision do not match.", nameof(value));
         ObjectDisposedException.ThrowIf(lifetime.IsCancellationRequested, this);
-        openTask = Track(LoadDocumentCoreAsync(value, label, token)); return openTask;
+        if (initialMip is < 0 || initialMip >= value.Info.MipCount) throw new ArgumentOutOfRangeException(nameof(initialMip));
+        openTask = Track(LoadDocumentCoreAsync(value, label, token, initialMip ?? 0)); return openTask;
     }
-    private async Task LoadDocumentCoreAsync(DdsTextureDocument value, string label, CancellationToken token)
+    private async Task LoadDocumentCoreAsync(DdsTextureDocument value, string label, CancellationToken token, int initialMip)
     {
         var version = BeginSource(true); var own = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token); openCancellation = own;
         Status.Text = "Opening image\u2026";
         try
         {
             own.Token.ThrowIfCancellationRequested(); BindDocument(value, label);
-            await RequestDecodeAsync(0, own.Token); own.Token.ThrowIfCancellationRequested();
+            updating = true; try { Mips.SelectedIndex = initialMip; } finally { updating = false; }
+            await RequestDecodeAsync(initialMip, own.Token); own.Token.ThrowIfCancellationRequested();
         }
         catch (OperationCanceledException) { if (version == generation) Status.Text = "Cancelled"; }
         catch (Exception error) { if (version == generation) Status.Text = error.Message; }
@@ -107,6 +112,7 @@ public partial class DdsImageView : UserControl, IAsyncDisposable
         sourceCancellation.Cancel(); sourceCancellation.Dispose(); sourceCancellation = new();
         openCancellation?.Cancel(); selectionCancellation?.Cancel(); renderCancellation?.Cancel(); documentBacked = hosted;
         document = null; surface = displaySurface = null; sourcePath = null; sourceStamp = null;
+        CurrentFailure = null;
         Preview.Source = null; ImageName.Text = Metadata.Text = ""; ExportDds.IsEnabled = ExportPng.IsEnabled = false; HdrControls.Visibility = Visibility.Collapsed;
         var actions = hosted ? Visibility.Collapsed : Visibility.Visible;
         OpenDds.Visibility = ExportDds.Visibility = ExportPng.Visibility = actions; OpenDds.IsEnabled = !hosted;
@@ -135,7 +141,7 @@ public partial class DdsImageView : UserControl, IAsyncDisposable
         selectionCancellation?.Cancel(); renderCancellation?.Cancel();
         var own = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token); selectionCancellation = own;
         var selected = new TextureSubresourceSelection(Layers.SelectedItem is int layer ? layer : 0, Faces.SelectedItem is CubeFace face ? face : null, mip);
-        surface = displaySurface = null; Preview.Source = null; ExportPng.IsEnabled = false; Status.Text = "Decoding mip…"; SurfaceChanged?.Invoke(this, EventArgs.Empty); var entered = false;
+        surface = displaySurface = null; CurrentFailure = null; Preview.Source = null; ExportPng.IsEnabled = false; Status.Text = "Decoding mip…"; SurfaceChanged?.Invoke(this, EventArgs.Empty); var entered = false;
         try
         {
             await decodeGate.WaitAsync(own.Token); entered = true;
@@ -146,7 +152,14 @@ public partial class DdsImageView : UserControl, IAsyncDisposable
             await ScheduleRender(false);
         }
         catch (OperationCanceledException) { }
-        catch (Exception error) { if (version == generation && selectionVersion == selectionGeneration) Status.Text = error.Message; }
+        catch (Exception error)
+        {
+            if (version == generation && selectionVersion == selectionGeneration)
+            {
+                CurrentFailure = new(error is TextureFormatException format ? format.Code : "TexturePixelDecodeFailed", error.Message);
+                Status.Text = error.Message;
+            }
+        }
         finally { if (entered) decodeGate.Release(); if (ReferenceEquals(selectionCancellation, own)) selectionCancellation = null; own.Dispose(); }
     }
 
@@ -205,8 +218,15 @@ public partial class DdsImageView : UserControl, IAsyncDisposable
             if (ReferenceEquals(opening, openTask) && ReferenceEquals(selecting, selectionTask) && ReferenceEquals(rendering, renderTask)) return;
         }
     }
-    private Task Track(Task task) { operations.Add(task); ImageProcessing.IsActive = operations.Any(operation => !operation.IsCompleted); _ = ObserveAsync(task); return task; }
-    private async Task ObserveAsync(Task task) { try { await task; } catch (Exception) { } finally { operations.Remove(task); ImageProcessing.IsActive = operations.Any(operation => !operation.IsCompleted); } }
+    private Task Track(Task task) { operations.Add(task); UpdateActivity(); _ = ObserveAsync(task); return task; }
+    private async Task ObserveAsync(Task task) { try { await task; } catch (Exception) { } finally { operations.Remove(task); UpdateActivity(); } }
+    private void UpdateActivity()
+    {
+        var isBusy = IsBusy;
+        var wasBusy = ImageProcessing.IsActive;
+        ImageProcessing.IsActive = isBusy;
+        if (wasBusy != isBusy) ActivityChanged?.Invoke(this, EventArgs.Empty);
+    }
 
     private async void Open_Click(object sender, RoutedEventArgs e) { if (documentBacked) return; var dialog = new OpenFileDialog { Title = "Open DDS", Filter = "DDS images (*.dds)|*.dds" }; if (dialog.ShowDialog(Window.GetWindow(this)) == true) await OpenAsync(dialog.FileName); }
     private async void MipChanged(object sender, SelectionChangedEventArgs e) { if (!updating && Mips.SelectedIndex >= 0) await RequestDecodeAsync(Mips.SelectedIndex); }

@@ -25,6 +25,25 @@ public sealed class DdsTextureDecoder
         return DecodeSubresource(document, document.DefaultSelection with { MipIndex = mipIndex });
     }
 
+    /// <summary>Returns a read-only pixel view backed by the document's owned, tightly packed RGBA bytes.</summary>
+    public TextureSurface ViewRgbaSubresource(DdsTextureDocument document,
+        TextureSubresourceSelection selection, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(document); ArgumentNullException.ThrowIfNull(selection);
+        token.ThrowIfCancellationRequested();
+        var extent = FindSubresource(document, selection);
+        var encoding = document.Encoding;
+        if (encoding.Compression is not null || encoding.IsHdr || encoding.AlphaOnly || encoding.Luminance ||
+            encoding.BytesPerPixel != 4 || encoding.RedMask != 0xff || encoding.GreenMask != 0xff00 ||
+            encoding.BlueMask != 0xff0000 || encoding.AlphaMask != 0xff000000 ||
+            extent.EncodedLength != checked((long)extent.Width * extent.Height * 4))
+            throw new TextureFormatException("UnsupportedRgbaView", "This DDS subresource requires pixel conversion.");
+        var pixels = document.OriginalBytes.Slice(checked((int)extent.SourceOffset), extent.EncodedLength);
+        return new(extent.Width, extent.Height, pixels, ReadOnlyMemory<HdrPixel>.Empty, false, false,
+            document.Info.IsSrgb, selection.MipIndex, document.Info.Format, document.Info.FormatName,
+            document.ContentSha256, selection, document.Identity, document.Revision);
+    }
+
     public TextureSurface DecodeSubresource(DdsTextureDocument document, TextureSubresourceSelection selection)
     {
         ArgumentNullException.ThrowIfNull(document);

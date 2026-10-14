@@ -9,6 +9,9 @@ namespace Deviant.Browser;
 public sealed record NativeContainerSegmentLayout(int DecodedPrefixLength,
     SourceExtent? RawSuffixExtent, int RawSuffixLength);
 
+internal sealed record NativeContainerMetadataBody(ReadOnlyMemory<byte> Bytes,
+    IReadOnlyList<SourceExtent> PhysicalExtents);
+
 /// <summary>One source read and native-directory decode shared by an asset load.</summary>
 public sealed class NativeContainerLease : IDisposable
 {
@@ -23,20 +26,30 @@ public sealed class NativeContainerLease : IDisposable
     private NativeObjectDirectoryDocument? directory;
     private readonly SourceExtentVerificationLease verification;
     private readonly AssetMemoryBudget.Reservation compressionMemory;
+    private readonly List<SourceExtent> sourceExtents;
+    private readonly List<SourceExtentVerificationLease> additionalVerifications = [];
     private int references = 1;
     private bool ownerDisposed;
+    private long preparedMetadataBytes;
+    private readonly int? metadataDecodedPrefixLength;
+    private readonly bool metadataSourceIsDirect;
 
     private NativeContainerLease(ArchiveSnapshot snapshot, NativeTexturePayload source,
         DecodeResult<SegsDocument>? segments, NativeObjectDirectoryDocument directory,
         SourceExtentVerificationLease verification, AssetMemoryBudget budget, List<IDisposable> resources,
-        AssetMemoryBudget.Reservation compressionMemory)
+        AssetMemoryBudget.Reservation compressionMemory, IReadOnlyList<SourceExtent>? physicalExtents = null)
     {
         Snapshot = snapshot; storedSource = source; this.segments = segments; this.directory = directory;
         this.verification = verification; this.resources = resources; MemoryBudget = budget;
         Identity = source.Identity; Revision = directory.Revision;
         this.compressionMemory = compressionMemory;
-        SourceExtents = segments?.Extents ?? [source.Extent];
-        if (segments?.Value is { } decoded)
+        IsMetadataOnly = directory.IsMetadataOnly;
+        metadataDecodedPrefixLength = segments?.Value?.DecodedPrefix.Length;
+        metadataSourceIsDirect = source.OriginalBytes.Span.StartsWith("QZIP\0"u8);
+        sourceExtents = (physicalExtents ?? segments?.Extents ?? [source.Extent]).ToList();
+        if (IsMetadataOnly)
+            DataLayout = new(checked((int)(directory.BodyExtent.Offset + directory.RawBody.Length)), null, 0);
+        else if (segments?.Value is { } decoded)
             DataLayout = new(decoded.DecodedPrefix.Length, decoded.RawSuffixExtent, decoded.RawSuffix.Length);
         else if (directory.RemainderExtent is { } remainder)
         {
@@ -54,10 +67,129 @@ public sealed class NativeContainerLease : IDisposable
     public AssetMemoryBudget MemoryBudget { get; }
     public NativeContainerSegmentLayout DataLayout { get; }
     public NativeContainerSegmentLayout SegmentLayout => DataLayout;
-    public IReadOnlyList<SourceExtent> SourceExtents { get; }
-    public NativeTexturePayload StoredSource => storedSource ?? throw new ObjectDisposedException(nameof(NativeContainerLease));
+    public IReadOnlyList<SourceExtent> SourceExtents { get { lock (sync) return sourceExtents.ToArray(); } }
+    public IReadOnlyList<SourceExtent> PhysicalExtents => SourceExtents;
+    public bool IsMetadataOnly { get; }
+    public long PreparedMetadataBytes { get { lock (sync) return preparedMetadataBytes; } }
+    internal NativeTexturePayload MetadataSource => storedSource ?? throw new ObjectDisposedException(nameof(NativeContainerLease));
+    internal int? MetadataDecodedPrefixLength => metadataDecodedPrefixLength;
+    internal bool MetadataSourceIsDirect => metadataSourceIsDirect;
+    public NativeTexturePayload StoredSource => IsMetadataOnly
+        ? throw new InvalidOperationException("Open the complete container before reading its data buffers.")
+        : storedSource ?? throw new ObjectDisposedException(nameof(NativeContainerLease));
     public DecodeResult<SegsDocument>? Segments => segments;
     public NativeObjectDirectoryDocument Directory => directory ?? throw new ObjectDisposedException(nameof(NativeContainerLease));
+
+    public static async Task<NativeContainerLease> OpenMetadataAsync(ArchiveSnapshot snapshot, ResourceIdentity identity,
+        AssetMemoryBudget budget, CancellationToken token = default, bool allowLargeData = false)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot); ArgumentNullException.ThrowIfNull(identity);
+        ArgumentNullException.ThrowIfNull(budget); token.ThrowIfCancellationRequested();
+        if (identity.IndexContentId != snapshot.IndexContentId || identity.MemberPath is not null ||
+            identity.Ordinal < 0 || identity.Ordinal >= snapshot.Records.Count)
+            throw new ArgumentException("Select a native container from this archive.", nameof(identity));
+        var resources = new List<IDisposable>();
+        int maximumStored = allowLargeData ? MaximumLargeStoredBytes : MaximumStoredBytes;
+        int maximumDecoded = allowLargeData ? MaximumLargeDecodedBytes : MaximumDecodedBytes;
+        try
+        {
+            var read = await NativeContainerMetadataReader.ReadAsync(snapshot, identity, budget, resources,
+                maximumStored, maximumDecoded, token).ConfigureAwait(false);
+            using var verificationScratch = budget.Reserve(256 * 1024, "container metadata verification scratch");
+            var pin = await new SourceExtentVerifier().AcquireAsync(snapshot, read.PhysicalExtents, token,
+                maximumBytes: maximumStored).ConfigureAwait(false);
+            resources.Add(pin); token.ThrowIfCancellationRequested();
+            return new(snapshot, read.Source, read.Segments, read.Directory, pin, budget, resources,
+                read.CompressionMemory, read.PhysicalExtents);
+        }
+        catch
+        {
+            for (int i = resources.Count - 1; i >= 0; i--) resources[i].Dispose();
+            throw;
+        }
+    }
+
+    public void RequireDataBuffers()
+    {
+        EnsureUnchanged();
+        if (IsMetadataOnly) throw new InvalidOperationException("Open the complete container before reading its data buffers.");
+    }
+
+    internal async Task<NativeContainerMetadataBody> ReadDeclaredMetadataBodyAsync(CancellationToken token = default)
+    {
+        token.ThrowIfCancellationRequested();
+        EnsureUnchanged();
+        var extent = Directory.BodyExtent;
+        if (extent.Length < 0 || extent.Length > NativeTextureSession.MaximumResourceBytes ||
+            extent.Length > int.MaxValue || extent.Offset < 0 || extent.Offset > long.MaxValue - extent.Length)
+            throw new ArchiveException("NativeMetadataLimit", "The declared metadata body exceeds the supported limit.");
+        if (extent.Length == 0) return new(ReadOnlyMemory<byte>.Empty, SourceExtents);
+
+        var decoded = Segments?.Value?.DecodedPrefix;
+        var start = checked((int)Math.Min(extent.Offset, int.MaxValue));
+        int decodedCount = decoded is null || start >= decoded.Length
+            ? 0 : checked((int)Math.Min(extent.Length, decoded.Length - (long)start));
+        if (decodedCount == extent.Length)
+            return new(decoded.AsMemory(start, decodedCount), SourceExtents);
+
+        AssetMemoryBudget.Reservation? bodyReservation = MemoryBudget.Reserve(extent.Length, "declared texture metadata body");
+        try
+        {
+            var bytes = new byte[checked((int)extent.Length)];
+            if (decodedCount > 0) decoded!.AsMemory(start, decodedCount).CopyTo(bytes);
+            long rawLogicalOffset = checked(extent.Offset + decodedCount);
+            int remaining = bytes.Length - decodedCount;
+            long sourceOffset = decoded is null
+                ? checked(5L + rawLogicalOffset)
+                : checked(MetadataSource.Extent.Length + rawLogicalOffset - decoded.Length);
+            if (sourceOffset < 0 || sourceOffset > Snapshot.RequireRecord(Identity.Ordinal).StoredSize - remaining)
+                throw new ArchiveException("NativeMetadataUnavailable", "The declared metadata body exceeds its stored source.");
+
+            var stored = MetadataSource.OriginalBytes;
+            if (sourceOffset <= stored.Length - (long)remaining)
+                stored.Span.Slice(checked((int)sourceOffset), remaining).CopyTo(bytes.AsSpan(decodedCount));
+            else
+            {
+                using var scratch = MemoryBudget.Reserve(Math.Min(4L * 1024 * 1024, remaining), "metadata body read scratch");
+                var resolver = new ArchiveResourceResolver(Snapshot);
+                int cursor = 0;
+                while (cursor < remaining)
+                {
+                    token.ThrowIfCancellationRequested();
+                    int length = Math.Min(4 * 1024 * 1024, remaining - cursor);
+                    var chunk = await resolver.ReadAsync(Identity, sourceOffset + cursor, length, token).ConfigureAwait(false);
+                    chunk.CopyTo(bytes, decodedCount + cursor); cursor += length;
+                }
+
+                var row = Snapshot.RequireRecord(Identity.Ordinal);
+                var volume = Snapshot.Volumes.Single(item => item.Package == row.Package);
+                var physical = new SourceExtent(volume.RelativeName, checked(row.Offset + sourceOffset), remaining,
+                    Convert.ToHexString(SHA256.HashData(bytes.AsSpan(decodedCount, remaining))).ToLowerInvariant());
+                var pin = await new SourceExtentVerifier().AcquireAsync(Snapshot, [physical], token,
+                    maximumBytes: Math.Max(1, remaining)).ConfigureAwait(false);
+                try { OwnVerifiedExtent(physical, pin); }
+                catch { pin.Dispose(); throw; }
+            }
+
+            token.ThrowIfCancellationRequested();
+            OwnPreparedMetadata(bodyReservation);
+            bodyReservation = null;
+            EnsureUnchanged();
+            return new(bytes, SourceExtents);
+        }
+        finally { bodyReservation?.Dispose(); }
+    }
+
+    internal void OwnVerifiedExtent(SourceExtent extent, SourceExtentVerificationLease pin)
+    {
+        lock (sync)
+        {
+            ObjectDisposedException.ThrowIf(resources is null, this);
+            sourceExtents.Add(extent);
+            additionalVerifications.Add(pin);
+            resources.Add(pin);
+        }
+    }
 
     public static async Task<NativeContainerLease> OpenAsync(ArchiveSnapshot snapshot, ResourceIdentity identity,
         AssetMemoryBudget budget, CancellationToken token = default, bool allowLargeData = false)
@@ -157,7 +289,15 @@ public sealed class NativeContainerLease : IDisposable
         value.Gaps.Sum(gap => (long)gap.Bytes.Length + 128) +
         value.DecodedPrefix.Length + value.RawSuffix.Length + 256 * 1024);
 
-    public void EnsureUnchanged() { lock (sync) { ObjectDisposedException.ThrowIf(resources is null, this); verification.EnsureUnchanged(); } }
+    public void EnsureUnchanged()
+    {
+        lock (sync)
+        {
+            ObjectDisposedException.ThrowIf(resources is null, this);
+            verification.EnsureUnchanged();
+            foreach (var additional in additionalVerifications) additional.EnsureUnchanged();
+        }
+    }
 
     internal void ReleaseCompressionBuffers()
     {
@@ -176,6 +316,16 @@ public sealed class NativeContainerLease : IDisposable
             ObjectDisposedException.ThrowIf(resources is null, this);
             checked { references++; }
             return new BorrowedLease(this);
+        }
+    }
+
+    internal void OwnPreparedMetadata(AssetMemoryBudget.Reservation resource)
+    {
+        lock (sync)
+        {
+            if (resources is null) { resource.Dispose(); throw new ObjectDisposedException(nameof(NativeContainerLease)); }
+            preparedMetadataBytes = checked(preparedMetadataBytes + resource.Bytes);
+            resources.Add(resource);
         }
     }
 

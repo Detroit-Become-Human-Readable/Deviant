@@ -1,5 +1,7 @@
 using Deviant.Assets;
 using System.Security.Cryptography;
+using System.Buffers.Binary;
+using BCnEncoder.Shared;
 
 namespace Deviant.Formats.Textures;
 
@@ -86,6 +88,68 @@ public sealed record TextureDisplayTransform(TextureToneMapOperator Operator, fl
 
 public sealed class TextureSurface
 {
+    public static bool CanRetainEncodedDds(DdsTextureDocument document, TextureSubresourceSelection selection,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(document); ArgumentNullException.ThrowIfNull(selection);
+        token.ThrowIfCancellationRequested();
+        if (document.Info.IsHdr || document.Info.TrailingLength != 0) return false;
+        var extent = document.Subresources.SingleOrDefault(item => item.Selection == selection);
+        if (extent is null || extent.SourceOffset < 0 || extent.SourceOffset > document.OriginalBytes.Length - extent.EncodedLength)
+            return false;
+        var encoding = document.Encoding;
+        if (document.Info.Format == TextureStorageFormat.Luminance8)
+            return !document.Info.IsSrgb && encoding.Compression is null && !encoding.Luminance && !encoding.AlphaOnly &&
+                encoding.BytesPerPixel == 1 && encoding.RedMask == 0xff && encoding.GreenMask == 0 &&
+                encoding.BlueMask == 0 && encoding.AlphaMask == 0;
+        if (document.Info.Format is not (TextureStorageFormat.Bc1 or TextureStorageFormat.Bc3)) return false;
+        if (document.Info.Format == TextureStorageFormat.Bc3) return document.Encoding.Compression == CompressionFormat.Bc3;
+        if (document.Encoding.Compression == CompressionFormat.Bc1WithAlpha) return true;
+        if (document.Encoding.Compression != CompressionFormat.Bc1) return false;
+        var blocks = document.OriginalBytes.Span.Slice(checked((int)extent.SourceOffset), extent.EncodedLength);
+        for (int offset = 0; offset < blocks.Length; offset += 8)
+        {
+            if ((offset & 0xffff) == 0) token.ThrowIfCancellationRequested();
+            if (BinaryPrimitives.ReadUInt16LittleEndian(blocks[offset..]) <=
+                BinaryPrimitives.ReadUInt16LittleEndian(blocks[(offset + 2)..])) return false;
+        }
+        return true;
+    }
+
+    public static TextureSurface RestoreEncodedDds(int width, int height, DdsTextureDocument encodedDds,
+        bool sourceIsHdr, bool isSrgb, int mipIndex, TextureStorageFormat sourceFormat,
+        string sourceFormatName, string sourcePayloadSha256, TextureSubresourceSelection subresource,
+        ResourceIdentity? identity, SourceRevision? revision, TextureSubresourceSelection? encodedSelection = null)
+    {
+        ArgumentNullException.ThrowIfNull(encodedDds); ArgumentNullException.ThrowIfNull(subresource);
+        var selection = encodedSelection ?? encodedDds.DefaultSelection;
+        var extent = encodedDds.Subresources.SingleOrDefault(item => item.Selection == selection);
+        if (width is < 1 or > DdsTextureReader.MaximumDimension || height is < 1 or > DdsTextureReader.MaximumDimension ||
+            (long)width * height > DdsTextureReader.MaximumPixelCount || extent is null || extent.Width != width || extent.Height != height ||
+            sourceIsHdr || isSrgb != encodedDds.Info.IsSrgb || sourceFormat != encodedDds.Info.Format || mipIndex < 0 ||
+            subresource.MipIndex != mipIndex || subresource.ArrayLayer != selection.ArrayLayer || subresource.Face != selection.Face ||
+            sourcePayloadSha256 is not { Length: 64 } || !sourcePayloadSha256.All(Uri.IsHexDigit) ||
+            !CanRetainEncodedDds(encodedDds, selection) ||
+            encodedDds.Revision is not null && encodedDds.Revision != revision ||
+            encodedDds.ContentSha256 != Convert.ToHexString(SHA256.HashData(encodedDds.OriginalBytes.Span)).ToLowerInvariant())
+            throw new TextureFormatException("InvalidPreparedSurface", "The prepared encoded texture surface is invalid.");
+        return new(width, height, ReadOnlyMemory<byte>.Empty, ReadOnlyMemory<HdrPixel>.Empty, false, false, isSrgb,
+            mipIndex, sourceFormat, sourceFormatName, sourcePayloadSha256, subresource, identity, revision)
+            { EncodedDds = encodedDds, EncodedDdsSelection = selection };
+    }
+
+    public static TextureSurface RestoreRgba8(int width, int height, ReadOnlyMemory<byte> pixels,
+        bool sourceIsHdr, bool isSrgb, int mipIndex, TextureStorageFormat sourceFormat,
+        string sourceFormatName, string sourcePayloadSha256, TextureSubresourceSelection subresource,
+        ResourceIdentity? identity, SourceRevision? revision, TextureDisplayTransform? displayTransform = null)
+    {
+        if (width is < 1 or > DdsTextureReader.MaximumDimension || height is < 1 or > DdsTextureReader.MaximumDimension ||
+            (long)width * height > DdsTextureReader.MaximumPixelCount || pixels.Length != checked(width * height * 4) ||
+            mipIndex < 0 || sourcePayloadSha256 is not { Length: 64 } || !sourcePayloadSha256.All(Uri.IsHexDigit))
+            throw new TextureFormatException("InvalidPreparedSurface", "The prepared texture surface is invalid.");
+        return new(width, height, pixels, ReadOnlyMemory<HdrPixel>.Empty, false, sourceIsHdr, isSrgb, mipIndex, sourceFormat,
+            sourceFormatName, sourcePayloadSha256, subresource, identity, revision, displayTransform);
+    }
     internal TextureSurface(int width, int height, ReadOnlyMemory<byte> rgba8, ReadOnlyMemory<HdrPixel> hdrPixels,
         bool isHdr, bool sourceIsHdr, bool isSrgb, int mipIndex, TextureStorageFormat sourceFormat,
         string sourceFormatName, string sourcePayloadSha256, TextureSubresourceSelection subresource,
@@ -123,6 +187,9 @@ public sealed class TextureSurface
     public SourceRevision? Revision { get; }
     public TextureDisplayTransform? DisplayTransform { get; }
     public ReadOnlyMemory<byte> Rgba8 { get; }
+    public bool HasRgba8 => Rgba8.Length == (long)Width * Height * 4;
+    public DdsTextureDocument? EncodedDds { get; private init; }
+    public TextureSubresourceSelection? EncodedDdsSelection { get; private init; }
     public ReadOnlyMemory<HdrPixel> HdrPixels { get; }
 }
 

@@ -41,6 +41,18 @@ public sealed class GeometryPipelineTests
     }
 
     [Fact]
+    public void ValidatorObservesCancellationDuringVertexScan()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var positions = new CancellingVectorList(cancellation,
+            [new(0, 0, 0), new(1, 0, 0), new(0, 1, 0)]);
+        var primitive = Primitive() with { Positions = positions };
+
+        Assert.ThrowsAny<OperationCanceledException>(() =>
+            GeometryValidator.Validate(Asset(primitive), cancellation.Token));
+    }
+
+    [Fact]
     public async Task ExporterWritesReadableGlbAndReportsUnresolvedMaterialValues()
     {
         var primitive = Primitive() with
@@ -115,4 +127,20 @@ public sealed class GeometryPipelineTests
     private static GeometryPrimitive Primitive() => new("triangle", PrimitiveTopology.Triangles,
         [new Vector3(0, 0, 0), new Vector3(1, 0, 0), new Vector3(0, 1, 0)], [0, 1, 2],
         IndexElementFormat.UInt16, [new GeometrySubmesh("default", 0, 3, [])]);
+
+    private sealed class CancellingVectorList(CancellationTokenSource cancellation,
+        IReadOnlyList<Vector3> values) : IReadOnlyList<Vector3>
+    {
+        public int Count => values.Count;
+        public Vector3 this[int index]
+        {
+            get
+            {
+                if (index == 1) cancellation.Cancel();
+                return values[index];
+            }
+        }
+        public IEnumerator<Vector3> GetEnumerator() => values.GetEnumerator();
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
 }

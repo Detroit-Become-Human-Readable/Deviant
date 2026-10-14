@@ -19,18 +19,18 @@ public sealed class NativeTextureDecoderTests
         var source = NativeTextureFixture.Create(srgb: srgb);
         var result = new NativeTextureDecoder().ReadDetailed(source);
         Assert.Equal(4, result.Document.Info.Width); Assert.Equal(2, result.Document.Info.Height);
-        Assert.Equal(2, result.Document.Info.MipCount); Assert.Equal(3, result.TotalMipCount);
-        Assert.Equal(new[] { 0, 1 }, result.SupportedMips.Select(mip => mip.MipIndex)); Assert.Equal(new[] { 2 }, result.OmittedMipIndices);
+        Assert.Equal(3, result.Document.Info.MipCount); Assert.Equal(3, result.TotalMipCount);
+        Assert.Equal(new[] { 0, 1, 2 }, result.SupportedMips.Select(mip => mip.MipIndex)); Assert.Empty(result.OmittedMipIndices);
         Assert.Equal(srgb, result.Document.Info.IsSrgb); Assert.Equal(TextureStorageFormat.Bgra8, result.Document.Info.Format);
         var decoder = new DdsTextureDecoder();
-        for (var mip = 0; mip < 2; mip++)
+        for (var mip = 0; mip < 3; mip++)
         {
             var pixels = decoder.DecodeMip(result.Document, mip);
             Assert.Equal(NativeTextureFixture.RgbaPixels(mip), pixels.Rgba8.ToArray());
             Assert.Equal(source.Metadata.Identity, pixels.Identity); Assert.Equal(source.Revision, pixels.Revision);
             Assert.Equal(srgb, pixels.IsSrgb);
         }
-        Assert.Equal(new byte[] { 99, 88 }, source.Payloads[0].OriginalBytes.ToArray());
+        Assert.Equal(source.Payloads[0].Identity, result.SupportedMips[2].Identity);
         Assert.NotEqual(source.Payloads[1].Sha256, result.Document.ContentSha256);
     }
 
@@ -86,7 +86,7 @@ public sealed class NativeTextureDecoderTests
     [Fact]
     public void KeepsOnlyContiguousLevelsAndHonorsCancellationAndByteBudget()
     {
-        var result = new NativeTextureDecoder().ReadDetailed(NativeTextureFixture.Create(indices: [0, 2]));
+        var result = new NativeTextureDecoder().ReadDetailed(NativeTextureFixture.Create(indices: [0]));
         Assert.Equal(1, result.Document.Info.MipCount); Assert.Equal(new[] { 1, 2 }, result.OmittedMipIndices);
         using var cancelled = new CancellationTokenSource(); cancelled.Cancel();
         Assert.Throws<OperationCanceledException>(() => new NativeTextureDecoder().Read(NativeTextureFixture.Create(), cancelled.Token));
@@ -122,7 +122,9 @@ internal static class NativeTextureFixture
     {
         indices ??= [0, 1]; const string index = "synthetic-native-index";
         var catalog = new ResourceIdentity(index, 0); var container = new ResourceIdentity(index, 1); var revision = new SourceRevision(index, "synthetic-native-source");
-        var raw = Payload(new(index, 2), 2229, 100, [99, 88]);
+        var tail = new byte[256]; BgraPixels(2, zeroAlpha).CopyTo(tail, 0);
+        var packed = WrapRawL(tail); "ETF_RAW_"u8.CopyTo(packed.AsSpan(5));
+        var raw = Payload(new(index, 2), 2229, 100, packed);
         var payloads = new List<NativeTexturePayload> { raw };
         foreach (var (mip, sequence) in indices.Select((mip, sequence) => (mip, sequence)))
             payloads.Add(Payload(new(index, sequence + 3), 2230, (uint)sequence + 110, WrapRawL(BgraPixels(mip, zeroAlpha))));
@@ -138,7 +140,7 @@ internal static class NativeTextureFixture
             foreach (var descriptor in descriptors) { writer.Write(descriptor.Width); writer.Write(descriptor.Height); writer.Write(descriptor.ThirdU16); writer.Write(descriptor.TrailingByte); }
             writer.Write(conversion ? (byte)1 : (byte)0); writer.Write((byte)0); writer.Write((byte)0);
             writer.Write(32u); writer.Write(8u); writer.Write(4u);
-            writer.Write(2229u); writer.Write(100u); writer.Write(77u);
+            writer.Write(2229u); writer.Write(100u); writer.Write(256u);
             foreach (var (mip, sequence) in indices.Select((mip, sequence) => (mip, sequence)))
             { writer.Write(2230u); writer.Write((uint)sequence + 110); writer.Write((uint)BgraPixels(mip).Length + (wrongFollowing && sequence == 0 ? 1u : 0u)); }
         }

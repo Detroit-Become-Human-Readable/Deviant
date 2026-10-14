@@ -26,6 +26,11 @@ public sealed record TextureBufferPatternInspection(
     TextureBufferPatternBoundaryBasis BoundaryBasis,
     IReadOnlyDictionary<string, string> Assumptions);
 
+public sealed record TextureBufferPatternRangeInspection(TextureBufferPatternProfile Profile,
+    TextureBufferPatternKind Kind, SourceExtent StoredExtent, SourceExtent PayloadExtent,
+    uint DeclaredDecodedLength, IReadOnlyList<SegsDecodedByteRange> Ranges,
+    IReadOnlyList<byte[]> DecodedRanges);
+
 /// <summary>Inspects one explicitly selected ETF buffer pattern. It does not decode image pixels.</summary>
 public sealed class TextureBufferPatternInspector(ISourceRevisionProvider? revisionProvider = null)
 {
@@ -141,6 +146,64 @@ public sealed class TextureBufferPatternInspector(ISourceRevisionProvider? revis
             new(CandidateLengthWordOffset, candidatePayloadOffset, true, true, false), assumptions);
         return new(inspection, identity, revision, extents, steps, segsResult.Diagnostics, [],
             new Dictionary<string, string> { ["status"] = "Inspected" });
+    }
+
+    /// <summary>Validates an ETF_RAW_ table and decodes only the requested bounded ranges from its SEGS package.</summary>
+    public DecodeResult<TextureBufferPatternRangeInspection> ParseDecodedRanges(ReadOnlyMemory<byte> storedBytes,
+        ResourceIdentity identity, SourceRevision revision, SourceExtent originalExtent, uint resourceType,
+        TextureBufferPatternProfile profile, IReadOnlyList<SegsDecodedByteRange> ranges,
+        uint expectedDecodedLength, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        ArgumentNullException.ThrowIfNull(revision);
+        ArgumentNullException.ThrowIfNull(originalExtent);
+        ArgumentNullException.ThrowIfNull(ranges);
+        cancellationToken.ThrowIfCancellationRequested();
+        var storedHash = Sha256(storedBytes.Span);
+        var storedExtent = originalExtent with { PayloadSha256 = storedHash };
+        DecodeResult<TextureBufferPatternRangeInspection> Unsupported(string code, string message,
+            IReadOnlyList<SourceExtent>? extents = null) =>
+            new(null, identity, revision, extents ?? [storedExtent],
+                [new(nameof(TextureBufferPatternInspector), Version, $"profile={profile};selected-decoded-ranges", storedHash)],
+                [$"Unsupported {code}: {message}"], [], new Dictionary<string, string> { ["status"] = "Unsupported" });
+
+        if (identity.IndexContentId != revision.IndexContentId || originalExtent.Offset < 0 ||
+            originalExtent.Length != storedBytes.Length || originalExtent.Offset > long.MaxValue - originalExtent.Length)
+            return Unsupported("InvalidSourceExtent", "The source extent must exactly describe the supplied texture bytes.");
+        if (storedBytes.Length < HeaderLength || storedBytes.Length > MaximumStoredBytes)
+            return Unsupported("UnsupportedStoredSize", "The resource is outside the configured stored-byte limit.");
+        if (profile != TextureBufferPatternProfile.ObservedEtfSeGsCandidateV1)
+            return Unsupported("UnsupportedProfile", "The selected buffer inspection profile is not supported.");
+        if (originalExtent.PayloadSha256 is { } expectedHash &&
+            !StringComparer.OrdinalIgnoreCase.Equals(expectedHash, storedHash))
+            return Unsupported("StoredBytesHashMismatch", "The owner stored-byte hash does not match the supplied bytes.");
+        if (!TryGetPayload(storedBytes.Span, originalExtent with { PayloadSha256 = storedHash }, resourceType,
+            out var kind, out _, out var payloadExtent, out var envelopeDiagnostic))
+            return Unsupported("UnsupportedEnvelope", envelopeDiagnostic!);
+
+        var payloadBytes = storedBytes.Slice(HeaderLength);
+        var parsed = new SegsContainerReader(revisions).ParseDecodedRanges(payloadBytes, identity, revision,
+            payloadExtent!, ranges, expectedDecodedLength, DefaultLimits(), cancellationToken);
+        var package = parsed.Value;
+        if (package is null)
+            return Unsupported("UnsupportedSegsPayload", string.Join("; ", parsed.Diagnostics), parsed.Extents);
+        if (package.RawSuffixLength != 0)
+            return Unsupported("UnsupportedRawSuffix", "The selected texture payload contains an unsupported trailing suffix.", parsed.Extents);
+
+        var inspection = new TextureBufferPatternRangeInspection(profile, kind, storedExtent,
+            payloadExtent!, package.DeclaredDecodedLength, package.Ranges, package.DecodedRanges);
+        var steps = new[]
+        {
+            new DecodeStep(nameof(TextureBufferPatternInspector), Version,
+                $"profile={profile};selected-decoded-ranges", storedHash)
+        }.Concat(parsed.Steps).ToArray();
+        var extents = new[] { storedExtent }.Concat(parsed.Extents).Distinct().ToArray();
+        return new(inspection, identity, revision, extents, steps, parsed.Diagnostics, [],
+            new Dictionary<string, string>
+            {
+                ["status"] = "Inspected",
+                ["retainedDecodedBytes"] = package.DecodedRanges.Sum(range => (long)range.Length).ToString(System.Globalization.CultureInfo.InvariantCulture)
+            });
     }
 
     /// <summary>Validates the shared ETF envelope and returns its exact stored payload.</summary>

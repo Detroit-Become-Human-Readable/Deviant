@@ -52,12 +52,16 @@ public sealed class RenderTreeRow : INotifyPropertyChanged
     public event PropertyChangedEventHandler? PropertyChanged;
 }
 
-public sealed record RenderTextureRow(ResourceIdentity Material, int SlotOrdinal, RenderTexture Texture,
+public sealed record RenderTextureRow(ResourceIdentity Material, int SlotOrdinal, RenderTexture? Texture,
     MaterialTextureBinding? Binding = null, string? Usage = null)
 {
     public RenderTextureRow(ResourceIdentity material, MaterialTextureBinding binding, RenderTexture texture)
         : this(material, binding.SlotOrdinal, texture, binding) { }
-    public string Label => $"{Usage ?? RoleLabel(Binding?.Role)} · {Texture.Surface.Width} × {Texture.Surface.Height}";
+    public string Label => $"{Usage ?? RoleLabel(Binding?.Role)} · " + (Texture is { } texture
+        ? $"{texture.Surface.Width} × {texture.Surface.Height}" : "Unavailable");
+    public string Details => Texture is { } texture ? SceneView.FormatTextureDetails(SlotOrdinal, texture) :
+        $"Slot {SlotOrdinal}\nReference {Binding?.Texture.ResourceType}/{Binding?.Texture.Id}\n{Failure ?? "Texture could not be loaded."}";
+    public string? Failure { get; init; }
     private static string RoleLabel(MaterialTextureRole? role) => role switch
     {
         MaterialTextureRole.Normal => "Normal",
@@ -75,14 +79,21 @@ public partial class SceneView
     private CancellationTokenSource? renderCancellation;
     private Task renderTask = Task.CompletedTask;
     private long renderGeneration;
+    private long restoreGeneration;
+    private SceneRenderRequest? lastSuccessfulSceneRenderRequest;
+    private AssetMemoryBudget? lastSuccessfulRenderBudget;
     private bool selectingRenderTree;
     private bool updatingBranches;
     private readonly Dictionary<string, RenderTreeRow> renderRows = new(StringComparer.Ordinal);
 
     public Func<SceneRenderRequest, IProgress<RenderLoadProgress>?, CancellationToken, Task<RenderAssetSnapshot>>? RenderProvider { get; set; }
+    public Func<SceneRenderRequest, IProgress<RenderLoadProgress>?, Func<RenderAssetSnapshot, CancellationToken, Task>, CancellationToken, Task<RenderAssetSnapshot>>? StreamingRenderProvider { get; set; }
+    public Func<IDisposable>? ForegroundWorkProvider { get; set; }
+    public Func<CancellationToken, Task>? BackgroundDrainProvider { get; set; }
     public Func<string, CancellationToken, Task<bool>>? LargeDataConfirmationProvider { get; set; }
     public Func<RenderAssetSnapshot, RenderOccurrence, CancellationToken, Task>? ModelPreviewProvider { get; set; }
     public Func<RenderTexture, SourceRevision, CancellationToken, Task>? TexturePreviewProvider { get; set; }
+    public Func<RenderTextureSelection, CancellationToken, Task>? LightingTexturePreviewProvider { get; set; }
     public RenderAssetSnapshot? CurrentRenderSnapshot => renderSnapshot;
     public RenderOccurrence? SelectedOccurrence => selectedOccurrence;
     public AssetViewport Viewport => SceneViewport;
@@ -91,7 +102,7 @@ public partial class SceneView
 
     private void InitializeRendering()
     {
-        SceneViewport.SelectionChanged += (_, key) => SelectOccurrence(key, selectTree: true);
+        SceneViewport.MeshSelectionChanged += (_, selected) => SelectMeshes(selected);
         SceneViewport.RenderFailed += (_, error) => { RenderStatus.Text = "Unable to render scene"; Advanced.Text = error.ToString(); };
         SceneViewport.LoadProgressChanged += (_, progress) => UpdateRenderLoadingProgress(progress);
     }
@@ -178,13 +189,18 @@ public partial class SceneView
         UpdateRegionButtons();
     }
 
-    public async Task LoadRegionAsync(CancellationToken token = default, SceneRenderScope scope = SceneRenderScope.Region,
-        int maximumPreviewDimension = 1024)
+    public Task LoadRegionAsync(CancellationToken token = default, SceneRenderScope scope = SceneRenderScope.Region,
+        int maximumPreviewDimension = 1024) => LoadRegionAsync(token, scope, maximumPreviewDimension, null);
+
+    private async Task LoadRegionAsync(CancellationToken token, SceneRenderScope scope,
+        int maximumPreviewDimension, GeometryBounds? regionOverride, bool? allowLargeDataOverride = null,
+        AssetMemoryBudget? expectedBudget = null)
     {
         var loaded = section ?? throw new InvalidOperationException("Open a scene first.");
         var branch = BranchChoice.SelectedItem as SceneBranchChoice ?? throw new InvalidOperationException("Select a scene branch.");
         var provider = RenderProvider ?? throw new InvalidOperationException("Scene rendering is unavailable.");
-        var region = scope == SceneRenderScope.Scene ? renderSnapshot?.Region ?? new GeometryBounds(Vector3.Zero, Vector3.One) : ReadRegion();
+        var region = regionOverride ?? (scope == SceneRenderScope.Scene
+            ? renderSnapshot?.Region ?? new GeometryBounds(Vector3.Zero, Vector3.One) : ReadRegion());
         renderCancellation?.Cancel();
         var previous = renderTask;
         var generation = ++renderGeneration;
@@ -193,7 +209,8 @@ public partial class SceneView
         var own = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
         renderCancellation = own;
         var task = LoadRegionCoreAsync(new(loaded, branch.Instance.Identity, region, scope)
-            { MaximumPreviewDimension = maximumPreviewDimension, AllowLargeData = HasLargeDataApproval(loaded) }, provider, own, generation);
+            { MaximumPreviewDimension = maximumPreviewDimension, AllowLargeData = allowLargeDataOverride ?? HasLargeDataApproval(loaded) },
+            provider, own, generation, expectedBudget);
         renderTask = task;
         try { await task; }
         finally
@@ -206,11 +223,14 @@ public partial class SceneView
 
     private async Task LoadRegionCoreAsync(SceneRenderRequest request,
         Func<SceneRenderRequest, IProgress<RenderLoadProgress>?, CancellationToken, Task<RenderAssetSnapshot>> provider,
-        CancellationTokenSource cancellation, long generation)
+        CancellationTokenSource cancellation, long generation, AssetMemoryBudget? expectedBudget = null)
     {
         RenderAssetSnapshot? candidate = null;
+        using var foreground = ForegroundWorkProvider?.Invoke();
         var previousSnapshot = renderSnapshot;
         var viewportTouched = false;
+        bool streamed = false;
+        IDisposable? provisionalLease = null;
         var previousCamera = renderSnapshot is not null
             ? SceneViewport.Viewport.Camera?.CloneCurrentValue() as HelixToolkit.Wpf.SharpDX.PerspectiveCamera : null;
         LoadRegionButton.IsEnabled = false;
@@ -223,7 +243,8 @@ public partial class SceneView
         UpdateLoadingProgress();
         try
         {
-            var progress = new Progress<RenderLoadProgress>(value =>
+            if (BackgroundDrainProvider is { } drain) await drain(cancellation.Token);
+            using var progress = new CoalescedDispatcherProgress<RenderLoadProgress>(Dispatcher, value =>
             {
                 if (generation == renderGeneration && !cancellation.IsCancellationRequested)
                     UpdateRenderLoadingProgress(value);
@@ -233,7 +254,6 @@ public partial class SceneView
             {
                 candidate?.Dispose();
                 candidate = null;
-                if (viewportTouched) await SceneViewport.UnloadAsync();
                 var subject = request.Scope switch
                 {
                     SceneRenderScope.Scene => "This scene contains a lot of data and may take extra time to load. Continue?",
@@ -253,11 +273,13 @@ public partial class SceneView
                     throw new OperationCanceledException(cancellation.Token);
                 ApproveLargeData(request.Section);
                 await ReleaseRenderSnapshotAsync();
+                provisionalLease?.Dispose();
+                provisionalLease = null;
                 UpdateRenderLoadingProgress(new("Reading scene", 0, 0, 0));
                 request = request with { AllowLargeData = true };
                 await LoadCandidateAsync();
             }
-            if (request.Scope == SceneRenderScope.Scene && previousCamera is not null && SceneViewport.Viewport.Camera is HelixToolkit.Wpf.SharpDX.PerspectiveCamera camera)
+            if (!streamed && request.Scope == SceneRenderScope.Scene && previousCamera is not null && SceneViewport.Viewport.Camera is HelixToolkit.Wpf.SharpDX.PerspectiveCamera camera)
             {
                 camera.Position = previousCamera.Position;
                 camera.LookDirection = previousCamera.LookDirection;
@@ -271,15 +293,35 @@ public partial class SceneView
             RenderedTab.IsSelected = true;
             UpdateRenderedCount();
             Advanced.Text = FormatCoverage(renderSnapshot) + "\n" + FormatIssues(renderSnapshot.Issues.Concat(SceneViewport.RendererIssues));
+            lastSuccessfulSceneRenderRequest = request;
+            lastSuccessfulRenderBudget = renderSnapshot.MemoryBudget;
 
             async Task LoadCandidateAsync()
             {
-                candidate = await provider(request, progress, cancellation.Token);
+                if (StreamingRenderProvider is { } streaming)
+                    candidate = await streaming(request, progress, async (slice, sliceToken) =>
+                    {
+                        await Dispatcher.InvokeAsync(async () =>
+                        {
+                            sliceToken.ThrowIfCancellationRequested();
+                            if (generation != renderGeneration || !ReferenceEquals(section, request.Section)) throw new OperationCanceledException(sliceToken);
+                            if (!streamed) await SceneViewport.UnloadAsync();
+                            viewportTouched = true;
+                            await SceneViewport.AppendSnapshotAsync(slice, sliceToken);
+                            var held = slice.AcquireLease(); provisionalLease?.Dispose(); provisionalLease = held;
+                            renderSnapshot = slice; streamed = true;
+                            RenderedTab.IsSelected = true; UpdateRenderedCount();
+                        }, DispatcherPriority.Normal, sliceToken).Task.Unwrap();
+                    }, cancellation.Token);
+                else candidate = await provider(request, progress, cancellation.Token);
                 cancellation.Token.ThrowIfCancellationRequested();
                 if (generation != renderGeneration || !ReferenceEquals(section, request.Section))
                     throw new OperationCanceledException(cancellation.Token);
+                if (expectedBudget is not null && !ReferenceEquals(candidate.MemoryBudget, expectedBudget))
+                    throw new InvalidOperationException("The restored scene belongs to another render budget.");
                 viewportTouched = true;
-                await SceneViewport.LoadSnapshotAsync(candidate, cancellation.Token);
+                if (streamed) await SceneViewport.CompleteSnapshotAsync(candidate, cancellation.Token);
+                else await LoadViewportSnapshotAsync(candidate, cancellation.Token);
                 cancellation.Token.ThrowIfCancellationRequested();
                 if (generation != renderGeneration || !ReferenceEquals(section, request.Section))
                     throw new OperationCanceledException(cancellation.Token);
@@ -300,6 +342,7 @@ public partial class SceneView
         finally
         {
             candidate?.Dispose();
+            provisionalLease?.Dispose();
             if (generation == renderGeneration)
             {
                 renderLoadingActive = false;
@@ -313,10 +356,11 @@ public partial class SceneView
             await SceneViewport.UnloadAsync();
             candidate?.Dispose();
             candidate = null;
+            renderSnapshot = previousSnapshot;
             if (previousSnapshot is null || !ReferenceEquals(renderSnapshot, previousSnapshot)) return;
             try
             {
-                await SceneViewport.LoadSnapshotAsync(previousSnapshot, CancellationToken.None);
+                await LoadViewportSnapshotAsync(previousSnapshot, CancellationToken.None);
                 if (previousCamera is not null && SceneViewport.Viewport.Camera is HelixToolkit.Wpf.SharpDX.PerspectiveCamera camera)
                 {
                     camera.Position = previousCamera.Position;
@@ -329,17 +373,28 @@ public partial class SceneView
         }
     }
 
-    private Task<bool> ConfirmLargeDataAsync(string message, CancellationToken token)
+    private TaskCompletionSource<bool>? largeLoadDecision;
+    private bool cancellingActivity;
+
+    private async Task<bool> ConfirmLargeDataAsync(string message, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
-        if (LargeDataConfirmationProvider is { } confirm) return confirm(message, token);
-        var owner = Window.GetWindow(this);
-        var result = owner is null
-            ? MessageBox.Show(message, "Large scene", MessageBoxButton.YesNo, MessageBoxImage.Warning)
-            : MessageBox.Show(owner, message, "Large scene", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-        token.ThrowIfCancellationRequested();
-        return Task.FromResult(result == MessageBoxResult.Yes);
+        if (LargeDataConfirmationProvider is { } confirm) return await confirm(message, token).WaitAsync(token);
+        var decision = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        largeLoadDecision = decision;
+        LargeLoadMessage.Text = message;
+        LargeLoadDecisionPanel.Visibility = Visibility.Visible;
+        UpdateLoadingProgress();
+        try { return await decision.Task.WaitAsync(token); }
+        finally
+        {
+            if (ReferenceEquals(largeLoadDecision, decision))
+            { largeLoadDecision = null; LargeLoadDecisionPanel.Visibility = Visibility.Collapsed; UpdateLoadingProgress(); }
+        }
     }
+
+    private void ContinueLargeLoad_Click(object sender, RoutedEventArgs e) => largeLoadDecision?.TrySetResult(true);
+    private void DeclineLargeLoad_Click(object sender, RoutedEventArgs e) => largeLoadDecision?.TrySetResult(false);
 
     public async Task ClearRenderingAsync()
     {
@@ -388,9 +443,13 @@ public partial class SceneView
 
     public void SelectOccurrence(string? key, bool selectTree = true)
     {
+        InvalidateTextureQuery();
+        ClearLightingInspector();
         selectedOccurrence = key is null ? null : renderSnapshot?.Occurrences.FirstOrDefault(item => item.Key == key);
         SceneViewport.SetSelection(selectedOccurrence?.Key);
         OpenModelButton.IsEnabled = selectedOccurrence is not null && ModelPreviewProvider is not null;
+        ExportSelectionButton.IsEnabled = selectedOccurrence is not null;
+        SelectionSummary.Text = selectedOccurrence is null ? "" : "1 selected · Ctrl+click to add";
         if (selectedOccurrence is not { } occurrence || renderSnapshot is not { } source)
         {
             ClearRenderInspector();
@@ -403,16 +462,21 @@ public partial class SceneView
         SelectedName.Text = renderRows.Values.FirstOrDefault(item => item.Node.OccurrenceKey == occurrence.Key)?.Label ?? SceneNameDisplay.Project(occurrence.Label, "Mesh");
         Footer.Text = "";
         RenderSummary.Text = $"{mesh.Geometry.Primitives.Sum(item => item.Positions.Count):N0} vertices · {mesh.Geometry.Primitives.Sum(item => item.Indices.Count / 3):N0} triangles";
-        IdentityText.Text = $"Object {occurrence.Entity.Key}\nNode {occurrence.Node.Key}\nMesh {mesh.Identity.Key}\nGroup {mesh.GroupIndex}";
+        IdentityText.Text = occurrence.PlacementOrigin == RenderPlacementOrigin.ModelLocal
+            ? $"Model-local placement\nMesh anchor {mesh.Identity.Key}\nGroup {mesh.GroupIndex}\nScene entity unavailable\nScene node unavailable"
+            : $"Object {occurrence.SceneEntityIdentity?.Key ?? occurrence.Entity.Key}\nNode {occurrence.SceneNodeIdentity?.Key ?? occurrence.Node.Key}\nMesh {mesh.Identity.Key}\nGroup {mesh.GroupIndex}";
         PropertiesText.Text = $"Bounds {Format(occurrence.WorldBounds.Minimum)} – {Format(occurrence.WorldBounds.Maximum)}\n" +
-            $"Source visibility {occurrence.SourceVisible}\nNative flags {(occurrence.NativeFlags is { } flags ? $"0x{flags:X8}" : "Unavailable")}";
+            $"Source visibility {(occurrence.SourceVisibilityKnown ? occurrence.SourceVisible.ToString() : "Unavailable")}\nNative flags {(occurrence.NativeFlags is { } flags ? $"0x{flags:X8}" : "Unavailable")}";
         var row = source.Hierarchy.FirstOrDefault(item => item.OccurrenceKey == occurrence.Key);
         LocalMatrix.Text = row is null ? "" : FormatMatrix(row.Local);
         WorldMatrix.Text = FormatMatrix(occurrence.World);
         Entities.ItemsSource = null;
         QueryTextures.IsEnabled = false; TextureResults.ItemsSource = null;
         MappedTextures.ItemsSource = BuildTextureRows(materials);
-        References.ItemsSource = section?.ReferencesByNode.GetValueOrDefault(occurrence.Node)?.Select(item => new SceneObjectReferenceRow(item)).ToArray();
+        MappedTexturesPanel.Visibility = MappedTextures.Items.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+        References.ItemsSource = occurrence.SceneNodeIdentity is { } node
+            ? section?.ReferencesByNode.GetValueOrDefault(node)?.Select(item => new SceneObjectReferenceRow(item)).ToArray()
+            : null;
         OpenReference.IsEnabled = false;
         Advanced.Text = $"Source name {occurrence.Label}\nOccurrence {occurrence.Key}\nInstance path:\n{string.Join("\n", occurrence.InstancePath.Select(item => item.Key))}\n\n" +
             string.Join("\n", materials.Select(material => $"Material {material.Asset.Identity.Key}\n{material.Asset.Profile}\n" +
@@ -437,12 +501,33 @@ public partial class SceneView
         SelectedResourceChanged?.Invoke(this, EventArgs.Empty);
     }
 
+    public void SelectMeshes(IReadOnlyList<RenderMeshSelection> selected)
+    {
+        SelectOccurrence(selected.LastOrDefault()?.OccurrenceKey);
+        SceneViewport.SetSelections(selected);
+        SelectionSummary.Text = selected.Count == 0 ? "" : $"{selected.Count:N0} selected · Ctrl+click to add";
+        ExportSelectionButton.IsEnabled = selected.Count > 0;
+        if (selected.LastOrDefault()?.PrimitiveKey is { } primitiveKey && selectedOccurrence is { } occurrence && renderSnapshot is { } source)
+        {
+            var mesh = source.Meshes[occurrence.GeometryKey];
+            var primitive = mesh.Geometry.Primitives.Single(p => p.Key == primitiveKey);
+            RenderSummary.Text = $"{primitive.Positions.Count:N0} vertices · {primitive.Indices.Count / 3:N0} triangles";
+            var identities = mesh.MaterialsByPrimitive?.TryGetValue(primitiveKey, out var material) == true ? new[] { material } : [];
+            MappedTextures.ItemsSource = BuildTextureRows(identities.Where(source.Materials.ContainsKey).Select(id => source.Materials[id]));
+        }
+    }
+
     private void ClearRenderInspector()
     {
+        SelectionSummary.Text = "";
+        ExportSelectionButton.IsEnabled = false;
+        InvalidateTextureQuery();
+        ClearLightingInspector();
         SelectedName.Text = "Select an object";
         Footer.Text = RenderSummary.Text = IdentityText.Text = PropertiesText.Text = LocalMatrix.Text = WorldMatrix.Text = Advanced.Text = "";
         Entities.ItemsSource = References.ItemsSource = TextureResults.ItemsSource = MappedTextures.ItemsSource = null;
         QueryTextures.IsEnabled = OpenReference.IsEnabled = OpenModelButton.IsEnabled = false;
+        MappedTexturesPanel.Visibility = Visibility.Collapsed;
     }
 
     private bool SelectRenderTreeItem(string occurrenceKey)
@@ -519,14 +604,17 @@ public partial class SceneView
     public static IReadOnlyList<RenderTextureRow> BuildTextureRows(IEnumerable<RenderMaterial> materials)
     {
         ArgumentNullException.ThrowIfNull(materials);
-        return materials.SelectMany(material => material.TexturesBySlot.OrderBy(pair => pair.Key).Select(pair =>
+        return materials.SelectMany(material => material.TexturesBySlot.Keys.Concat(material.Asset.Bindings.Select(b => b.SlotOrdinal))
+            .Concat(material.Asset.SurfaceGraph?.TextureSlots ?? [])
+            .Distinct().Order().Select(slot =>
         {
-            var binding = material.Asset.Bindings.FirstOrDefault(item => item.SlotOrdinal == pair.Key);
+            var binding = material.Asset.Bindings.FirstOrDefault(item => item.SlotOrdinal == slot);
             var graph = material.Asset.SurfaceGraph;
-            var color = UsesSlot(graph?.BaseColor, pair.Key);
-            var opacity = UsesSlot(graph?.Opacity, pair.Key) || UsesSlot(graph?.AlphaCutoff, pair.Key);
+            var color = UsesSlot(graph?.BaseColor, slot);
+            var opacity = UsesSlot(graph?.Opacity, slot) || UsesSlot(graph?.AlphaCutoff, slot);
             var usage = color && opacity ? "Colour / Opacity" : color ? "Colour" : opacity ? "Opacity" : null;
-            return new RenderTextureRow(material.Asset.Identity, pair.Key, pair.Value, binding, usage);
+            return new RenderTextureRow(material.Asset.Identity, slot, material.TexturesBySlot.GetValueOrDefault(slot), binding, usage)
+                { Failure = string.Join("\n", material.Asset.Diagnostics.Concat(material.Asset.SurfaceGraph?.Diagnostics ?? [])) };
         })).ToArray();
     }
 
@@ -557,17 +645,26 @@ public partial class SceneView
     }
     private void UpdateRenderedCount()
     {
-        if (renderSnapshot is not null) RenderStatus.Text = $"{SceneViewport.VisibleOccurrenceCount:N0} objects · {renderSnapshot.Meshes.Count:N0} meshes";
+        if (renderSnapshot is not null) RenderStatus.Text = $"{SceneViewport.VisibleOccurrenceCount:N0} objects · {SceneViewport.VisibleMeshCount:N0} meshes";
     }
     private void RenderHierarchy_SelectionChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
     {
         if (selectingRenderTree || e.NewValue is not RenderTreeRow row) return;
-        if (row.Node.OccurrenceKey is { } key) SelectOccurrence(key, selectTree: false);
+        if (row.Node.OccurrenceKey is { } key)
+        {
+            var selected = Keyboard.Modifiers.HasFlag(ModifierKeys.Control) ? SceneViewport.SelectedMeshes.ToHashSet() : [];
+            var item = new RenderMeshSelection(key);
+            if (!selected.Remove(item)) selected.Add(item);
+            SelectMeshes(selected.ToArray());
+        }
         else
         {
+            InvalidateTextureQuery();
+            ClearLightingInspector();
             selectedOccurrence = null; SceneViewport.SetSelection(null); OpenModelButton.IsEnabled = false;
             SelectedName.Text = row.Label; RenderSummary.Text = ""; Footer.Text = "";
             MappedTextures.ItemsSource = null; TextureResults.ItemsSource = null; QueryTextures.IsEnabled = false;
+            MappedTexturesPanel.Visibility = Visibility.Collapsed;
             IdentityText.Text = row.Node.Node.Key; PropertiesText.Text = "";
             LocalMatrix.Text = FormatMatrix(row.Node.Local); WorldMatrix.Text = FormatMatrix(row.Node.World);
             Entities.ItemsSource = null; References.ItemsSource = null; OpenReference.IsEnabled = false;
@@ -583,11 +680,11 @@ public partial class SceneView
     }
     private async void MappedTextures_DoubleClick(object sender, MouseButtonEventArgs e)
     {
-        if (MappedTextures.SelectedItem is not RenderTextureRow row || renderSnapshot is not { } source) return;
+        if (MappedTextures.SelectedItem is not RenderTextureRow { Texture: { } texture } row || renderSnapshot is not { } source) return;
         try
         {
-            if (TexturePreviewProvider is not null) await TexturePreviewProvider(row.Texture, source.Revision, lifetime.Token);
-            else if (row.Texture.SourceIdentity is { } identity && AssetNavigator is not null) await AssetNavigator.OpenAsync(identity, source.Revision, lifetime.Token);
+            if (TexturePreviewProvider is not null) await TexturePreviewProvider(texture, source.Revision, lifetime.Token);
+            else if (texture.SourceIdentity is { } identity && AssetNavigator is not null) await AssetNavigator.OpenAsync(identity, source.Revision, lifetime.Token);
         }
         catch (OperationCanceledException) { }
         catch (Exception error) { RenderStatus.Text = error.Message; }

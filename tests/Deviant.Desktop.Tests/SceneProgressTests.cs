@@ -33,6 +33,60 @@ public sealed class SceneProgressTests
     });
 
     [Fact]
+    public void SceneSearchPublishesActivityAndCancelDrainsTheQuery() => Run(() =>
+    {
+        var session = new DiscoverySession(1, 1) { QueryGated = true };
+        var view = new SceneView();
+        var updates = new List<SceneActivityProgress>();
+        view.ActivityProgressChanged += (_, update) => updates.Add(update);
+        try
+        {
+            var load = view.LoadAsync(session);
+            PumpUntil(() => session.QueryStarted.Task.IsCompleted);
+            Assert.True(view.ActivityProgress.IsActive);
+            Assert.Equal("Searching scenes", view.ActivityProgress.Stage);
+            view.CancelActivity();
+            Pump(load);
+            Assert.True(session.QueryCancelled);
+            Assert.Contains(updates, update => update.IsActive && update.Stage == "Searching scenes");
+            Assert.False(view.ActivityProgress.IsActive);
+            Assert.Equal("Cancelled", view.ActivityProgress.Stage);
+        }
+        finally { Pump(view.DisposeAsync().AsTask()); }
+    });
+
+    [Fact]
+    public void SceneSearchStaysActiveUntilEveryOverlappingQueryDrains() => Run(() =>
+    {
+        var session = new DiscoverySession(1, 1);
+        var view = new SceneView();
+        try
+        {
+            Pump(view.LoadAsync(session));
+            session.QueryGated = true;
+            session.IgnoreQueryCancellation = true;
+            var query = typeof(SceneView).GetMethod("QueryAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var first = (Task)query.Invoke(view, [CancellationToken.None])!;
+            PumpUntil(() => session.GatedQueryCalls == 1);
+            var second = (Task)query.Invoke(view, [CancellationToken.None])!;
+            PumpUntil(() => session.GatedQueryCalls == 2);
+            session.SecondQueryRelease.SetResult();
+            Pump(second);
+            Assert.True(view.ActivityProgress.IsActive);
+            Assert.Equal("Searching scenes", view.ActivityProgress.Stage);
+
+            var suspend = view.SuspendAsync();
+            Assert.False(suspend.IsCompleted);
+            session.FirstQueryRelease.SetResult();
+            Pump(first);
+            Pump(suspend);
+            Assert.False(view.ActivityProgress.IsActive);
+            Assert.Equal("Ready", view.ActivityProgress.Stage);
+        }
+        finally { Pump(view.DisposeAsync().AsTask()); }
+    });
+
+    [Fact]
     public void DiscoveryShowsUnknownAndKnownProgressAndResumesAfterCancellation() => Run(() =>
     {
         var session = new DiscoverySession(5, 2) { Gated = true, ExposeTotal = false };
@@ -45,6 +99,8 @@ public sealed class SceneProgressTests
             Assert.True(view.ActivityProgress.IsActive);
             Assert.Equal("Discovering scenes", view.ActivityProgress.Stage);
             Assert.Equal(0, view.ActivityProgress.Total);
+            Assert.Equal(Visibility.Collapsed, ((Grid)view.FindName("ViewportLoadingOverlay")).Visibility);
+            Assert.False(((ProcessingAnimation)view.FindName("ViewportProcessing")).IsActive);
             session.Permits.Release();
             PumpUntil(() => session.DiscoveryCalls == 2);
             Assert.Equal(5, view.ActivityProgress.Total);
@@ -79,6 +135,16 @@ public sealed class SceneProgressTests
         {
             Pump(view.LoadAsync(session)); Pump(view.SelectResourceAsync(session.LoadedSection.Result.Identity));
             var loading = view.LoadRegionAsync(); PumpUntil(() => progress is not null);
+            var overlay = (Grid)view.FindName("ViewportLoadingOverlay");
+            var animation = (ProcessingAnimation)view.FindName("ViewportProcessing");
+            var bar = (ProgressBar)view.FindName("ViewportLoadingProgress");
+            var stageText = (TextBlock)view.FindName("ViewportLoadingStage");
+            var countText = (TextBlock)view.FindName("ViewportLoadingCount");
+            Assert.Equal(Visibility.Visible, overlay.Visibility);
+            Assert.True(animation.IsActive);
+            Assert.False(view.Viewport.IsEnabled);
+            Assert.True(bar.IsIndeterminate);
+            Assert.Equal(Visibility.Collapsed, countText.Visibility);
             Assert.True(view.ActivityProgress.IsActive);
             Assert.Equal("Reading scene", view.ActivityProgress.Stage);
             progress!.Report(new("Metadata", 3, 12, 0));
@@ -98,14 +164,68 @@ public sealed class SceneProgressTests
                 PumpUntil(() => view.ActivityProgress.Stage == stage && view.ActivityProgress.Completed == update.Completed);
                 Assert.True(view.ActivityProgress.IsActive);
                 Assert.Equal(update.Total, view.ActivityProgress.Total);
+                Assert.Equal(stage, stageText.Text);
+                Assert.False(bar.IsIndeterminate);
+                Assert.Equal((double)update.Total, bar.Maximum);
+                Assert.Equal((double)update.Completed, bar.Value);
+                Assert.Equal($"{update.Completed:N0} / {update.Total:N0}", countText.Text);
+                Assert.Equal(Visibility.Visible, countText.Visibility);
             }
             Assert.Equal("Uploading", view.ActivityProgress.Stage);
             Pump(view.SuspendAsync());
             Assert.True(loading.IsCanceled);
             Assert.False(view.ActivityProgress.IsActive);
             Assert.False(view.IsLoading);
+            Assert.Equal(Visibility.Collapsed, overlay.Visibility);
+            Assert.False(animation.IsActive);
+            Assert.True(view.Viewport.IsEnabled);
         }
         finally { Pump(view.DisposeAsync().AsTask()); }
+    });
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SceneOverlayTracksRegionDiscoveryAndClearsOnCompletionOrFailure(bool fail) => Run(() =>
+    {
+        IProgress<RenderLoadProgress>? progress = null;
+        var pending = new TaskCompletionSource<SceneRegionDiscovery>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var view = new SceneView
+        {
+            RegionProvider = (_, updates, _) => { progress = updates; return pending.Task; }
+        };
+        var session = new DiscoverySession(1, 1);
+        try
+        {
+            Pump(view.LoadAsync(session));
+            var loading = view.LoadSceneAsync(session.LoadedSection.Result.Identity);
+            PumpUntil(() => progress is not null);
+            var overlay = (Grid)view.FindName("ViewportLoadingOverlay");
+            var animation = (ProcessingAnimation)view.FindName("ViewportProcessing");
+            var bar = (ProgressBar)view.FindName("ViewportLoadingProgress");
+            Assert.Equal(Visibility.Visible, overlay.Visibility);
+            Assert.True(animation.IsActive);
+            Assert.True(bar.IsIndeterminate);
+            Assert.Equal("Finding regions", ((TextBlock)view.FindName("ViewportLoadingStage")).Text);
+            progress!.Report(new("Metadata", 2, 5, 0));
+            PumpUntil(() => bar.Value == 2);
+            Assert.False(bar.IsIndeterminate);
+            Assert.Equal(5d, bar.Maximum);
+            if (fail)
+            {
+                pending.SetException(new InvalidOperationException("Generated discovery failure"));
+                Pump(Assert.ThrowsAsync<InvalidOperationException>(() => loading));
+            }
+            else
+            {
+                pending.SetResult(new([], []));
+                Pump(loading);
+            }
+            Assert.Equal(Visibility.Collapsed, overlay.Visibility);
+            Assert.False(animation.IsActive);
+            Assert.True(view.Viewport.IsEnabled);
+        }
+        finally { pending.TrySetResult(new([], [])); Pump(view.DisposeAsync().AsTask()); }
     });
 
     [Theory]
@@ -149,13 +269,21 @@ public sealed class SceneProgressTests
     {
         private readonly int count, batchSize;
         private int visited;
+        private int gatedQueryCalls;
         private bool running;
         private string? message;
         public DiscoverySession(int count, int batchSize) { this.count = count; this.batchSize = batchSize; LoadedSection = Section(Revision); }
         public bool Gated { get; set; }
+        public bool QueryGated { get; set; }
+        public bool IgnoreQueryCancellation { get; set; }
         public bool ExposeTotal { get; set; } = true;
         public bool Cancelled { get; private set; }
+        public bool QueryCancelled { get; private set; }
         public int DiscoveryCalls { get; private set; }
+        public TaskCompletionSource QueryStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource FirstQueryRelease { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource SecondQueryRelease { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int GatedQueryCalls => Volatile.Read(ref gatedQueryCalls);
         public SemaphoreSlim Permits { get; } = new(0);
         public SceneLoadedSection LoadedSection { get; }
         public ArchiveSnapshot Snapshot => null!;
@@ -174,12 +302,31 @@ public sealed class SceneProgressTests
             catch (OperationCanceledException) { Cancelled = true; message = "Cancelled"; throw; }
             finally { running = false; Updated?.Invoke(this, EventArgs.Empty); }
         }
-        public Task<SceneCatalogPage> QueryAsync(string? search = null, long offset = 0, int limit = 100, CancellationToken token = default)
+        public async Task<SceneCatalogPage> QueryAsync(string? search = null, long offset = 0, int limit = 100, CancellationToken token = default)
         {
+            if (QueryGated)
+            {
+                QueryStarted.TrySetResult();
+                try
+                {
+                    if (IgnoreQueryCancellation)
+                    {
+                        var gate = Interlocked.Increment(ref gatedQueryCalls) switch
+                        {
+                            1 => FirstQueryRelease,
+                            2 => SecondQueryRelease,
+                            _ => throw new InvalidOperationException("The generated query gate supports two concurrent calls.")
+                        };
+                        await gate.Task;
+                    }
+                    else await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                }
+                catch (OperationCanceledException) { QueryCancelled = true; throw; }
+            }
             token.ThrowIfCancellationRequested();
             var rows = Enumerable.Range(0, visited).Select(index => new AssetDescriptor(new(Revision.IndexContentId, index, "scene"), Revision,
                 "scene", $"Scene {index}", null, AssetAvailability.Available, AssetCompleteness.Complete, AssetCapabilities.Json, [], [])).ToArray();
-            return Task.FromResult(new SceneCatalogPage(rows.Skip((int)offset).Take(limit).ToArray(), rows.Length, offset));
+            return new SceneCatalogPage(rows.Skip((int)offset).Take(limit).ToArray(), rows.Length, offset);
         }
         public Task<SceneLoadedSection> LoadAsync(ResourceIdentity identity, CancellationToken token = default) => Task.FromResult(LoadedSection);
         public Task RevalidateAsync(SceneLoadedSection section, CancellationToken token = default) => Task.CompletedTask;

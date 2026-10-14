@@ -11,6 +11,15 @@
     <Button Content="Cancel" Click="Cancel_Click"/>
     <Button Content="Export metadata" Click="ExportMetadata_Click"/>
    </WrapPanel>
+   <WrapPanel Margin="0,4,0,0">
+    <Button x:Name="ExportSelectionButton" Content="Export selection" Click="ExportSelection_Click" IsEnabled="False"/>
+    <Button Content="Export loaded scene" Click="ExportLoadedScene_Click"/>
+    <Button Content="Export all regions" Click="ExportAllRegions_Click"/>
+    <ComboBox x:Name="ExportPlacement" SelectedIndex="0" Margin="6,0" MinWidth="155"><ComboBoxItem Content="Keep scene placement"/><ComboBoxItem Content="Center at origin"/></ComboBox>
+    <CheckBox x:Name="MergeExport" Content="Merge selected meshes" VerticalAlignment="Center" Margin="6,0"/>
+    <CheckBox x:Name="IncludeHiddenExport" Content="Include hidden" VerticalAlignment="Center" Margin="6,0"/>
+    <TextBlock x:Name="SelectionSummary" VerticalAlignment="Center" Margin="6,0"/>
+   </WrapPanel>
    <Expander Header="Region" Margin="0,5,0,0">
     <WrapPanel Margin="0,5,0,3">
      <ComboBox x:Name="BranchChoice" DisplayMemberPath="Label" Width="200" Margin="0,0,8,0" SelectionChanged="BranchChoice_SelectionChanged" ToolTip="Scene branch"/>
@@ -36,7 +45,7 @@
   </StackPanel>
   <TextBlock x:Name="Status" DockPanel.Dock="Bottom" TextWrapping="Wrap" Margin="0,6,0,0"/>
   <Grid>
-   <Grid.ColumnDefinitions><ColumnDefinition Width="220" MinWidth="140"/><ColumnDefinition Width="6"/><ColumnDefinition Width="*" MinWidth="180"/><ColumnDefinition Width="6"/><ColumnDefinition Width="280" MinWidth="180"/></Grid.ColumnDefinitions>
+   <Grid.ColumnDefinitions><ColumnDefinition Width="220" MinWidth="140"/><ColumnDefinition Width="8"/><ColumnDefinition Width="*" MinWidth="180"/><ColumnDefinition Width="8"/><ColumnDefinition Width="280" MinWidth="180"/></Grid.ColumnDefinitions>
    <TabControl x:Name="SceneTabs">
     <TabItem Header="Scenes"><DockPanel>
      <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,6,0,0"><TextBlock x:Name="Page" VerticalAlignment="Center"/><Button x:Name="Previous" Content="Previous" Click="Previous_Click"/><Button x:Name="Next" Content="Next" Click="Next_Click"/></StackPanel>
@@ -45,16 +54,54 @@
     <TabItem Header="Structure"><TreeView x:Name="Hierarchy" SelectedItemChanged="Hierarchy_SelectionChanged" ScrollViewer.HorizontalScrollBarVisibility="Auto"><TreeView.ItemTemplate><HierarchicalDataTemplate ItemsSource="{Binding Children}"><TextBlock Text="{Binding Label}" ToolTip="{Binding Label}"/></HierarchicalDataTemplate></TreeView.ItemTemplate></TreeView></TabItem>
     <TabItem x:Name="RenderedTab" Header="Scene"><TreeView x:Name="RenderHierarchy" SelectedItemChanged="RenderHierarchy_SelectionChanged" ScrollViewer.HorizontalScrollBarVisibility="Auto" VirtualizingPanel.IsVirtualizing="False"><TreeView.ItemContainerStyle><Style TargetType="TreeViewItem"><Setter Property="IsSelected" Value="{Binding IsSelected, Mode=TwoWay}"/><Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}"/></Style></TreeView.ItemContainerStyle><TreeView.ItemTemplate><HierarchicalDataTemplate ItemsSource="{Binding Children}"><StackPanel Orientation="Horizontal"><CheckBox IsChecked="{Binding IsVisible, Mode=TwoWay}" VerticalAlignment="Center" Margin="0,0,5,0"/><TextBlock Text="{Binding Label}" ToolTip="{Binding Label}"/></StackPanel></HierarchicalDataTemplate></TreeView.ItemTemplate></TreeView></TabItem>
    </TabControl>
-   <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch"/>
-   <local:AssetViewport x:Name="SceneViewport" Grid.Column="2"/>
-   <GridSplitter Grid.Column="3" Width="5" HorizontalAlignment="Stretch"/>
+   <GridSplitter Grid.Column="1" Width="8" HorizontalAlignment="Stretch" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" VerticalAlignment="Stretch"/>
+   <Grid Grid.Column="2">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+    <StackPanel x:Name="LargeLoadDecisionPanel" Visibility="Collapsed" Margin="8" Grid.Row="0">
+     <TextBlock x:Name="LargeLoadMessage" TextWrapping="Wrap"/>
+     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+      <Button Content="Continue loading" Click="ContinueLargeLoad_Click"/>
+      <Button Content="Cancel" Click="DeclineLargeLoad_Click"/>
+     </StackPanel>
+    </StackPanel>
+    <local:AssetViewport x:Name="SceneViewport" Grid.Row="1"/>
+    <Grid x:Name="ViewportLoadingOverlay" Grid.Row="1" Background="#B3000000" Visibility="Collapsed">
+     <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*" MaxWidth="320"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+     <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="12">
+      <local:ProcessingAnimation x:Name="ViewportProcessing" Width="128" Height="128" HorizontalAlignment="Center"/>
+      <ProgressBar x:Name="ViewportLoadingProgress" Height="8" Minimum="0" Maximum="1" IsIndeterminate="True" Margin="0,20,0,12"/>
+      <TextBlock x:Name="ViewportLoadingStage" Foreground="#DFE6EF" TextAlignment="Center" TextWrapping="Wrap"/>
+      <TextBlock x:Name="ViewportLoadingCount" Foreground="#DFE6EF" TextAlignment="Center" Margin="0,6,0,0" Visibility="Collapsed"/>
+     </StackPanel>
+    </Grid>
+   </Grid>
+   <GridSplitter Grid.Column="3" Width="8" HorizontalAlignment="Stretch" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" VerticalAlignment="Stretch"/>
    <DockPanel Grid.Column="4" Margin="8,0,0,0">
     <StackPanel DockPanel.Dock="Top"><TextBlock x:Name="SelectedName" Text="Select a node" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap"/><TextBlock x:Name="Footer" Margin="0,6,0,8" TextWrapping="Wrap"/></StackPanel>
     <TabControl>
      <TabItem Header="Selection"><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel>
+      <StackPanel x:Name="LightingPanel" Visibility="Collapsed" Margin="0,0,0,10">
+       <TextBlock Text="Lighting" FontWeight="SemiBold"/>
+       <ComboBox x:Name="LightingChoice" DisplayMemberPath="Label" SelectionChanged="LightingChoice_SelectionChanged" Margin="0,4,0,8"/>
+       <StackPanel x:Name="LightingValues" Visibility="Collapsed">
+        <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="110"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+         <Grid.RowDefinitions><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+         <TextBlock Text="Enabled"/><TextBlock x:Name="LightEnabled" Grid.Column="1"/>
+         <TextBlock Text="Intensity" Grid.Row="1"/><TextBlock x:Name="LightIntensity" Grid.Row="1" Grid.Column="1"/>
+         <TextBlock Text="Attenuation" Grid.Row="2"/><TextBlock x:Name="LightAttenuation" Grid.Row="2" Grid.Column="1"/>
+         <TextBlock Text="Specular textures" Grid.Row="3"/><TextBlock x:Name="LightSpecular" Grid.Row="3" Grid.Column="1"/>
+        </Grid>
+        <Expander Header="Bounds" Margin="0,6,0,0"><StackPanel Margin="0,4,0,0">
+         <TextBlock Text="Extent bounds" FontWeight="SemiBold"/>
+         <TextBlock x:Name="LightExtentBounds" FontFamily="Consolas" TextWrapping="Wrap" Margin="0,3,0,6"/>
+         <TextBlock Text="Local box bounds" FontWeight="SemiBold"/>
+         <TextBlock x:Name="LightLocalBoxBounds" FontFamily="Consolas" TextWrapping="Wrap" Margin="0,3,0,0"/>
+        </StackPanel></Expander>
+       </StackPanel>
+      </StackPanel>
       <TextBlock x:Name="RenderSummary" TextWrapping="Wrap" Margin="0,0,0,8"/>
-      <TextBlock Text="Textures" FontWeight="SemiBold"/><ListBox x:Name="MappedTextures" DisplayMemberPath="Label" MouseDoubleClick="MappedTextures_DoubleClick" MaxHeight="180" Margin="0,4,0,8"/>
-      <StackPanel Orientation="Horizontal"><TextBlock Text="Related textures" FontWeight="SemiBold" VerticalAlignment="Center"/><Button x:Name="QueryTextures" Content="Query" Click="QueryTextures_Click"/></StackPanel>
+      <StackPanel x:Name="MappedTexturesPanel" Visibility="Collapsed"><TextBlock Text="Textures" FontWeight="SemiBold"/><ListBox x:Name="MappedTextures" DisplayMemberPath="Label" MouseDoubleClick="MappedTextures_DoubleClick" MaxHeight="180" Margin="0,4,0,8"><ListBox.ItemContainerStyle><Style TargetType="ListBoxItem"><Setter Property="ToolTip" Value="{Binding Details}"/></Style></ListBox.ItemContainerStyle></ListBox></StackPanel>
+      <StackPanel Orientation="Horizontal"><TextBlock x:Name="TextureResultsHeading" Text="Related textures" FontWeight="SemiBold" VerticalAlignment="Center"/><Button x:Name="QueryTextures" Content="Query" Click="QueryTextures_Click"/></StackPanel>
       <ListBox x:Name="TextureResults" DisplayMemberPath="Label" MaxHeight="150" MouseDoubleClick="TextureResults_DoubleClick" Margin="0,0,0,8"/>
       <TextBlock Text="References" FontWeight="SemiBold"/><ListBox x:Name="References" DisplayMemberPath="Label" MaxHeight="160" SelectionChanged="References_SelectionChanged" MouseDoubleClick="References_DoubleClick" Margin="0,3,0,8"/>
       <Button x:Name="OpenReference" Content="Open reference" HorizontalAlignment="Left" Click="OpenReference_Click" IsEnabled="False"/>
@@ -64,6 +111,7 @@
       <TextBlock Text="Local matrix" FontWeight="SemiBold"/><TextBox x:Name="LocalMatrix" IsReadOnly="True" FontFamily="Consolas" TextWrapping="Wrap" Margin="0,3,0,8"/>
       <TextBlock Text="World matrix" FontWeight="SemiBold"/><TextBox x:Name="WorldMatrix" IsReadOnly="True" FontFamily="Consolas" TextWrapping="Wrap" Margin="0,3,0,8"/>
       <TextBlock Text="Entities" FontWeight="SemiBold"/><ListBox x:Name="Entities" DisplayMemberPath="Label" MaxHeight="130" Margin="0,3,0,8"/>
+      <TextBox x:Name="LightingDetails" Visibility="Collapsed" IsReadOnly="True" FontFamily="Consolas" TextWrapping="Wrap" BorderThickness="0" Margin="0,0,0,8"/>
       <TextBox x:Name="Advanced" IsReadOnly="True" FontFamily="Consolas" TextWrapping="Wrap" BorderThickness="0"/>
      </StackPanel></ScrollViewer></TabItem>
     </TabControl>

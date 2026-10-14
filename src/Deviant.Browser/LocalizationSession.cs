@@ -9,13 +9,12 @@ using Deviant.Formats.Localization.Model;
 namespace Deviant.Browser;
 
 /// <summary>Indexes a single immutable archive's localization rows lazily when the Strings view is opened.</summary>
-public sealed class LocalizationSession : IAsyncDisposable
+public sealed partial class LocalizationSession : IAsyncDisposable
 {
-    private const string ReadyHeadKey = "localization.ready";
     private const int ResourceBatchSize = 32;
-    private const int AssetBatchSize = 512;
-    private static readonly string Version = LocalizationSchema.CacheVersion;
-    private static readonly string AssetIndexVersion = LocalizationSchema.AssetIndexVersion;
+    private const int AssetBatchSize = FeatureStore.LocalizationGenerationBatchLimit;
+    private static readonly string Version = LocalizationCacheContract.RecordStoreVersion;
+    private static readonly string AssetIndexVersion = LocalizationCacheContract.SearchProjectionVersion;
 
     private readonly ArchiveSnapshot snapshot;
     private readonly FeatureStore featureStore;
@@ -30,14 +29,19 @@ public sealed class LocalizationSession : IAsyncDisposable
     private readonly Dictionary<string, long> statusCounts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> versionCounts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> diagnosticCounts = new(StringComparer.Ordinal);
-    private readonly Dictionary<long,string> inputDigests=[];
+    private readonly Dictionary<long,LocalizationInputDigest> inputDigests=[];
+    private StagedLocalizationGeneration? stagedGeneration;
+    private PublishedLocalizationGeneration<LocalizationGenerationHead>? publishedGeneration;
     private Task? disposeTask;
+    private TaskCompletionSource? exportsDrained;
+    private int activeExports;
     private int disposed;
     private long recordCount;
     private long completedResources;
     private long updateGeneration;
     private string? metadataContentId;
     private bool complete;
+    private bool unavailable;
     private string phase = "Ready";
 
     private LocalizationSession(ArchiveSnapshot snapshot, FeatureStore featureStore, LocalizationSnapshotReader reader,
@@ -78,49 +82,58 @@ public sealed class LocalizationSession : IAsyncDisposable
         var resourceRows = snapshot.Records.Where(row => row.Type == 1016).OrderBy(row => row.Ordinal).ToArray();
         var featureStore = await Task.Run(() => FeatureStore.Open(snapshot, cacheLocation), cancellationToken).ConfigureAwait(false);
         var session = new LocalizationSession(snapshot, featureStore, new LocalizationSnapshotReader(sourceRevisionProvider), resourceRows,sourceRevisionProvider);
+        session.enrichmentProgress = progress;
         try
         {
-            var head = await Task.Run(() => featureStore.Load<LocalizationCacheHead>(ReadyHeadKey, AssetIndexVersion, cancellationToken), cancellationToken).ConfigureAwait(false);
-            if (head is not null && head.IndexContentId == snapshot.IndexContentId &&
-                head.PhysicalSourceStamp == snapshot.PhysicalSourceStamp && head.ResourceCount == resourceRows.Length)
+            var accepted = await Task.Run(() => featureStore.OpenLocalizationGeneration<LocalizationGenerationHead>(Version,
+                AssetIndexVersion, HeadIdentity, head => AcceptSourceHead(head, snapshot, resourceRows), cancellationToken), cancellationToken).ConfigureAwait(false);
+            if (accepted is not null)
             {
-                LocalizationPayloadVerificationLease? lease=null;
+                LocalizationPayloadVerificationLease? verification = null;
                 try
                 {
-                var reusable=MetadataCacheSourcePolicy.CanReuseStampHead(snapshot,resourceRows);
-                if(!reusable&&head.InputDigests is not null&&head.DigestVersion=="localization-input-sha256-v1")
-                {
-                    var required=resourceRows.Where(row=>row.Validity==ResourceValidity.Valid&&row.StoredSize is >0 and <=LocalizationSnapshotReader.MaximumResourceBytes&&snapshot.Volumes.Any(volume=>volume.Package==row.Package&&volume.Stamp.Exists&&volume.Stamp.Error is null)).ToArray();
-                    lease=await new LocalizationPayloadVerifier().VerifyAsync(snapshot,head.InputDigests,required,sourceRevisionProvider,cancellationToken).ConfigureAwait(false);
-                    reusable=lease.DigestsMatch;
-                }
-                var count = await Task.Run(() => featureStore.Count(new AssetQuery(Family: LocalizationSchema.AssetFamily), cancellationToken), cancellationToken).ConfigureAwait(false);
-                if (reusable&&count == head.RecordCount)
-                {
-                    lease?.EnsureUnchanged();
-                    lock (session.stateGate)
+                    var head = accepted.Head;
+                    var reusable = snapshot.IndexStamp.Reliable && MetadataCacheSourcePolicy.CanReuseStampHead(snapshot, resourceRows) &&
+                        SourceIdentity.SameStamp(head.IndexStamp, snapshot.IndexStamp) && MetadataCacheSourcePolicy.SameVolumes(head.SourceVolumes, snapshot.Volumes);
+                    if (!reusable && head.InputDigestVersion == LocalizationCacheContract.InputDigestVersion)
                     {
-                        session.complete = true;
-                        session.phase = "Localization ready";
-                        session.recordCount = head.RecordCount;
-                        session.completedResources = head.ResourceCount;
-                        foreach (var language in head.Languages) session.languages.Add(language);
-                        CopyCounters(head.KindCounts, session.kindCounts); CopyCounters(head.StatusCounts, session.statusCounts);
-                        CopyCounters(head.VersionCounts, session.versionCounts); CopyCounters(head.DiagnosticCounts, session.diagnosticCounts);
-                        session.Sources = BuildSourceChoices(snapshot.IndexContentId, resourceRows, head.SourceCounts);
-                        if(head.InputDigests is not null)foreach(var pair in head.InputDigests)session.inputDigests[pair.Key]=pair.Value;
-                        session.metadataContentId=head.MetadataContentId;
+                        var expected = head.InputDigests.Where(input => input.Status == LocalizationInputStatus.Read)
+                            .ToDictionary(input => input.ResourceOrdinal, input => input.Sha256!);
+                        var required = resourceRows.Where(row => row.Validity == ResourceValidity.Valid &&
+                            row.StoredSize is > 0 and <= LocalizationSnapshotReader.MaximumResourceBytes &&
+                            snapshot.Volumes.Any(volume => volume.Package == row.Package && volume.Stamp.Exists && volume.Stamp.Error is null)).ToArray();
+                        verification = await new LocalizationPayloadVerifier().VerifyAsync(snapshot, expected, required,
+                            sourceRevisionProvider, cancellationToken).ConfigureAwait(false);
+                        reusable = verification.DigestsMatch;
                     }
-                    session.Publish(progress, "Loaded cached localization", null);
-                    return session;
+                    if (reusable && HeadInputIdentityMatches(head, resourceRows))
+                    {
+                        verification?.EnsureUnchanged();
+                        session.publishedGeneration = accepted;
+                        session.ApplyHead(head, resourceRows);
+                        if (accepted.SearchProjectionMatches)
+                        {
+                            lock (session.stateGate) { session.complete = true; session.phase = "Localization ready"; }
+                            session.Publish(progress, "Loaded cached localization", null);
+                            return session;
+                        }
+                        session.stagedGeneration = await Task.Run(() => featureStore.BeginLocalizationGeneration(
+                            Version, AssetIndexVersion, cancellationToken), cancellationToken).ConfigureAwait(false);
+                        if (session.stagedGeneration.BasePublishedGeneration != accepted.Generation)
+                            throw new ArchiveException("LocalizationSuperseded", "Wait for localization indexing to finish.");
+                        lock (session.stateGate) session.phase = "Updating localization search";
+                        session.StartOwnedEnrichment(token => session.RebuildSearchProjectionAsync(head, accepted, progress, token));
+                        session.Publish(progress, "Updating localization search", null);
+                        return session;
+                    }
+                    accepted.Dispose();
+                    session.publishedGeneration = null;
                 }
-                }
-                finally{if(lease is not null)await lease.DisposeAsync().ConfigureAwait(false);}
+                finally { if (verification is not null) await verification.DisposeAsync().ConfigureAwait(false); }
             }
-            await Task.Run(() => featureStore.SaveItems<LocalizationRecord>(LocalizationSchema.ItemCollection, Version,
-                Array.Empty<LocalizationRecord>(), cancellationToken), cancellationToken).ConfigureAwait(false);
-            await Task.Run(() => featureStore.ReplaceAssets(LocalizationSchema.AssetFamily, [], cancellationToken), cancellationToken).ConfigureAwait(false);
-            session.EnrichmentTask = session.EnrichAsync(progress, session.lifetime.Token);
+            session.stagedGeneration = await Task.Run(() => featureStore.BeginLocalizationGeneration(
+                Version, AssetIndexVersion, cancellationToken), cancellationToken).ConfigureAwait(false);
+            session.StartOwnedEnrichment(token => session.EnrichAsync(progress, token));
             return session;
         }
         catch
@@ -128,6 +141,147 @@ public sealed class LocalizationSession : IAsyncDisposable
             await session.DisposeAsync().ConfigureAwait(false);
             throw;
         }
+    }
+
+    private static LocalizationGenerationIdentity HeadIdentity(LocalizationGenerationHead head) => new(
+        head.InputSnapshotId, head.ParsedResultId, head.RecordStoreVersion,
+        head.SearchProjectionVersion, head.JsonPolicyVersion, head.RecordCount);
+
+    private static bool AcceptSourceHead(LocalizationGenerationHead head, ArchiveSnapshot snapshot,
+        IReadOnlyList<ResourceRecord> resources)
+    {
+        if (head.IndexStamp is null || head.SourceVolumes is null || head.SourceVolumes.Any(volume => volume is null || volume.Stamp is null) ||
+            head.InputDigests is null || head.InputDigests.Any(input => input is null) || head.SourceCounts is null ||
+            head.KindCounts is null || head.StatusCounts is null || head.VersionCounts is null ||
+            head.DiagnosticCounts is null || head.Languages is null ||
+            head.IndexContentId != snapshot.IndexContentId || head.PhysicalSourceStamp != snapshot.PhysicalSourceStamp ||
+            head.ResourceCount != resources.Count || !SourceIdentity.SameStamp(head.IndexStamp, snapshot.IndexStamp) ||
+            !MetadataCacheSourcePolicy.SameVolumes(head.SourceVolumes, snapshot.Volumes)) return false;
+        return HeadInputIdentityMatches(head, resources);
+    }
+
+    private static bool HeadInputIdentityMatches(LocalizationGenerationHead head, IReadOnlyList<ResourceRecord> resources)
+    {
+        if (head.InputDigests is null || head.InputDigests.Any(input => input is null) ||
+            head.RecordStoreVersion != Version || head.JsonPolicyVersion != LocalizationCacheContract.JsonPolicyVersion ||
+            head.InputDigestVersion != LocalizationCacheContract.InputDigestVersion || head.InputDigests.Count != resources.Count ||
+            head.InputDigests.Select(input => input.ResourceOrdinal).Order().SequenceEqual(resources.Select(row => row.Ordinal).Order()) is false)
+            return false;
+        try
+        {
+            var inputId = LocalizationCacheContract.InputSnapshotId(head.IndexContentId, head.InputDigests);
+            return inputId == head.InputSnapshotId && LocalizationCacheContract.ParsedResultId(inputId) == head.ParsedResultId;
+        }
+        catch (ArgumentException) { return false; }
+    }
+
+    private void ApplyHead(LocalizationGenerationHead head, IReadOnlyList<ResourceRecord> resources)
+    {
+        lock (stateGate)
+        {
+            recordCount = head.RecordCount;
+            completedResources = head.ResourceCount;
+            foreach (var language in head.Languages) languages.Add(language);
+            CopyCounters(head.KindCounts, kindCounts); CopyCounters(head.StatusCounts, statusCounts);
+            CopyCounters(head.VersionCounts, versionCounts); CopyCounters(head.DiagnosticCounts, diagnosticCounts);
+            Sources = BuildSourceChoices(snapshot.IndexContentId, resources, head.SourceCounts);
+            foreach (var input in head.InputDigests) inputDigests[input.ResourceOrdinal] = input;
+            metadataContentId = head.ParsedResultId;
+        }
+    }
+
+    private static LocalizationInputDigest BuildInputDigest(ResourceRecord resource, string? sha256)
+    {
+        var status = sha256 is not null ? LocalizationInputStatus.Read :
+            resource.Validity != ResourceValidity.Valid ? LocalizationInputStatus.InvalidResource :
+            resource.StoredSize <= 0 ? LocalizationInputStatus.Empty :
+            resource.StoredSize > LocalizationSnapshotReader.MaximumResourceBytes ? LocalizationInputStatus.SizeLimit :
+            LocalizationInputStatus.SourceUnavailable;
+        return new(resource.Ordinal, status, sha256);
+    }
+
+    private async Task RebuildSearchProjectionAsync(LocalizationGenerationHead priorHead,
+        PublishedLocalizationGeneration<LocalizationGenerationHead> priorGeneration,
+        IProgress<LocalizationReadProgress>? progress, CancellationToken token)
+    {
+        try
+        {
+            SetProgress("Updating localization search");
+            long cursor = -1;
+            var visited = 0L;
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                var page = await Task.Run(() => featureStore.LoadLocalizationRecordPage<LocalizationGenerationHead, LocalizationRecord>(
+                    priorGeneration, cursor, AssetBatchSize, token), token).ConfigureAwait(false);
+                if (page.Items.Count == 0) break;
+                var batch = new LocalizationGenerationRow<LocalizationRecord>[page.Items.Count];
+                for (var index = 0; index < page.Items.Count; index++)
+                {
+                    var item = page.Items[index];
+                    batch[index] = new(item.IdentityKey, item.Record, Describe(item.Record));
+                }
+                await AppendGenerationBatchAsync(batch, token).ConfigureAwait(false);
+                visited += page.Items.Count;
+                cursor = page.NextSequence;
+                progress?.Report(new("Updating localization search", visited, RecordCount, RecordCount));
+                Publish(progress, "Updating localization search", null);
+                if (!page.HasMore) break;
+            }
+            var updatedHead = priorHead with { SearchProjectionVersion = AssetIndexVersion };
+            await PublishGenerationAsync(updatedHead, token).ConfigureAwait(false);
+            Publish(progress, "Localization ready", null);
+        }
+        catch (Exception error)
+        {
+            if (IsProducerCancellation(error, token))
+            {
+                SetProgress("Cancelled");
+            }
+            else
+            {
+                lock (stateGate) unavailable = true;
+                SetProgress("Localization search update failed");
+                await DiscardStagedGenerationAsync().ConfigureAwait(false);
+            }
+            Publish(progress, Status, null);
+            throw;
+        }
+    }
+
+    private async Task AppendGenerationBatchAsync(IReadOnlyList<LocalizationGenerationRow<LocalizationRecord>> rows,
+        CancellationToken token)
+    {
+        if (rows.Count == 0) return;
+        await featureGate.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            var writer = stagedGeneration ?? throw new InvalidOperationException("The localization generation is not active.");
+            await Task.Run(() => featureStore.AppendLocalizationGeneration(writer, rows, token), token).ConfigureAwait(false);
+        }
+        finally { featureGate.Release(); }
+    }
+
+    private async Task PublishGenerationAsync(LocalizationGenerationHead head, CancellationToken token)
+    {
+        await featureGate.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            var writer = stagedGeneration ?? throw new InvalidOperationException("The localization generation is not active.");
+            var accepted = await Task.Run(() => featureStore.PublishLocalizationGeneration(writer, head, HeadIdentity, token), token).ConfigureAwait(false);
+            stagedGeneration = null;
+            var previous = publishedGeneration;
+            publishedGeneration = accepted;
+            previous?.Dispose();
+            lock (stateGate)
+            {
+                Sources = BuildSourceChoices(snapshot.IndexContentId, Resources, head.SourceCounts);
+                metadataContentId = head.ParsedResultId;
+                complete = true;
+                phase = "Localization ready";
+            }
+        }
+        finally { featureGate.Release(); }
     }
 
     public async Task<LocalizationPage> QueryAsync(LocalizationQuery query, CancellationToken cancellationToken = default)
@@ -139,20 +293,22 @@ public sealed class LocalizationSession : IAsyncDisposable
         await featureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var total = await Task.Run(() => featureStore.Count(assetQuery, cancellationToken), cancellationToken).ConfigureAwait(false);
-            var keys = await Task.Run(() => featureStore.QueryIdentityKeys(assetQuery, cancellationToken), cancellationToken).ConfigureAwait(false);
-            var rows = await Task.Run(() =>
+            lock (stateGate)
+                if (unavailable) throw new ArchiveException("LocalizationUnavailable", "Localization indexing did not finish.");
+            LocalizationGenerationQueryPage<LocalizationRecord> page;
+            if (stagedGeneration is { IsActive: true } staged)
+                page = await Task.Run(() => featureStore.QueryStagedLocalizationPage<LocalizationRecord>(staged, assetQuery, cancellationToken), cancellationToken).ConfigureAwait(false);
+            else if (publishedGeneration is { IsActive: true } published && published.SearchProjectionMatches)
+                page = await Task.Run(() => featureStore.QueryLocalizationPage<LocalizationGenerationHead, LocalizationRecord>(published, assetQuery, cancellationToken), cancellationToken).ConfigureAwait(false);
+            else
             {
-                var records=new List<LocalizationRecord>(keys.Count);
-                foreach(var key in keys)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var record=featureStore.LoadItem<LocalizationRecord>(LocalizationSchema.ItemCollection,key,Version,cancellationToken);
-                    if(record is not null)records.Add(record);
-                }
-                return records;
-            },cancellationToken).ConfigureAwait(false);
-            return new(total, rows.AsReadOnly());
+                lock (stateGate)
+                    if (unavailable) throw new ArchiveException("LocalizationUnavailable", "Localization indexing did not finish.");
+                return new(0, Array.Empty<LocalizationRecord>());
+            }
+            lock (stateGate)
+                if (unavailable) throw new ArchiveException("LocalizationUnavailable", "Localization indexing did not finish.");
+            return new(page.Total, page.Records);
         }
         finally { featureGate.Release(); }
     }
@@ -168,13 +324,20 @@ public sealed class LocalizationSession : IAsyncDisposable
         await featureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            lock (stateGate)
+                if (unavailable) throw new ArchiveException("LocalizationUnavailable", "Localization indexing did not finish.");
             foreach (var key in keys)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var row = await Task.Run(() => featureStore.LoadItem<LocalizationRecord>(LocalizationSchema.ItemCollection,
-                    key, Version, cancellationToken), cancellationToken).ConfigureAwait(false);
+                var row = stagedGeneration is { IsActive: true } staged
+                    ? await Task.Run(() => featureStore.LoadStagedLocalizationRecord<LocalizationRecord>(staged, key, cancellationToken), cancellationToken).ConfigureAwait(false)
+                    : publishedGeneration is { IsActive: true } published
+                        ? await Task.Run(() => featureStore.LoadLocalizationRecord<LocalizationGenerationHead, LocalizationRecord>(published, key, cancellationToken), cancellationToken).ConfigureAwait(false)
+                        : null;
                 if (row is not null) records.Add(row);
             }
+            lock (stateGate)
+                if (unavailable) throw new ArchiveException("LocalizationUnavailable", "Localization indexing did not finish.");
         }
         finally { featureGate.Release(); }
         return records.AsReadOnly();
@@ -230,10 +393,34 @@ public sealed class LocalizationSession : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(selection);
-        ThrowIfDisposed();
-        if (!IsEnrichmentComplete)
-            throw new ArchiveException("LocalizationPending", "Localization export is available after the current source snapshot finishes indexing.");
-        return new LocalizationExportService(snapshot, featureStore,sourceRevisions).ExportAsync(selection, format, destination, progress, cancellationToken);
+        PublishedLocalizationGeneration<LocalizationGenerationHead> generation;
+        lock (stateGate)
+        {
+            ThrowIfDisposed();
+            if (!complete) throw new ArchiveException("LocalizationPending", "Wait for localization indexing to finish before exporting.");
+            generation = publishedGeneration is { IsActive: true, SearchProjectionMatches: true } current
+                ? current : throw new ArchiveException("LocalizationPending", "Wait for localization indexing to finish before exporting.");
+            if (activeExports++ == 0) exportsDrained = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        return ExportPinnedGenerationAsync(generation, selection, format, destination, progress, cancellationToken);
+    }
+
+    private async Task<LocalizationExportReport> ExportPinnedGenerationAsync(
+        PublishedLocalizationGeneration<LocalizationGenerationHead> generation, LocalizationExportSelection selection,
+        LocalizationExportFormat format, string destination, IProgress<LocalizationReadProgress>? progress, CancellationToken token)
+    {
+        try
+        {
+            return await new LocalizationExportService(snapshot, featureStore, generation, sourceRevisions)
+                .ExportAsync(selection, format, destination, progress, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (stateGate)
+            {
+                if (--activeExports == 0) exportsDrained?.TrySetResult();
+            }
+        }
     }
 
     public ValueTask DisposeAsync()
@@ -256,14 +443,19 @@ public sealed class LocalizationSession : IAsyncDisposable
             {
                 token.ThrowIfCancellationRequested();
                 var parsed = await reader.ReadResourceAsync(snapshot, resource, token).ConfigureAwait(false);
-                if(parsed.InputSha256 is not null)inputDigests[resource.Ordinal]=parsed.InputSha256;
-                rows.AddRange(parsed.Records);
+                lock (stateGate) inputDigests[resource.Ordinal] = BuildInputDigest(resource, parsed.InputSha256);
                 foreach (var record in parsed.Records)
                 {
+                    rows.Add(record);
                     descriptors.Add(Describe(record));
                     if (!string.IsNullOrWhiteSpace(record.Language))
                         lock (stateGate) languages.Add(record.Language);
                     Interlocked.Increment(ref recordCount);
+                    if (rows.Count == AssetBatchSize)
+                    {
+                        await FlushBatchAsync(rows, descriptors, token).ConfigureAwait(false);
+                        rows.Clear(); descriptors.Clear();
+                    }
                 }
                 lock (stateGate) sourceCounts[parsed.ResourceIdentity.Key] = parsed.Records.Count;
                 lock (stateGate)
@@ -278,32 +470,45 @@ public sealed class LocalizationSession : IAsyncDisposable
                 }
                 Interlocked.Increment(ref completedResources);
                 progress?.Report(new("Reading localization", completedResources, Resources.Count, RecordCount, parsed.RelativeSource));
-                if (rows.Count >= AssetBatchSize || completedResources % ResourceBatchSize == 0)
+                if (completedResources % ResourceBatchSize == 0)
                 {
-                    await FlushBatchAsync(rows, descriptors, token).ConfigureAwait(false);
-                    rows.Clear(); descriptors.Clear();
+                    if (rows.Count > 0)
+                    {
+                        await FlushBatchAsync(rows, descriptors, token).ConfigureAwait(false);
+                        rows.Clear(); descriptors.Clear();
+                    }
                     lock (stateGate) Sources = BuildSourceChoices(snapshot.IndexContentId, Resources, sourceCounts);
                     Publish(progress, "Indexed localization", parsed.RelativeSource);
                 }
             }
             if (rows.Count > 0) await FlushBatchAsync(rows, descriptors, token).ConfigureAwait(false);
-            lock (stateGate)
-            {
-                Sources = BuildSourceChoices(snapshot.IndexContentId, Resources, sourceCounts);
-                complete = true;
-                phase = "Localization ready";
-                metadataContentId=SourceIdentity.HashFields("deviant-localization-inputs-v1",new[]{snapshot.IndexContentId,Version}.Concat(inputDigests.OrderBy(pair=>pair.Key).Select(pair=>pair.Key.ToString(System.Globalization.CultureInfo.InvariantCulture)+":"+pair.Value)));
-            }
             var summary = Summary;
-            var head = new LocalizationCacheHead(snapshot.IndexContentId, snapshot.PhysicalSourceStamp,
-                Resources.Count, RecordCount, Languages.ToArray(), new Dictionary<string, long>(sourceCounts, StringComparer.Ordinal),
-                new(summary.KindCounts), new(summary.StatusCounts), new(summary.VersionCounts), new(summary.DiagnosticCounts),new(inputDigests),"localization-input-sha256-v1",metadataContentId);
-            await Task.Run(() => featureStore.Save(ReadyHeadKey, AssetIndexVersion, head, token), token).ConfigureAwait(false);
+            var inputList = Resources.Select(resource => inputDigests[resource.Ordinal]).OrderBy(input => input.ResourceOrdinal).ToArray();
+            var inputSnapshotId = LocalizationCacheContract.InputSnapshotId(snapshot.IndexContentId, inputList);
+            var parsedResultId = LocalizationCacheContract.ParsedResultId(inputSnapshotId);
+            var head = new LocalizationGenerationHead(snapshot.IndexContentId, snapshot.PhysicalSourceStamp,
+                snapshot.IndexStamp, snapshot.Volumes, inputSnapshotId, parsedResultId, Version, AssetIndexVersion,
+                LocalizationCacheContract.JsonPolicyVersion, LocalizationCacheContract.InputDigestVersion,
+                Resources.Count, RecordCount, inputList, new Dictionary<string, long>(sourceCounts, StringComparer.Ordinal),
+                new Dictionary<string, long>(summary.KindCounts), new Dictionary<string, long>(summary.StatusCounts),
+                new Dictionary<string, long>(summary.VersionCounts), new Dictionary<string, long>(summary.DiagnosticCounts),
+                Languages.ToArray());
+            await PublishGenerationAsync(head, token).ConfigureAwait(false);
             Publish(progress, "Localization ready", null);
         }
-        catch
+        catch (Exception error)
         {
-            SetProgress(token.IsCancellationRequested ? "Cancelled" : "Localization indexing failed");
+            if (IsProducerCancellation(error, token))
+            {
+                lock (stateGate) Sources = BuildSourceChoices(snapshot.IndexContentId, Resources, sourceCounts);
+                SetProgress("Cancelled");
+            }
+            else
+            {
+                lock (stateGate) unavailable = true;
+                SetProgress("Localization indexing failed");
+                await DiscardStagedGenerationAsync().ConfigureAwait(false);
+            }
             Publish(progress, Status, null);
             throw;
         }
@@ -313,14 +518,21 @@ public sealed class LocalizationSession : IAsyncDisposable
         CancellationToken token)
     {
         if (rows.Count == 0) return;
-        await featureGate.WaitAsync(token).ConfigureAwait(false);
-        try
+        if (rows.Count != descriptors.Count) throw new InvalidDataException("Localization search descriptors do not match the record batch.");
+        var offset = 0;
+        while (offset < rows.Count)
         {
-            var items = rows.Select(row => new KeyValuePair<string, LocalizationRecord>(row.Identity.Key, row)).ToArray();
-            await Task.Run(() => featureStore.UpsertItems(LocalizationSchema.ItemCollection, Version, items, token), token).ConfigureAwait(false);
-            await Task.Run(() => featureStore.UpsertAssets(descriptors, token), token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            var count = Math.Min(AssetBatchSize, rows.Count - offset);
+            var batch = new LocalizationGenerationRow<LocalizationRecord>[count];
+            for (var index = 0; index < count; index++)
+            {
+                var record = rows[offset + index];
+                batch[index] = new(record.Identity.Key, record, descriptors[offset + index]);
+            }
+            await AppendGenerationBatchAsync(batch, token).ConfigureAwait(false);
+            offset += count;
         }
-        finally { featureGate.Release(); }
     }
 
     private AssetDescriptor Describe(LocalizationRecord record)
@@ -427,20 +639,33 @@ public sealed class LocalizationSession : IAsyncDisposable
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         await lifetime.CancelAsync().ConfigureAwait(false);
-        try { await EnrichmentTask.ConfigureAwait(false); }
+        await enrichmentLifecycleGate.WaitAsync().ConfigureAwait(false);
+        Task producer;
+        Task? retry;
+        lock (stateGate) { producer = EnrichmentTask; retry = retryCoordinatorTask; }
+        enrichmentLifecycleGate.Release();
+        try { await producer.ConfigureAwait(false); }
         catch { /* Preserve disposal even if a cancelled/failed enrichment task faulted. */ }
+        if (retry is not null && !ReferenceEquals(retry, producer))
+        {
+            try { await retry.ConfigureAwait(false); }
+            catch { /* Preserve disposal while a retry request drains. */ }
+        }
+        Task pendingExports;
+        lock (stateGate) pendingExports = activeExports == 0 ? Task.CompletedTask : exportsDrained!.Task;
+        await pendingExports.ConfigureAwait(false);
         await featureGate.WaitAsync().ConfigureAwait(false);
-        try { await Task.Run(featureStore.Dispose).ConfigureAwait(false); }
+        try
+        {
+            stagedGeneration?.Dispose(); stagedGeneration = null;
+            publishedGeneration?.Dispose(); publishedGeneration = null;
+            await Task.Run(featureStore.Dispose).ConfigureAwait(false);
+        }
         finally { featureGate.Release(); lifetime.Dispose(); }
     }
 
     private static void AddCount(Dictionary<string, long> counts, string key) => counts[key] = counts.GetValueOrDefault(key) + 1;
-    private static void CopyCounters(Dictionary<string, long> source, Dictionary<string, long> destination)
+    private static void CopyCounters(IReadOnlyDictionary<string, long> source, Dictionary<string, long> destination)
     { foreach (var item in source) destination[item.Key] = item.Value; }
 
-    private sealed record LocalizationCacheHead(string IndexContentId, string PhysicalSourceStamp,
-        int ResourceCount, long RecordCount, string[] Languages, Dictionary<string, long> SourceCounts,
-        Dictionary<string, long> KindCounts, Dictionary<string, long> StatusCounts,
-        Dictionary<string, long> VersionCounts, Dictionary<string, long> DiagnosticCounts,
-        Dictionary<long,string>? InputDigests=null,string? DigestVersion=null,string? MetadataContentId=null);
 }

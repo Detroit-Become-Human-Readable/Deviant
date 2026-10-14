@@ -34,6 +34,8 @@ public partial class SceneView
     {
         largeDataApprovedSection = null;
         largeDataApprovedRevision = null;
+        lastSuccessfulSceneRenderRequest = null;
+        lastSuccessfulRenderBudget = null;
     }
 
     private void ApproveLargeData(SceneLoadedSection loaded)
@@ -106,7 +108,7 @@ public partial class SceneView
         UpdateLoadingProgress();
         try
         {
-            var progress = new Progress<RenderLoadProgress>(value =>
+            using var progress = new CoalescedDispatcherProgress<RenderLoadProgress>(Dispatcher, value =>
             {
                 if (token.IsCancellationRequested || !ReferenceEquals(section, loaded)) return;
                 regionsCompleted = value.Completed; regionsTotal = value.Total; UpdateLoadingProgress();
@@ -240,6 +242,7 @@ public partial class SceneView
     private void UpdateRegionButtons()
     {
         LoadRegionButton.IsEnabled = !scenePipelineActive && !renderLoadingActive && section is not null && BranchChoice.SelectedItem is not null && RenderProvider is not null;
-        LoadAllButton.IsEnabled = !scenePipelineActive && !renderLoadingActive && section is not null && RegionProvider is not null && RenderProvider is not null;
+        LoadAllButton.IsEnabled = !scenePipelineActive && !renderLoadingActive && section is not null &&
+            (RegionProvider is not null || RegionProviderWithLargeData is not null) && RenderProvider is not null;
     }
 }

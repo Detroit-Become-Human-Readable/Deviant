@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using Deviant.Core;
+using Deviant.Assets;
 using Microsoft.Data.Sqlite;
 
 namespace Deviant.Catalog;
@@ -9,6 +10,15 @@ namespace Deviant.Catalog;
 /// <summary>Persists parser-normalized index rows while rebuilding volume validity from each fresh snapshot.</summary>
 public static class CatalogService
 {
+    /// <summary>Creates an indexed query view over the verified archive snapshot without opening or writing a cache.</summary>
+    public static IResourceCatalog OpenInMemory(ArchiveSnapshot snapshot, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        cancellationToken.ThrowIfCancellationRequested();
+        var key = SourceIdentity.DerivedCacheKey(snapshot.IndexContentId, snapshot.PhysicalSourceStamp);
+        return new InMemoryResourceCatalog(snapshot, key, cancellationToken);
+    }
+
     public static IResourceCatalog Open(ArchiveSnapshot snapshot, string? cacheRoot = null,
         CancellationToken cancellationToken = default) => Open(snapshot, cacheRoot, null, cancellationToken);
 
@@ -26,7 +36,9 @@ public static class CatalogService
         var key = SourceIdentity.DerivedCacheKey(snapshot.IndexContentId, snapshot.PhysicalSourceStamp);
         var indexKey = SourceIdentity.IndexCacheKey(snapshot.IndexContentId);
         var fileKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(IndexLayout.ParserVersion + "\n" + indexKey))).ToLowerInvariant();
-        var dbPath = Path.Combine(cacheRoot, "catalog-" + fileKey + ".sqlite3");
+        var indexCacheRoot = Path.Combine(cacheRoot, "raw-index-v1");
+        Directory.CreateDirectory(indexCacheRoot);
+        var dbPath = Path.Combine(indexCacheRoot, "catalog-" + fileKey + ".sqlite3");
         var connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = dbPath, Mode = SqliteOpenMode.ReadWriteCreate, Pooling = false }.ToString());
         connection.Open();
         try
@@ -91,6 +103,7 @@ public static class CatalogService
         IProgress<ArchiveProgress>? progress) => ExecuteInterruptible(connection, token, () =>
     {
         using var transaction = connection.BeginTransaction();
+        using var buildTiming = AssetLoadDiagnostics.Measure("CatalogIndexBuild", snapshot.IndexContentId);
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
@@ -112,6 +125,8 @@ public static class CatalogService
         index.Value = snapshot.IndexContentId;
         progress?.Report(new("Building catalog index", 0, snapshot.Records.Count));
         var completed = 0L;
+        using (AssetLoadDiagnostics.Measure("CatalogIndexRows", snapshot.IndexContentId))
+        {
         foreach (var row in snapshot.Records)
         {
             token.ThrowIfCancellationRequested();
@@ -122,7 +137,8 @@ public static class CatalogService
             completed++;
             if ((completed & 8191) == 0) progress?.Report(new("Building catalog index", completed, snapshot.Records.Count));
         }
-        transaction.Commit();
+        }
+        using (AssetLoadDiagnostics.Measure("CatalogIndexCommit", snapshot.IndexContentId)) transaction.Commit();
         progress?.Report(new("Building catalog index", completed, snapshot.Records.Count));
         return true;
     });

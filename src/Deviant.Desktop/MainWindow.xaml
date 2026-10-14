@@ -49,7 +49,7 @@
                     <Button Content="Cancel export" Click="CancelExport_Click" IsEnabled="{Binding IsExporting}" />
                     <Button Content="View report" Click="ViewReport_Click" IsEnabled="{Binding HasReport}" />
                 </StackPanel>
-                <TextBlock Grid.Column="1" Text="This is a pre-release. It's not finished. There's going to be a lot of bugs."
+                <TextBlock Grid.Column="1" Visibility="Collapsed"
                            MaxWidth="450" Margin="10,0" FontSize="11" Opacity="0.7" TextWrapping="Wrap" TextAlignment="Center" VerticalAlignment="Center" />
                 <Grid Grid.Column="2" MaxWidth="380" HorizontalAlignment="Right" VerticalAlignment="Center">
                     <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
@@ -72,9 +72,9 @@
             </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="220" MinWidth="160" />
-                <ColumnDefinition Width="5" />
+                <ColumnDefinition Width="8"/>
                 <ColumnDefinition Width="*" MinWidth="440" />
-                <ColumnDefinition Width="5" />
+                <ColumnDefinition Width="8"/>
                 <ColumnDefinition Width="300" MinWidth="230" />
             </Grid.ColumnDefinitions>
 
@@ -90,7 +90,7 @@
                     </TreeView.Resources>
                 </TreeView>
             </GroupBox>
-            <GridSplitter Grid.Row="0" Grid.Column="1" Width="5" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+            <GridSplitter Grid.Row="0" Grid.Column="1" Width="8" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"  ResizeDirection="Columns" ResizeBehavior="PreviousAndNext"/>
 
             <GroupBox Grid.Row="0" Grid.Column="2" Header="Resources" Padding="4">
                 <DockPanel>
@@ -129,7 +129,7 @@
                     </ListView>
                 </DockPanel>
             </GroupBox>
-            <GridSplitter Grid.Row="0" Grid.Column="3" Width="5" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+            <GridSplitter Grid.Row="0" Grid.Column="3" Width="8" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"  ResizeDirection="Columns" ResizeBehavior="PreviousAndNext"/>
 
             <GroupBox Grid.Row="0" Grid.Column="4" Header="Details" Padding="12">
                 <ScrollViewer VerticalScrollBarVisibility="Auto">

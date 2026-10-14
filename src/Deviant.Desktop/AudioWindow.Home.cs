@@ -12,8 +12,9 @@ public partial class AudioWindow
 
     private void RefreshHomeState()
     {
+        RefreshWorkspaceNavigation();
         var indexing = indexOpeningActive || AudioIndexingActive;
-        var ready = session is not null && !indexing;
+        var ready = IsWorkspaceValidated && !indexing;
         HomeLogo.Visibility = indexing ? Visibility.Collapsed : Visibility.Visible;
         HomeProcessing.IsActive = indexing && currentView == "home";
         HomeTitle.Text = ready ? "Welcome, Deviant" : "Deviant";
@@ -29,14 +30,16 @@ public partial class AudioWindow
                 : progress is null ? "Reading audio" : FormatActivity(progress.Phase, progress.Completed, progress.Total);
         }
         if (!ready || session is not { } current) return;
-        HomeAudioButton.Visibility = current.Catalog.Media.Count > 0 || current.Catalog.Banks.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
         if (!ReferenceEquals(homeTypeSnapshot, current.Snapshot))
         {
             homeTypeSnapshot = current.Snapshot;
             homeResourceTypes = current.Snapshot.Records.Select(record => record.Type).ToHashSet();
         }
         var types = homeResourceTypes;
+        HomeAudioButton.Visibility = current.Catalog.Media.Count > 0 || current.Catalog.Banks.Count > 0 ||
+            types.Overlaps([65u, 1016u, 1022u, 1023u, 1031u, 1033u, 4091u]) ? Visibility.Visible : Visibility.Collapsed;
         HomeStringsButton.Visibility = types.Contains(1016) ? Visibility.Visible : Visibility.Collapsed;
+        HomeCharactersButton.Visibility = types.Contains(29) ? Visibility.Visible : Visibility.Collapsed;
         HomeTexturesButton.Visibility = types.Contains(2229) || types.Contains(2230) ? Visibility.Visible : Visibility.Collapsed;
         HomeScenesButton.Visibility = types.Contains(29) ? Visibility.Visible : Visibility.Collapsed;
         HomeAnimationButton.Visibility = types.Contains(Deviant.Formats.Animation.AnimationDataReader.ResourceType) ? Visibility.Visible : Visibility.Collapsed;
@@ -51,7 +54,7 @@ public partial class AudioWindow
 
     public async Task OpenHomeViewAsync(string view, CancellationToken token = default)
     {
-        if (session is null) return;
+        if (!RequireWorkspaceNavigation() || session is null) return;
         var navigation = BeginNavigation();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(navigation.Token, token);
         SelectExplorerView(view);
@@ -64,6 +67,7 @@ public partial class AudioWindow
                     await QueryAsync(true);
                     break;
                 case "strings": await ShowStringsAsync(linked.Token); break;
+                case "characters": await ShowCharactersCoreAsync(linked.Token, navigation); break;
                 case "textures": await ShowTexturesAsync(linked.Token); break;
                 case "scenes": await ShowScenesAsync(linked.Token); break;
                 case "animation": await ShowAnimationAsync(linked.Token); break;

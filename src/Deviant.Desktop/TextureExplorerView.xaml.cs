@@ -29,7 +29,9 @@ public sealed record TextureExplorerCard(TextureDiscoveryEntry Entry)
     public string SizeFormat => string.Join(" · ", new[]
     {
         Entry.Width is { } width && Entry.Height is { } height ? $"{width:N0} × {height:N0}" : null,
-        Entry.Format
+        Entry.Format,
+        Entry.Kind == TextureKind.LodBuffer ? "Mip buffer" : Entry.Kind == TextureKind.Lighting
+            ? Entry.IsCubeMap ? "Reflection probe" : "Lighting" : null
     }.Where(value => !string.IsNullOrWhiteSpace(value)));
     public string ContextTooltip => !string.IsNullOrWhiteSpace(Entry.ContextLabel) ? Entry.ContextLabel :
         string.Join(" / ", Entry.Owners.Where(link => link.Verified).Select(link => link.Label).Distinct(StringComparer.Ordinal));
@@ -51,11 +53,22 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     private const int PageSize = 100;
     private readonly CancellationTokenSource lifetime = new();
     private CancellationTokenSource workspace = new(), nativeWork = new();
+    private CancellationTokenSource thumbnailWork = new();
+    private long thumbnailEpoch;
+    public static readonly DependencyProperty ThumbnailsEnabledProperty = DependencyProperty.Register(
+        nameof(ThumbnailsEnabled), typeof(bool), typeof(TextureExplorerView), new PropertyMetadata(false,
+            (owner, _) => ((TextureExplorerView)owner).ThumbnailSettingChanged()));
+    public bool ThumbnailsEnabled
+    {
+        get => (bool)GetValue(ThumbnailsEnabledProperty);
+        set => SetValue(ThumbnailsEnabledProperty, value);
+    }
     private CancellationTokenSource? queryCancellation, exportCancellation, resourceSelection;
     private readonly SemaphoreSlim nativeGate = new(1, 1);
     private readonly HashSet<Task> operations = [];
     private readonly Dictionary<ResourceIdentity, BitmapSource> nativeThumbnails = [];
     private readonly Dictionary<ResourceIdentity, int> thumbnailBindings = [];
+    private readonly Dictionary<ResourceIdentity, string> thumbnailVersions = [];
     private readonly HashSet<ResourceIdentity> thumbnailPending = [], thumbnailQueued = [];
     private readonly DispatcherTimer queryTimer = new() { Interval = TimeSpan.FromMilliseconds(180) };
     private readonly DispatcherTimer updateTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
@@ -67,12 +80,18 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     private readonly NativeTextureView nativeView = new();
     private TextureDiscoveryEntry? selected;
     private NativePreviewSelection? nativePreviewSelection;
+    private TextureMetadataContext? selectedMetadataContext;
+    private bool updatingMetadataChoices;
     private long offset, total, queryVersion, publishedQueryVersion, nativeVersion, selectionVersion, resourceRequestVersion;
     private bool updating, suspended = true, cancelled, selectionSettled, selectedPending, disposed;
     private int selectedBindings, retryCount;
-    private Task previewClear = Task.CompletedTask, queryTask = Task.CompletedTask, exportTask = Task.CompletedTask;
+    private string? selectedBindingVersion;
+    public TexturePreviewState CurrentPreviewState { get; private set; }
+    public TexturePreviewFailure? PreviewFailure { get; private set; }
+    private Task previewClear = Task.CompletedTask, queryTask = Task.CompletedTask, exportTask = Task.CompletedTask, selectionTask = Task.CompletedTask;
     private ResourceIdentity? nativeAdvancedIdentity;
     private string nativeAdvanced = "";
+    private static long textureDiagnosticSequence;
 
     public TextureExplorerView()
     {
@@ -80,8 +99,14 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
         Rows.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler((_, _) => StartVisibleThumbnails()));
         Relationships.ItemsSource = new[] { "Any", "With owners", "Without owners" };
         Relationships.SelectedIndex = 0;
-        Sort.ItemsSource = new[] { "Named first", "Name", "Source order" }; Sort.SelectedIndex = 0;
-        queryTimer.Tick += (_, _) => { queryTimer.Stop(); queryTask = Track(RefreshAsync(false)); };
+        Kinds.ItemsSource = new[] { "Images", "Lighting", "All" }; Kinds.SelectedIndex = 0;
+        Sort.ItemsSource = new[] { "Named first", "Name", "Source order" }; Sort.SelectedIndex = 2;
+        queryTimer.Tick += (_, _) =>
+        {
+            queryTimer.Stop();
+            AssetLoadDiagnostics.Counters("TextureBrowser.Ui.DebounceFired", "texture-ui", new Dictionary<string, long> { ["QueryVersion"] = queryVersion });
+            queryTask = Track(RefreshAsync(false));
+        };
         updateTimer.Tick += (_, _) =>
         {
             updateTimer.Stop();
@@ -91,11 +116,11 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
                 updateTimer.Start();
                 return;
             }
-            RefreshOptions(); queryTask = Track(RefreshAsync(true));
-            if (native is { } owner && selected is { } entry && owner.KnownCatalogCount(entry.Identity) != selectedBindings)
+            queryTask = Track(RefreshOptionsAndPageAsync(true));
+            if (nativePreviewSelection is null && selectedMetadataContext is null && native is { } owner && selected is { } entry && owner.BindingVersion(entry.Identity) != selectedBindingVersion)
                 QueueSelection();
             foreach (var card in CurrentResources)
-                if (native is { } source && thumbnailBindings.TryGetValue(card.Identity, out var count) && count != source.KnownCatalogCount(card.Identity))
+                if (native is { } source && thumbnailVersions.TryGetValue(card.Identity, out var signature) && signature != source.BindingVersion(card.Identity))
                 { nativeThumbnails.Remove(card.Identity); thumbnailPending.Add(card.Identity); }
             StartVisibleThumbnails();
         };
@@ -109,6 +134,9 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     }
 
     public event EventHandler? SelectedResourceChanged;
+    public event EventHandler? PreviewStateChanged;
+    public event RoutedEventHandler? OpenDdsRequested;
+    private void OpenDds_Click(object sender, RoutedEventArgs e) => OpenDdsRequested?.Invoke(this, e);
     public event EventHandler<TextureDiscoveryLinkEventArgs>? LinkSelected;
     public Action? DiscoveryCancel { get; set; }
     public Func<TextureDiscoveryEntry, string, bool, CancellationToken, Task>? ExportOriginalAsync { get; set; }
@@ -117,7 +145,8 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     public ResourceIdentity? SelectedIdentity => selected?.Identity;
     public TextureDiscoveryEntry? SelectedEntry => selected;
     public string? SelectedLabel => selected?.Alias ?? selected?.Label;
-    public SourceRevision? LoadedRevision => discovery?.Revision;
+    public SourceRevision? LoadedRevision => discovery?.Revision ?? native?.Revision;
+    public bool HasDiscoveryCatalog => discovery is not null;
     public long SelectionVersion => selectionVersion;
     public long TotalMatches => total;
     public long PublishedQueryVersion => publishedQueryVersion;
@@ -136,7 +165,55 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
         await ClearAsync(); token.ThrowIfCancellationRequested();
         discovery = catalog; native = textures; cache = thumbnailCache; documentReader = reader;
         catalog.Updated += DiscoveryUpdated; suspended = false; cancelled = false;
-        RefreshOptions(); queryTask = Track(RefreshAsync(false, token)); await queryTask;
+        queryTask = Track(RefreshOptionsAndPageAsync(false, token)); await queryTask;
+    }
+
+    public async Task LoadNativeSelectionAsync(NativeTextureSession textures, CacheManager thumbnailCache,
+        ResourceIdentity sourceIdentity, ResourceIdentity nativeIdentity, ResourceIdentity catalogIdentity,
+        AssetMemoryBudget budget, string label, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(textures); ArgumentNullException.ThrowIfNull(thumbnailCache);
+        ArgumentNullException.ThrowIfNull(budget); token.ThrowIfCancellationRequested();
+        ObjectDisposedException.ThrowIf(disposed, this);
+        if (sourceIdentity.IndexContentId != textures.Revision.IndexContentId || nativeIdentity.IndexContentId != textures.Revision.IndexContentId ||
+            catalogIdentity.IndexContentId != textures.Revision.IndexContentId)
+            throw new ArchiveException("SourceChanged", "The linked texture belongs to another workspace.");
+        if (!ReferenceEquals(native, textures)) { await ClearAsync(); token.ThrowIfCancellationRequested(); }
+        native = textures; cache = thumbnailCache;
+        documentReader = (source, cancellation) => new NativeTextureDecoder().ReadPreview(source, 1024, cancellation).Document;
+        suspended = false; cancelled = false;
+        resourceSelection?.Cancel(); queryCancellation?.Cancel(); ++queryVersion; queryTimer.Stop(); updateTimer.Stop();
+        var row = textures.Snapshot.RequireRecord(sourceIdentity.Ordinal);
+        var entry = new TextureDiscoveryEntry(sourceIdentity, row.Id, row.Type, label, TextureNameKind.InferredDescription,
+            null, null, null, null, null, null, null, [], [], [], [], [], [], "texture", label)
+            { MetadataIdentities = [nativeIdentity], CatalogKeys = [catalogIdentity.Key] };
+        nativePreviewSelection = new(sourceIdentity, nativeIdentity, catalogIdentity, budget);
+        updating = true;
+        try { Rows.ItemsSource = new[] { new TextureExplorerCard(entry) }; Rows.SelectedItem = CurrentResources[0]; }
+        finally { updating = false; }
+        Empty.Visibility = Visibility.Collapsed; Status.Text = "Opening selected image…"; Page.Text = "Selected image";
+        Previous.IsEnabled = Next.IsEnabled = false;
+        SetSelected(entry, token); DetailTabs.SelectedIndex = 0;
+        OwnerStatus.Text = RelatedStatus.Text = "Relationships not indexed";
+        await selectionTask.WaitAsync(token);
+        if (nativePreviewSelection?.SourceIdentity == sourceIdentity && CurrentPreviewState == TexturePreviewState.Ready)
+            Status.Text = "Selected image";
+    }
+
+    public async Task AttachDiscoveryAsync(ITextureDiscoveryCatalog catalog, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(catalog); token.ThrowIfCancellationRequested();
+        if (native is not { } owner || catalog.Revision != owner.Revision || !ReferenceEquals(catalog.Snapshot, owner.Snapshot))
+            throw new ArgumentException("The texture catalog belongs to another workspace.", nameof(catalog));
+        if (disposed || suspended || cancelled) return;
+        if (!ReferenceEquals(discovery, catalog))
+        {
+            if (discovery is { } previous) previous.Updated -= DiscoveryUpdated;
+            discovery = catalog; catalog.Updated += DiscoveryUpdated;
+        }
+        if (selected is { } entry && CurrentPreviewState == TexturePreviewState.Ready)
+            _ = Track(LoadSelectionRelationshipEvidenceAsync(catalog, owner, entry.Identity, nativeVersion, nativeWork.Token));
+        queryTask = Track(RefreshOptionsAndPageAsync(true, token)); await queryTask;
     }
 
     private void DiscoveryUpdated(object? sender, EventArgs e)
@@ -148,9 +225,29 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
         });
     }
 
-    private void RefreshOptions()
+    private async Task RefreshOptionsAndPageAsync(bool preserveSelection, CancellationToken token = default)
     {
+        using var diagnostic = TextureDiagnostic("TextureBrowser.Ui.OptionsAndPage", TextureDiagnosticKey());
+        try
+        {
+            await RefreshAsync(preserveSelection, token);
+            var before = Query();
+            await RefreshOptionsAsync(token);
+            if (before != Query()) await RefreshAsync(preserveSelection, token);
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private async Task RefreshOptionsAsync(CancellationToken token = default)
+    {
+        using var diagnostic = TextureDiagnostic("TextureBrowser.Ui.Options", TextureDiagnosticKey());
         if (discovery is not { } owner) return;
+        using var own = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token, workspace.Token, nativeWork.Token);
+        var options = owner is TextureDiscoverySession production
+            ? await production.ReadFilterOptionsAsync(own.Token)
+            : await Task.Run(() => owner.FilterOptions, own.Token);
+        own.Token.ThrowIfCancellationRequested();
+        if (!ReferenceEquals(owner, discovery) || suspended || cancelled) return;
         var dimension = Dimensions.SelectedItem;
         var format = Formats.SelectedItem as string; var role = Roles.SelectedItem as string;
         var context = (Contexts.SelectedItem as TextureContextOption)?.Key;
@@ -158,18 +255,18 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
         updating = true;
         try
         {
-            Dimensions.ItemsSource = new object[] { "Any" }.Concat(owner.FilterOptions.Dimensions).ToArray();
+            Dimensions.ItemsSource = new object[] { "Any" }.Concat(options.Dimensions).ToArray();
             Dimensions.SelectedItem = Dimensions.Items.Cast<object>().FirstOrDefault(item => Equals(item, dimension)) ?? Dimensions.Items[0];
-            Formats.ItemsSource = new[] { "Any" }.Concat(owner.FilterOptions.Formats).ToArray();
+            Formats.ItemsSource = new[] { "Any" }.Concat(options.Formats).ToArray();
             Formats.SelectedItem = Formats.Items.Cast<string>().FirstOrDefault(item => item == format) ?? "Any";
-            Roles.ItemsSource = new[] { "Any" }.Concat(owner.FilterOptions.VerifiedRoles).ToArray();
+            Roles.ItemsSource = new[] { "Any" }.Concat(options.VerifiedRoles).ToArray();
             Roles.SelectedItem = Roles.Items.Cast<string>().FirstOrDefault(item => item == role) ?? "Any";
-            Contexts.ItemsSource = new[] { new TextureContextOption("", "Any") }.Concat(owner.FilterOptions.Contexts).ToArray();
+            Contexts.ItemsSource = new[] { new TextureContextOption("", "Any") }.Concat(options.Contexts).ToArray();
             Contexts.SelectedItem = Contexts.Items.Cast<TextureContextOption>().FirstOrDefault(item => item.Key == context) ?? Contexts.Items[0];
-            ContextFilter.Visibility = owner.FilterOptions.Contexts.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
-            Catalogs.ItemsSource = new[] { new TextureContextOption("", "Any") }.Concat(owner.FilterOptions.Catalogs).ToArray();
+            ContextFilter.Visibility = options.Contexts.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+            Catalogs.ItemsSource = new[] { new TextureContextOption("", "Any") }.Concat(options.Catalogs).ToArray();
             Catalogs.SelectedItem = Catalogs.Items.Cast<TextureContextOption>().FirstOrDefault(item => item.Key == catalog) ?? Catalogs.Items[0];
-            CatalogFilter.Visibility = owner.FilterOptions.Catalogs.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+            CatalogFilter.Visibility = options.Catalogs.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
         }
         finally { updating = false; }
     }
@@ -183,7 +280,9 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
             Relationships.SelectedIndex switch { 1 => true, 2 => false, _ => null },
             (Contexts.SelectedItem as TextureContextOption)?.Key is { Length: > 0 } context ? context : null,
             offset, PageSize, SortByName: Sort.SelectedIndex != 2,
-            CatalogKey: (Catalogs.SelectedItem as TextureContextOption)?.Key is { Length: > 0 } catalog ? catalog : null, NamedFirst: Sort.SelectedIndex == 0);
+            CatalogKey: (Catalogs.SelectedItem as TextureContextOption)?.Key is { Length: > 0 } catalog ? catalog : null, NamedFirst: Sort.SelectedIndex == 0,
+            Kind: Kinds.SelectedIndex switch { 0 => TextureKindFilter.Images, 1 => TextureKindFilter.Lighting, _ => TextureKindFilter.All },
+            IncludeLodBuffers: Kinds.SelectedIndex == 2);
     }
 
     public Task RefreshAsync(CancellationToken token = default) => RefreshAsync(true, token);
@@ -192,13 +291,24 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
         if (discovery is not { } owner || suspended) return;
         queryCancellation?.Cancel();
         var version = ++queryVersion; var query = Query();
+        var diagnosticKey = TextureDiagnosticKey();
+        using var diagnostic = TextureDiagnostic("TextureBrowser.Ui.Refresh", diagnosticKey);
+        AssetLoadDiagnostics.Counters("TextureBrowser.Ui.Request", diagnosticKey, new Dictionary<string, long>
+        { ["QueryVersion"] = version, ["Offset"] = query.Offset, ["Limit"] = query.Limit, ["SearchLength"] = query.Search?.Length ?? 0 });
         using var own = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token, workspace.Token);
         queryCancellation = own;
         try
         {
-            var result = await owner.QueryAsync(query, own.Token);
+            TextureDiscoveryPage result;
+            using (TextureDiagnostic("TextureBrowser.Ui.QueryAwait", diagnosticKey)) result = await owner.QueryAsync(query, own.Token);
             own.Token.ThrowIfCancellationRequested();
-            if (version != queryVersion || discovery != owner || suspended) return;
+            if (version != queryVersion || discovery != owner || suspended)
+            {
+                AssetLoadDiagnostics.Counters("TextureBrowser.Ui.PublicationSkipped", diagnosticKey, new Dictionary<string, long>
+                { ["VersionChanged"] = version != queryVersion ? 1 : 0, ["OwnerChanged"] = discovery != owner ? 1 : 0, ["Suspended"] = suspended ? 1 : 0 });
+                return;
+            }
+            using var publicationDiagnostic = TextureDiagnostic("TextureBrowser.Ui.Publish", diagnosticKey);
             if (result.Entries.Count == 0 && result.Total > 0 && offset >= result.Total)
             { offset = (result.Total - 1) / PageSize * PageSize; await RefreshAsync(preserveSelection, token); return; }
             total = result.Total; offset = result.Offset;
@@ -209,22 +319,26 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
                 Rows.ItemsSource = cards;
                 var same = cards.FirstOrDefault(card => card.Identity == previous);
                 Rows.SelectedItem = same;
-                if (same is not null) { selected = same.Entry; RenderDetails(false); }
+                if (same is not null) { if (nativePreviewSelection is null) selected = same.Entry; RenderDetails(false); }
                 else if (!preserveSelection) SetSelected(null);
             }
             finally { updating = false; }
             var visible = cards.Select(card => card.Identity).ToHashSet();
             foreach (var identity in nativeThumbnails.Keys.Where(identity => !visible.Contains(identity)).ToArray())
-            { nativeThumbnails.Remove(identity); thumbnailBindings.Remove(identity); }
+            { nativeThumbnails.Remove(identity); thumbnailBindings.Remove(identity); thumbnailVersions.Remove(identity); }
             Previous.IsEnabled = offset > 0; Next.IsEnabled = offset + cards.Length < total;
             Page.Text = total == 0 ? "0" : $"{offset + 1:N0}–{offset + cards.Length:N0} of {total:N0}";
-            Status.Text = $"{total:N0} textures";
+            Status.Text = $"{total:N0} images";
             publishedQueryVersion = version;
+            AssetLoadDiagnostics.Counters("TextureBrowser.Ui.Published", diagnosticKey, new Dictionary<string, long>
+            { ["QueryVersion"] = version, ["Rows"] = cards.Length, ["Total"] = total, ["Offset"] = offset });
             Empty.Visibility = total == 0 ? Visibility.Visible : Visibility.Collapsed;
             StartVisibleThumbnails();
         }
-        catch (OperationCanceledException) { token.ThrowIfCancellationRequested(); }
-        catch (Exception error) { if (version == queryVersion) Status.Text = error.Message; }
+        catch (OperationCanceledException)
+        { AssetLoadDiagnostics.Counters("TextureBrowser.Ui.Cancelled", diagnosticKey, new Dictionary<string, long> { ["QueryVersion"] = version }); token.ThrowIfCancellationRequested(); }
+        catch (Exception error)
+        { AssetLoadDiagnostics.Counters("TextureBrowser.Ui.Failed", diagnosticKey, new Dictionary<string, long> { ["QueryVersion"] = version }); if (version == queryVersion) Status.Text = error.Message; }
         finally { if (ReferenceEquals(queryCancellation, own)) queryCancellation = null; }
     }
 
@@ -234,11 +348,13 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     {
         if (updating || discovery is null || suspended) return;
         offset = 0; queryCancellation?.Cancel(); queryTimer.Stop(); queryTimer.Start();
+        AssetLoadDiagnostics.Counters("TextureBrowser.Ui.DebounceScheduled", "texture-ui", new Dictionary<string, long>
+        { ["QueryVersion"] = queryVersion, ["SearchLength"] = Search.Text.Length });
     }
     private void Reset_Click(object sender, RoutedEventArgs e)
     {
         updating = true;
-        try { Search.Text = ""; Dimensions.SelectedIndex = Formats.SelectedIndex = Roles.SelectedIndex = Relationships.SelectedIndex = Contexts.SelectedIndex = Catalogs.SelectedIndex = Sort.SelectedIndex = 0; }
+        try { Search.Text = ""; Dimensions.SelectedIndex = Formats.SelectedIndex = Roles.SelectedIndex = Relationships.SelectedIndex = Contexts.SelectedIndex = Catalogs.SelectedIndex = Kinds.SelectedIndex = 0; Sort.SelectedIndex = 2; }
         finally { updating = false; }
         ScheduleQuery();
     }
@@ -278,11 +394,11 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
                     updating = true;
                     try
                     {
-                        if (reset) { Search.Text = ""; Dimensions.SelectedIndex = Formats.SelectedIndex = Roles.SelectedIndex = Relationships.SelectedIndex = Contexts.SelectedIndex = Catalogs.SelectedIndex = 0; }
+                        if (reset) { Search.Text = ""; Dimensions.SelectedIndex = Formats.SelectedIndex = Roles.SelectedIndex = Relationships.SelectedIndex = Contexts.SelectedIndex = Catalogs.SelectedIndex = 0; Kinds.SelectedIndex = 2; }
                         Rows.ItemsSource = page.Entries.Select(item => new TextureExplorerCard(item)).ToArray();
                         offset = page.Offset; total = page.Total;
                         Previous.IsEnabled = offset > 0; Next.IsEnabled = offset + page.Entries.Count < total;
-                        Page.Text = $"{offset + 1:N0}–{offset + page.Entries.Count:N0} of {total:N0}"; Status.Text = $"{total:N0} textures";
+                        Page.Text = $"{offset + 1:N0}–{offset + page.Entries.Count:N0} of {total:N0}"; Status.Text = $"{total:N0} images";
                     }
                     finally { updating = false; }
                 }
@@ -298,14 +414,58 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     private void Rows_SelectionChanged(object sender, SelectionChangedEventArgs e)
     { if (!updating) SetSelected((Rows.SelectedItem as TextureExplorerCard)?.Entry); }
 
-    private void SetSelected(TextureDiscoveryEntry? entry)
+    private void SetSelected(TextureDiscoveryEntry? entry, CancellationToken token = default)
     {
         resourceSelection?.Cancel(); ++resourceRequestVersion;
         var changed = selected?.Identity != entry?.Identity;
         selected = entry;
         if (nativePreviewSelection?.SourceIdentity != entry?.Identity) nativePreviewSelection = null;
         if (changed) ++selectionVersion;
-        RenderDetails(changed); QueueSelection(); SelectedResourceChanged?.Invoke(this, EventArgs.Empty);
+        if (changed) selectedMetadataContext = null;
+        RefreshMetadataChoices();
+        RenderDetails(changed); QueueSelection(token); SelectedResourceChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private ResourceIdentity[] KnownCatalogs(TextureDiscoveryEntry entry)
+    {
+        if (native is not { } owner) return [];
+        return entry.CatalogKeys.Distinct(StringComparer.Ordinal).Select(key =>
+        {
+            var parts = key.Split(':');
+            if (parts.Length != 3 || parts[0] != owner.Revision.IndexContentId || parts[2].Length != 0 ||
+                !long.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var ordinal) ||
+                owner.Snapshot.FindRecord(ordinal) is not { Type: 3, Validity: ResourceValidity.Valid })
+                throw new ArchiveException("TextureCatalogSourceMismatch", "A texture catalog belongs to another workspace.");
+            return new ResourceIdentity(parts[0], ordinal);
+        }).ToArray();
+    }
+
+    private void RefreshMetadataChoices()
+    {
+        TextureMetadataContext[] contexts = selected is { } entry && nativePreviewSelection is null
+            ? entry.MetadataContexts.Count > 0 ? entry.MetadataContexts.ToArray() :
+                entry.MetadataIdentities.Distinct().Select(identity => new TextureMetadataContext(identity, KnownCatalogs(entry),
+                    entry.Width, entry.Height, entry.Format)).ToArray() : [];
+        var choices = contexts.GroupBy(context => context.MetadataIdentity).Select((group, index) =>
+            new TextureMetadataChoiceRow(group.First() with { CatalogIdentities = group.SelectMany(context => context.CatalogIdentities).Distinct().ToArray() }, index + 1)).ToArray();
+        updatingMetadataChoices = true;
+        try
+        {
+            MetadataChoices.ItemsSource = choices;
+            var same = choices.SingleOrDefault(choice => choice.Context.MetadataIdentity == selectedMetadataContext?.MetadataIdentity);
+            if (same is null && choices.Length == 1) same = choices[0];
+            selectedMetadataContext = same?.Context;
+            MetadataChoices.SelectedItem = same;
+            MetadataChoicePanel.Visibility = choices.Length > 1 ? Visibility.Visible : Visibility.Collapsed;
+        }
+        finally { updatingMetadataChoices = false; }
+    }
+
+    private void MetadataChoiceChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (updatingMetadataChoices || suspended || disposed) return;
+        selectedMetadataContext = (MetadataChoices.SelectedItem as TextureMetadataChoiceRow)?.Context;
+        QueueSelection();
     }
 
     private void RenderDetails(bool replaceAlias)
@@ -346,26 +506,39 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     private static string FormatEvidence(TextureEvidence evidence) => $"{evidence.Reader} {evidence.ReaderVersion} · {evidence.Field}" +
         (string.IsNullOrWhiteSpace(evidence.Consumer) ? "" : $"\n{evidence.Consumer}");
 
-    private void QueueSelection()
+    private void QueueSelection(CancellationToken token = default)
     {
         if (suspended || disposed) return;
-        cancelled = false; nativeWork.Cancel(); nativeWork.Dispose(); nativeWork = new();
+        cancelled = false; nativeWork.Cancel(); nativeWork.Dispose(); nativeWork = CancellationTokenSource.CreateLinkedTokenSource(token);
         var version = ++nativeVersion; selectedPending = false; selectionSettled = false;
+        CurrentPreviewState = TexturePreviewState.Loading; PreviewFailure = null;
+        PreviewStateChanged?.Invoke(this, EventArgs.Empty);
         thumbnailPending.Clear(); thumbnailQueued.Clear(); retryTimer.Stop();
         nativeAdvancedIdentity = null; nativeAdvanced = "";
         ImageHost.Visibility = Visibility.Collapsed; PreviewStatus.Visibility = Visibility.Visible;
         previewClear = Track(nativeView.ClearAsync());
-        if (selected is not { } entry || native is not { } owner || discovery is not { } catalog || documentReader is null)
-        { PreviewStatus.Text = "Select a texture"; selectionSettled = true; StartVisibleThumbnails(); return; }
+        if (selected is not { } entry || native is not { } owner || discovery is null && nativePreviewSelection is null || documentReader is null)
+        { PreviewStatus.Text = "Select a texture"; CurrentPreviewState = TexturePreviewState.Idle; selectionSettled = true; StartVisibleThumbnails(); return; }
+        if (nativePreviewSelection is null && entry.MetadataIdentities.Distinct().Count() > 1 && selectedMetadataContext is null)
+        {
+            PreviewStatus.Text = "Choose a texture record.";
+            CurrentPreviewState = TexturePreviewState.Pending;
+            PreviewFailure = new("TextureMetadataChoiceRequired", PreviewStatus.Text); selectionSettled = true;
+            return;
+        }
+        nativeThumbnails.Remove(entry.Identity); thumbnailVersions.Remove(entry.Identity);
+        foreach (var image in ThumbnailImages(Rows))
+            if (image.DataContext is TextureExplorerCard card && card.Identity == entry.Identity) image.Source = null;
         PreviewStatus.Text = "Opening image…";
-        Track(LoadSelectionAsync(catalog, owner, entry.Identity, version, nativeWork.Token));
+        selectionTask = Track(LoadSelectionAsync(discovery, owner, entry.Identity, version, nativeWork.Token));
     }
 
-    private async Task LoadSelectionAsync(ITextureDiscoveryCatalog catalog, NativeTextureSession owner, ResourceIdentity identity, long version, CancellationToken token)
+    private async Task LoadSelectionAsync(ITextureDiscoveryCatalog? catalog, NativeTextureSession owner, ResourceIdentity identity, long version, CancellationToken token)
     {
         using var own = CancellationTokenSource.CreateLinkedTokenSource(token, workspace.Token, lifetime.Token);
         var entered = false;
         NativeContainerLease? companion = null;
+        NativeContainerLease? previewCompanion = null;
         try
         {
             await previewClear.WaitAsync(own.Token);
@@ -374,55 +547,111 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
             NativeTextureReadResult result;
             if (nativePreviewSelection is { } exact && exact.SourceIdentity == identity)
             {
-                companion = await NativeContainerLease.OpenAsync(owner.Snapshot,
-                    exact.NativeIdentity with { MemberPath = null }, exact.MemoryBudget, own.Token);
-                result = await owner.ReadForNativeAsync(exact.NativeIdentity, exact.CatalogIdentity, companion, own.Token);
+                var legacyMetadata = exact.NativeIdentity.MemberPath?.StartsWith("filetext/", StringComparison.Ordinal) == true;
+                if (legacyMetadata)
+                {
+                    result = await Task.Run(() => owner.ReadPreviewAsync(identity, exact.MemoryBudget, 1024, own.Token,
+                        metadataIdentity: exact.NativeIdentity, knownCatalogs: [exact.CatalogIdentity]), own.Token);
+                    previewCompanion = result.Source?.CompanionLease;
+                }
+                else
+                {
+                    companion = await NativeContainerLease.OpenMetadataAsync(owner.Snapshot,
+                        exact.NativeIdentity with { MemberPath = null }, exact.MemoryBudget, own.Token, allowLargeData: true);
+                    result = await Task.Run(() => owner.ReadForNativeAsync(exact.NativeIdentity, exact.CatalogIdentity, companion, own.Token,
+                        maximumPreviewDimension: 1024, reservePayloadMemory: true), own.Token);
+                }
                 if (result.Source is { } resolved && (resolved.SelectedIdentity != identity || resolved.NativeTextureIdentity != exact.NativeIdentity ||
                     resolved.CatalogIdentity != exact.CatalogIdentity))
-                    throw new ArchiveException("TextureSourceMismatch", "The texture source does not match the selected material.");
+                {
+                    if (!legacyMetadata || resolved.SelectedIdentity != identity || resolved.CatalogIdentity != exact.CatalogIdentity ||
+                        resolved.Metadata.Identity != exact.NativeIdentity || resolved.NativeTextureIdentity is not null)
+                        throw new ArchiveException("TextureSourceMismatch", "The texture source does not match the selected material.");
+                }
             }
-            else result = await owner.ReadAsync(identity, own.Token);
+            else
+            {
+                var metadataIdentity = selectedMetadataContext?.MetadataIdentity ??
+                    (selected?.MetadataIdentities.Count == 1 ? selected.MetadataIdentities[0] : null);
+                var knownCatalogs = selectedMetadataContext?.CatalogIdentities ?? (selected is { } entry ? KnownCatalogs(entry) : []);
+                result = await Task.Run(() => owner.ReadPreviewAsync(identity, owner.MemoryBudget, 1024, own.Token,
+                    metadataIdentity: metadataIdentity, knownCatalogs: knownCatalogs), own.Token);
+                previewCompanion = result.Source?.CompanionLease;
+            }
             own.Token.ThrowIfCancellationRequested(); if (!Current(owner, identity, version)) return;
             selectedBindings = result.Source?.CatalogBindingCount ?? owner.KnownCatalogCount(identity);
+            selectedBindingVersion = owner.BindingVersion(identity);
             selectedPending = result.Pending;
             if (result.Pending) retryTimer.Start();
-            var details = await catalog.GetDetailsAsync(identity, own.Token);
-            own.Token.ThrowIfCancellationRequested(); if (!Current(owner, identity, version)) return;
-            if (details is not null) { selected = details; RenderDetails(false); }
-            if (result.Source is not { } source) { PreviewStatus.Text = result.Reason ?? "Preview unavailable"; return; }
+            if (result.Source is not { } source)
+            {
+                if (result.FailureCode == "TextureMetadataAmbiguous" && result.CandidateIdentities is { Count: > 1 } candidates && selected is { } entry)
+                {
+                    selected = entry with { MetadataIdentities = entry.MetadataIdentities.Concat(candidates).Distinct().ToArray() };
+                    RefreshMetadataChoices();
+                }
+                CurrentPreviewState = result.Pending ? TexturePreviewState.Pending : TexturePreviewState.Unavailable;
+                PreviewFailure = new(result.FailureCode, result.Reason ?? "Preview unavailable");
+                PreviewStatus.Text = PreviewFailure.Message; return;
+            }
             var document = await Task.Run(() => documentReader!(source, own.Token), own.Token);
             own.Token.ThrowIfCancellationRequested(); if (!Current(owner, identity, version)) return;
-            await nativeView.LoadAsync(owner, source, document, selected!.Label, own.Token);
+            await nativeView.LoadAsync(owner, source, document, selected?.Label ?? $"Texture {identity.Ordinal}", own.Token);
             own.Token.ThrowIfCancellationRequested(); if (!Current(owner, identity, version)) return;
             ImageHost.Visibility = Visibility.Visible; PreviewStatus.Visibility = Visibility.Collapsed;
+            CurrentPreviewState = TexturePreviewState.Ready; PreviewFailure = null;
             nativeAdvancedIdentity = identity;
             nativeAdvanced = $"\nMetadata {source.Metadata.Identity.MemberPath}\nMetadata SHA-256 {source.MetadataSha256}\nDerived DDS SHA-256 {document.ContentSha256}\nMips {document.Info.MipCount}/{source.Metadata.MipSizeCount}";
             Advanced.Text += nativeAdvanced;
-            if (nativePreviewSelection is null && owner.KnownCatalogCount(identity) != selectedBindings) { selectedPending = true; retryTimer.Start(); }
+            if (nativePreviewSelection is null && owner.BindingVersion(identity) != selectedBindingVersion) { selectedPending = true; retryTimer.Start(); }
+            if (catalog is not null) _ = Track(LoadSelectionRelationshipEvidenceAsync(catalog, owner, identity, version, nativeWork.Token));
         }
         catch (OperationCanceledException) { }
-        catch (Exception error) { if (Current(owner, identity, version)) PreviewStatus.Text = error.Message; }
+        catch (Exception error)
+        {
+            if (Current(owner, identity, version))
+            {
+                CurrentPreviewState = TexturePreviewState.Failed;
+                PreviewFailure = new(error is TextureFormatException format ? format.Code : error is ArchiveException archive ? archive.Code : "TexturePreviewFailed", error.Message);
+                PreviewStatus.Text = error.Message; nativeThumbnails.Remove(identity); thumbnailVersions.Remove(identity);
+            }
+        }
         finally
         {
             if (entered) nativeGate.Release();
+            previewCompanion?.Dispose();
             companion?.Dispose();
             if (!suspended && !cancelled && version == nativeVersion && !own.IsCancellationRequested)
-            { selectionSettled = true; StartVisibleThumbnails(); }
+            { selectionSettled = true; PreviewStateChanged?.Invoke(this, EventArgs.Empty); StartVisibleThumbnails(); }
         }
     }
     private bool Current(NativeTextureSession owner, ResourceIdentity identity, long version)
         => !suspended && !cancelled && !disposed && native == owner && selected?.Identity == identity && nativeVersion == version;
 
+    private async Task LoadSelectionRelationshipEvidenceAsync(ITextureDiscoveryCatalog catalog,
+        NativeTextureSession owner, ResourceIdentity identity, long version, CancellationToken token)
+    {
+        try
+        {
+            var details = await Task.Run(() => catalog.GetDetailsAsync(identity, token), token);
+            if (details is null || !Current(owner, identity, version)) return;
+            selected = details;
+            RenderDetails(false);
+        }
+        catch (OperationCanceledException) { }
+    }
+
     private void Thumbnail_Loaded(object sender, RoutedEventArgs e)
     {
         if (sender is not Image image || image.DataContext is not TextureExplorerCard card) return;
-        image.Source = nativeThumbnails.GetValueOrDefault(card.Identity);
+        image.Source = ThumbnailsEnabled ? nativeThumbnails.GetValueOrDefault(card.Identity) : null;
+        if (card.Identity == SelectedIdentity && CurrentPreviewState != TexturePreviewState.Ready) image.Source = null;
         if (!suspended && !cancelled && (selected is null || selectionSettled)) QueueThumbnail(card, image);
     }
     private void Thumbnail_ContextChanged(object sender, DependencyPropertyChangedEventArgs e) => Thumbnail_Loaded(sender, new());
     private void StartVisibleThumbnails()
     {
-        if (suspended || cancelled || (selected is not null && !selectionSettled)) return;
+        if (!ThumbnailsEnabled || suspended || cancelled || (selected is not null && !selectionSettled)) return;
         foreach (var image in ThumbnailImages(Rows).OrderByDescending(image => (image.DataContext as TextureExplorerCard)?.Identity == SelectedIdentity))
             if (image.DataContext is TextureExplorerCard card) QueueThumbnail(card, image);
     }
@@ -437,8 +666,9 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     }
     private void QueueThumbnail(TextureExplorerCard card, Image image)
     {
-        if (suspended || cancelled || native is not { } owner || cache is not { } thumbnailCache || documentReader is null) return;
-        if (nativeThumbnails.TryGetValue(card.Identity, out var bitmap)) { image.Source = bitmap; return; }
+        if (!ThumbnailsEnabled || suspended || cancelled || native is not { } owner || cache is not { } thumbnailCache || documentReader is null) return;
+        if (card.Identity == SelectedIdentity && CurrentPreviewState != TexturePreviewState.Ready) { image.Source = null; image.ToolTip = PreviewFailure?.Message; return; }
+        if (thumbnailVersions.GetValueOrDefault(card.Identity) == owner.BindingVersion(card.Identity) && nativeThumbnails.TryGetValue(card.Identity, out var bitmap)) { image.Source = bitmap; return; }
         image.Source = null;
         if (!IsInViewport(image)) return;
         if (!thumbnailQueued.Add(card.Identity)) return;
@@ -446,23 +676,37 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     }
     private async Task LoadThumbnailAsync(NativeTextureSession owner, CacheManager thumbnailCache, ResourceIdentity identity, Image image, long version, CancellationToken token)
     {
-        using var own = CancellationTokenSource.CreateLinkedTokenSource(token, workspace.Token, lifetime.Token);
+        var epoch = thumbnailEpoch;
+        using var own = CancellationTokenSource.CreateLinkedTokenSource(token, workspace.Token, lifetime.Token, thumbnailWork.Token);
         var entered = false;
         try
         {
             await nativeGate.WaitAsync(own.Token); entered = true;
-            if (!CanPublish(owner, identity, image, version)) return;
-            if (nativeThumbnails.TryGetValue(identity, out var previous)) { image.Source = previous; return; }
-            var result = await owner.ReadAsync(identity, own.Token, nativeView.CurrentSource?.RetainedSourceBytes ?? 0);
-            own.Token.ThrowIfCancellationRequested(); if (!CanPublish(owner, identity, image, version)) return;
+            if (!CanPublish(owner, identity, image, version, epoch)) return;
+            if (identity == SelectedIdentity && CurrentPreviewState != TexturePreviewState.Ready) return;
+            var bindingVersion = owner.BindingVersion(identity);
+            if (thumbnailVersions.GetValueOrDefault(identity) == bindingVersion && nativeThumbnails.TryGetValue(identity, out var previous)) { image.Source = previous; return; }
+            var currentSource = identity == SelectedIdentity ? nativeView.CurrentSource : null;
+            if (currentSource is not null) await Task.Run(() => owner.RevalidateAsync(currentSource, own.Token), own.Token);
+            var entry = CurrentResources.FirstOrDefault(card => card.Identity == identity)?.Entry;
+            if (entry?.MetadataIdentities.Distinct().Count() > 1) return;
+            var metadataIdentity = entry?.MetadataIdentities.Count == 1 ? entry.MetadataIdentities[0] : null;
+            var result = currentSource is not null ? new NativeTextureReadResult(currentSource, null) :
+                await Task.Run(() => owner.ReadPreviewAsync(identity, owner.MemoryBudget, 1024, own.Token,
+                    metadataIdentity: metadataIdentity, knownCatalogs: entry is null ? null : KnownCatalogs(entry)), own.Token);
+            var transientCompanion = currentSource is null ? result.Source?.CompanionLease : null;
+            try
+            {
+            own.Token.ThrowIfCancellationRequested(); if (!CanPublish(owner, identity, image, version, epoch)) return;
             thumbnailBindings[identity] = result.Source?.CatalogBindingCount ?? owner.KnownCatalogCount(identity);
             if (result.Pending) { thumbnailPending.Add(identity); retryTimer.Start(); return; }
             thumbnailPending.Remove(identity);
             if (result.Source is not { } source) { image.ToolTip = result.Reason; return; }
-            var document = await Task.Run(() => documentReader!(source, own.Token), own.Token);
+            var document = currentSource is not null ? nativeView.ImageBrowser.CurrentDocument! :
+                await Task.Run(() => documentReader!(source, own.Token), own.Token);
             var mip = document.MipLevels.FirstOrDefault(level => Math.Max(level.Width, level.Height) <= 128)?.Index ?? document.Info.MipCount - 1;
             var key = CacheManager.Key(owner.Revision.IndexContentId + ":" + owner.Revision.PhysicalSourceStamp,
-                document.ContentSha256, NativeTextureDecoder.Version + ":discovery-thumbnail-rgb-v1", $"thumbnail:128:mip:{mip}:RGB");
+                NativeTextureSession.SourceVersion(source) + ":" + document.ContentSha256, NativeTextureDecoder.Version + ":discovery-thumbnail-rgb-v2", $"thumbnail:128:mip:{mip}:RGB");
             await using var lease = await thumbnailCache.AcquireAsync(key, async (path, cancellation) =>
             {
                 var decoder = new DdsTextureDecoder(128L * 1024 * 1024);
@@ -475,18 +719,34 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
             BitmapSource bitmap;
             await using (var stream = new FileStream(lease.Path, FileMode.Open, FileAccess.Read, FileShare.Read))
             { bitmap = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad).Frames[0]; bitmap.Freeze(); }
-            own.Token.ThrowIfCancellationRequested(); if (!CanPublish(owner, identity, image, version)) return;
-            if (owner.KnownCatalogCount(identity) != source.CatalogBindingCount)
+            own.Token.ThrowIfCancellationRequested(); if (!CanPublish(owner, identity, image, version, epoch)) return;
+            if (owner.BindingVersion(identity) != bindingVersion)
             { thumbnailPending.Add(identity); retryTimer.Start(); return; }
-            nativeThumbnails[identity] = bitmap; image.Source = bitmap; image.ToolTip = null;
+            thumbnailVersions[identity] = bindingVersion; nativeThumbnails[identity] = bitmap; image.Source = bitmap; image.ToolTip = null;
+            }
+            finally { transientCompanion?.Dispose(); }
         }
         catch (OperationCanceledException) { }
-        catch (Exception error) { if (CanPublish(owner, identity, image, version)) image.ToolTip = error.Message; }
-        finally { if (entered) nativeGate.Release(); if (version == nativeVersion) thumbnailQueued.Remove(identity); }
+        catch (Exception error) { if (CanPublish(owner, identity, image, version, epoch)) image.ToolTip = error.Message; }
+        finally { if (entered) nativeGate.Release(); if (version == nativeVersion && epoch == thumbnailEpoch) thumbnailQueued.Remove(identity); }
     }
-    private bool CanPublish(NativeTextureSession owner, ResourceIdentity identity, Image image, long version)
-        => !suspended && !cancelled && !disposed && native == owner && version == nativeVersion &&
+    private bool CanPublish(NativeTextureSession owner, ResourceIdentity identity, Image image, long version, long epoch)
+        => ThumbnailsEnabled && epoch == thumbnailEpoch && !suspended && !cancelled && !disposed && native == owner && version == nativeVersion &&
             CurrentResources.Any(card => card.Identity == identity) && image.DataContext is TextureExplorerCard current && current.Identity == identity;
+    private void ThumbnailSettingChanged()
+    {
+        StopThumbnailWork();
+        Rows.ItemsPanel = (ItemsPanelTemplate)Resources[ThumbnailsEnabled ? "TextureThumbnailTiles" : "TextureMetadataRows"];
+        if (ThumbnailsEnabled && !disposed)
+            _ = Dispatcher.BeginInvoke(new Action(StartVisibleThumbnails), DispatcherPriority.Loaded);
+    }
+    private void StopThumbnailWork()
+    {
+        ++thumbnailEpoch; thumbnailWork.Cancel(); thumbnailWork.Dispose(); thumbnailWork = new();
+        thumbnailPending.Clear(); thumbnailQueued.Clear(); nativeThumbnails.Clear(); thumbnailBindings.Clear(); thumbnailVersions.Clear();
+        foreach (var image in ThumbnailImages(Rows)) { image.Source = null; image.ToolTip = null; }
+        if (!selectedPending) retryTimer.Stop();
+    }
     private bool IsInViewport(Image image)
     {
         var tile = image.Parent as FrameworkElement ?? image;
@@ -566,12 +826,13 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
             ["format"] = Formats.SelectedItem as string ?? "Any", ["role"] = Roles.SelectedItem as string ?? "Any",
             ["relationships"] = Relationships.SelectedIndex.ToString(CultureInfo.InvariantCulture),
             ["sort"] = Sort.SelectedIndex.ToString(CultureInfo.InvariantCulture),
+            ["kind"] = Kinds.SelectedIndex.ToString(CultureInfo.InvariantCulture),
             ["context"] = (Contexts.SelectedItem as TextureContextOption)?.Key ?? "", ["group"] = (Catalogs.SelectedItem as TextureContextOption)?.Key ?? ""
         };
     }
     public async Task ApplyFilterAsync(IReadOnlyDictionary<string, string> values, CancellationToken token = default)
     {
-        token.ThrowIfCancellationRequested(); RefreshOptions();
+        token.ThrowIfCancellationRequested(); await RefreshOptionsAsync(token);
         object dimension = Dimensions.Items[0];
         if (values.GetValueOrDefault("width", "").Length > 0 || values.GetValueOrDefault("height", "").Length > 0)
         {
@@ -591,10 +852,12 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
             ?? throw new InvalidOperationException("The saved catalog is unavailable.");
         if (!int.TryParse(values.GetValueOrDefault("relationships", "0"), out var relationships) || relationships < 0 || relationships > 2)
             throw new InvalidOperationException("The saved relationship filter is unavailable.");
-        if (!int.TryParse(values.GetValueOrDefault("sort", "0"), out var sort) || sort < 0 || sort > 2)
+        if (!int.TryParse(values.GetValueOrDefault("sort", "2"), out var sort) || sort < 0 || sort > 2)
             throw new InvalidOperationException("The saved sort is unavailable.");
+        if (!int.TryParse(values.GetValueOrDefault("kind", "0"), out var kind) || kind < 0 || kind > 2)
+            throw new InvalidOperationException("The saved texture kind is unavailable.");
         updating = true;
-        try { Search.Text = values.GetValueOrDefault("search", ""); Dimensions.SelectedItem = dimension; Formats.SelectedItem = format; Roles.SelectedItem = role; Contexts.SelectedItem = context; Catalogs.SelectedItem = catalog; Relationships.SelectedIndex = relationships; Sort.SelectedIndex = sort; offset = 0; }
+        try { Search.Text = values.GetValueOrDefault("search", ""); Dimensions.SelectedItem = dimension; Formats.SelectedItem = format; Roles.SelectedItem = role; Contexts.SelectedItem = context; Catalogs.SelectedItem = catalog; Relationships.SelectedIndex = relationships; Sort.SelectedIndex = sort; Kinds.SelectedIndex = kind; offset = 0; }
         finally { updating = false; }
         queryTimer.Stop(); queryTask = Track(RefreshAsync(false, token)); await queryTask;
     }
@@ -603,9 +866,14 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     private async Task ObserveAsync(Task task) { try { await task; } catch { } finally { operations.Remove(task); } }
     private async Task DrainAsync() { while (operations.Count > 0) { var batch = operations.ToArray(); try { await Task.WhenAll(batch); } catch { } foreach (var task in batch) operations.Remove(task); } }
     private void Cancel_Click(object sender, RoutedEventArgs e)
+        => CancelWork();
+    public void CancelWork()
     {
+        CurrentPreviewState = TexturePreviewState.Cancelled; PreviewFailure = null;
+        PreviewStateChanged?.Invoke(this, EventArgs.Empty);
         cancelled = true; ++nativeVersion; resourceSelection?.Cancel(); queryCancellation?.Cancel(); exportCancellation?.Cancel(); nativeWork.Cancel(); queryTimer.Stop(); updateTimer.Stop(); retryTimer.Stop();
-        selectedPending = false; thumbnailPending.Clear(); thumbnailQueued.Clear(); nativeThumbnails.Clear();
+        StopThumbnailWork();
+        selectedPending = false; thumbnailPending.Clear(); thumbnailQueued.Clear(); nativeThumbnails.Clear(); thumbnailVersions.Clear();
         ImageHost.Visibility = Visibility.Collapsed; PreviewStatus.Visibility = Visibility.Visible; PreviewStatus.Text = "Cancelled";
         foreach (var image in ThumbnailImages(Rows)) image.Source = null;
         previewClear = Track(nativeView.ClearAsync()); DiscoveryCancel?.Invoke();
@@ -613,35 +881,70 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     public async Task SuspendAsync()
     {
         suspended = true; ++nativeVersion; resourceSelection?.Cancel(); queryCancellation?.Cancel(); exportCancellation?.Cancel(); nativeWork.Cancel(); queryTimer.Stop(); updateTimer.Stop(); retryTimer.Stop();
+        StopThumbnailWork();
         selectedPending = false; thumbnailPending.Clear(); thumbnailQueued.Clear(); ImageHost.Visibility = Visibility.Collapsed;
         previewClear = Track(nativeView.ClearAsync()); await DrainAsync();
-        nativeThumbnails.Clear(); thumbnailBindings.Clear(); foreach (var image in ThumbnailImages(Rows)) image.Source = null;
+        nativeThumbnails.Clear(); thumbnailBindings.Clear(); thumbnailVersions.Clear(); foreach (var image in ThumbnailImages(Rows)) image.Source = null;
     }
     public void Resume()
     {
-        if (discovery is null || disposed) return;
+        if (native is null || disposed) return;
+        if (!suspended && CurrentPreviewState == TexturePreviewState.Ready) return;
         suspended = false; cancelled = false; retryCount = 0;
-        RefreshOptions(); queryTask = Track(RefreshAsync(true)); QueueSelection();
+        queryTask = Track(RefreshOptionsAndPageAsync(true)); QueueSelection();
     }
     public async Task ClearAsync()
     {
         if (discovery is { } previous) previous.Updated -= DiscoveryUpdated;
+        ThumbnailsEnabled = false;
         workspace.Cancel(); await SuspendAsync();
         discovery = null; native = null; cache = null; documentReader = null;
         nativePreviewSelection = null;
+        selectedMetadataContext = null;
         workspace.Dispose(); workspace = new(); nativeWork.Dispose(); nativeWork = new();
         updating = true;
-        try { Rows.ItemsSource = null; selected = null; ++selectionVersion; Search.Text = ""; Dimensions.ItemsSource = Formats.ItemsSource = Roles.ItemsSource = Contexts.ItemsSource = Catalogs.ItemsSource = null; Relationships.SelectedIndex = 0; }
+        try { Rows.ItemsSource = null; selected = null; ++selectionVersion; Search.Text = ""; Dimensions.ItemsSource = Formats.ItemsSource = Roles.ItemsSource = Contexts.ItemsSource = Catalogs.ItemsSource = null; Relationships.SelectedIndex = Kinds.SelectedIndex = 0; Sort.SelectedIndex = 2; }
         finally { updating = false; }
         offset = total = 0; Status.Text = Page.Text = ""; Empty.Visibility = Visibility.Collapsed; RenderDetails(true);
+        RefreshMetadataChoices();
+        CurrentPreviewState = TexturePreviewState.Idle; PreviewFailure = null; selectedBindingVersion = null;
         SelectedResourceChanged?.Invoke(this, EventArgs.Empty);
     }
     public async ValueTask DisposeAsync()
     {
         if (disposed) return;
         lifetime.Cancel(); await ClearAsync(); disposed = true; await nativeView.DisposeAsync();
-        nativeWork.Dispose(); workspace.Dispose(); lifetime.Dispose(); nativeGate.Dispose();
+        nativeWork.Dispose(); thumbnailWork.Dispose(); workspace.Dispose(); lifetime.Dispose(); nativeGate.Dispose();
     }
     private sealed record NativePreviewSelection(ResourceIdentity SourceIdentity, ResourceIdentity NativeIdentity,
         ResourceIdentity CatalogIdentity, AssetMemoryBudget MemoryBudget);
+    private static string TextureDiagnosticKey() => "texture-ui/" + Interlocked.Increment(ref textureDiagnosticSequence).ToString(CultureInfo.InvariantCulture);
+    private static IDisposable? TextureDiagnostic(string stage, string key) =>
+        AssetLoadDiagnostics.CountersEnabled || AssetLoadDiagnostics.Listener.IsEnabled(AssetLoadDiagnostics.MeasurementName)
+            ? new TextureDiagnosticPhase(stage, key) : null;
+    private sealed class TextureDiagnosticPhase : IDisposable
+    {
+        private readonly string stage, key;
+        private readonly IDisposable? timing;
+        private int disposed;
+        public TextureDiagnosticPhase(string stage, string key)
+        {
+            this.stage = stage; this.key = key;
+            AssetLoadDiagnostics.Counters(stage, key, new Dictionary<string, long> { ["Active"] = 1, ["ThreadId"] = Environment.CurrentManagedThreadId });
+            timing = AssetLoadDiagnostics.Measure(stage, key);
+        }
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+            timing?.Dispose();
+            AssetLoadDiagnostics.Counters(stage, key, new Dictionary<string, long> { ["Active"] = 0, ["ThreadId"] = Environment.CurrentManagedThreadId });
+        }
+    }
+
+    private sealed record TextureMetadataChoiceRow(TextureMetadataContext Context, int Number)
+    {
+        public string Label => string.Join(" · ", new[] { Context.Label ?? $"Texture record {Number}",
+            Context.Width is { } width && Context.Height is { } height ? $"{width:N0} × {height:N0}" : null, Context.Format }
+            .Where(value => !string.IsNullOrWhiteSpace(value)));
+    }
 }

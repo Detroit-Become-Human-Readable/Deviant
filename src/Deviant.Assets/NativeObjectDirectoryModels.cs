@@ -13,6 +13,8 @@ public sealed record NativeObjectDirectoryDocument(ResourceIdentity Identity, So
     ReadOnlyMemory<byte> RawBody, IReadOnlyList<NativeObjectFrame> Objects,
     DecodedExtent? RemainderExtent, ReadOnlyMemory<byte> RemainderBytes)
 {
+    public bool IsMetadataOnly { get; init; }
+    public DecodedExtent? DeclaredRemainderExtent { get; init; }
     public IReadOnlyList<NativeObjectFrame> FindNative(uint nativeType, uint nativeId) =>
         Objects.Where(item => item.NativeType == nativeType && item.NativeId == nativeId).ToArray();
 }

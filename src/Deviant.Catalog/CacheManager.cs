@@ -4,13 +4,14 @@ using System.Text.Json;
 namespace Deviant.Catalog;
 
 public sealed record CacheSettings(string Location, long LimitBytes = 4L * 1024 * 1024 * 1024, int Workers = 0,IReadOnlyList<string>? PreviousLocations=null);
-public sealed class CacheLease(string path, Func<ValueTask> release) : IAsyncDisposable
+public sealed class CacheLease(string path, Func<ValueTask> release) : IAsyncDisposable, IDisposable
 {
     private int disposed;
     public string Path { get; } = path;
+    public void Dispose() => DisposeAsync().GetAwaiter().GetResult();
     public ValueTask DisposeAsync() => Interlocked.Exchange(ref disposed, 1) == 0 ? release() : ValueTask.CompletedTask;
 }
-public sealed class CacheManager
+public sealed partial class CacheManager : IDisposable
 {
     private readonly SemaphoreSlim operation = new(1, 1);
     private readonly object leaseGate = new();
@@ -35,9 +36,10 @@ public sealed class CacheManager
     public int EffectiveWorkers => Workers == 0 ? Math.Clamp(Environment.ProcessorCount / 4, 1, 2) : Workers;
     public IReadOnlyList<string> PreviousLocations => settings.PreviousLocations??[];
     public int ActivePreviewLeases { get { lock (leaseGate) return leases.Values.Sum(); } }
-    public long UsageBytes => Files(Location).Sum(f => new FileInfo(f).Length);
-    public long PreviewUsageBytes => Files(Path.Combine(Location,"previews-v1")).Sum(f => new FileInfo(f).Length);
-    public long MetadataUsageBytes => Math.Max(0,UsageBytes-PreviewUsageBytes);
+    public long UsageBytes => GetUsage(CacheUsage.Total);
+    public long PreviewUsageBytes => GetUsage(CacheUsage.Preview);
+    public long PreparedUsageBytes => GetUsage(CacheUsage.Prepared);
+    public long MetadataUsageBytes => GetUsage(CacheUsage.Metadata);
     public long AvailableBytes => new DriveInfo(Path.GetPathRoot(Location)!).AvailableFreeSpace;
     public static string Key(string sourceRevision, string payloadHash, string decoderVersion, string options) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("preview-v1\n" + sourceRevision + "\n" + payloadHash + "\n" + decoderVersion + "\n" + options))).ToLowerInvariant();
@@ -48,72 +50,13 @@ public sealed class CacheManager
     public async Task<CacheLease> AcquireAsync(string key, Func<string, CancellationToken, Task> producer, CancellationToken token, string extension)
     {
         if (extension is not (".wav" or ".png")) throw new ArgumentException("Use a WAV or PNG cache entry.", nameof(extension));
-        var safeKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key))).ToLowerInvariant();
-        await operation.WaitAsync(token).ConfigureAwait(false);
-        try
-        {
-            if (LimitBytes == 0)
-            {
-                var uncached = Path.Combine(Path.GetTempPath(), "Deviant-preview-" + Guid.NewGuid().ToString("N") + extension);
-                try { await producer(uncached, token).ConfigureAwait(false); token.ThrowIfCancellationRequested(); return Lease(uncached, true); }
-                catch { if (File.Exists(uncached)) File.Delete(uncached); throw; }
-            }
-            var previewRoot = Path.Combine(Location, "previews-v1"); Directory.CreateDirectory(previewRoot);
-            var path = Path.Combine(previewRoot, safeKey + extension);
-            if (!File.Exists(path))
-            {
-                var temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                try
-                {
-                    try { await producer(temp, token).ConfigureAwait(false); }
-                    catch (IOException error) when ((error.HResult & 0xffff) is 112 or 39)
-                    {
-                        if (File.Exists(temp)) File.Delete(temp);
-                        var fallback = Path.Combine(Path.GetTempPath(), "Deviant-preview-" + Guid.NewGuid().ToString("N") + extension);
-                        try
-                        {
-                            await producer(fallback, token).ConfigureAwait(false);
-                            token.ThrowIfCancellationRequested();
-                            return Lease(fallback, true);
-                        }
-                        catch { if (File.Exists(fallback)) File.Delete(fallback); throw; }
-                    }
-                    token.ThrowIfCancellationRequested();
-                    if (!File.Exists(temp)) throw new IOException("Preview producer did not create a file.");
-                    var size = new FileInfo(temp).Length;
-                    Evict(size, temp);
-                    if (size > LimitBytes || PreviewUsageBytes > LimitBytes)
-                    {
-                        var uncached = Path.Combine(Path.GetTempPath(), "Deviant-preview-" + Guid.NewGuid().ToString("N") + extension);
-                        File.Move(temp, uncached);
-                        return Lease(uncached, true);
-                    }
-                    File.Move(temp, path);
-                }
-                finally { if (File.Exists(temp)) File.Delete(temp); }
-            }
-            File.SetLastWriteTimeUtc(path, DateTime.UtcNow);
-            return Lease(path, false);
-        }
-        finally { operation.Release(); }
+        return await AcquireCoreAsync(key, producer, token, extension, null).ConfigureAwait(false);
     }
-    private CacheLease Lease(string path, bool temporary)
-    {
-        lock (leaseGate)
-        {
-            if (leases.Count == 0) drained = NewSignal();
-            leases[path] = leases.GetValueOrDefault(path) + 1;
-        }
-        return new(path, () =>
-        {
-            lock (leaseGate)
-            {
-                if (--leases[path] == 0) { leases.Remove(path); if ((temporary || LimitBytes == 0) && File.Exists(path)) { try { File.Delete(path); } catch (IOException) { } } }
-                if (leases.Count == 0) drained.TrySetResult();
-            }
-            return ValueTask.CompletedTask;
-        });
-    }
+
+    public Task<CacheLease> AcquireMaterialBakeAsync(string key, Func<string, CancellationToken, Task> producer,
+        Func<string, CancellationToken, Task<bool>> validate, CancellationToken token = default) =>
+        AcquireCoreAsync("material-bake-v1/" + key, producer, token, ".bake", validate);
+
     public async Task SetLimitAsync(long bytes, CancellationToken token = default)
     {
         ValidateLimit(bytes); await operation.WaitAsync(token).ConfigureAwait(false);
@@ -129,14 +72,20 @@ public sealed class CacheManager
     public async Task ClearAsync(Func<CancellationToken, Task>? drainUsers = null, CancellationToken token = default)
     {
         if (drainUsers is not null) await drainUsers(token).ConfigureAwait(false);
-        await operation.WaitAsync(token).ConfigureAwait(false);
+        await BeginMaintenanceAsync(token).ConfigureAwait(false);
         try
         {
-            await WaitForLeasesAsync(token).ConfigureAwait(false);
-            ValidateLocation(Location);
-            foreach (var file in Files(Location)) { token.ThrowIfCancellationRequested(); File.Delete(file); }
+            await WaitForUsersAsync(token).ConfigureAwait(false);
+            await operation.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                ValidateLocation(Location);
+                foreach (var file in Files(Location)) { token.ThrowIfCancellationRequested(); File.Delete(file); }
+                ResetAccounting();
+            }
+            finally { operation.Release(); }
         }
-        finally { operation.Release(); }
+        finally { EndMaintenance(); }
     }
     public Task ClearAsync(CancellationToken token) => ClearAsync(null, token);
     public async Task RelocateAsync(string destination, Func<CancellationToken, Task>? drainUsers = null, CancellationToken token = default)
@@ -149,13 +98,25 @@ public sealed class CacheManager
         if (Directory.Exists(destination) && Directory.EnumerateFileSystemEntries(destination).Any())
             throw new IOException("Choose an empty cache folder.");
         if (drainUsers is not null) await drainUsers(token).ConfigureAwait(false);
-        await operation.WaitAsync(token).ConfigureAwait(false);
+        await BeginMaintenanceAsync(token).ConfigureAwait(false);
         var stage = destination.TrimEnd(Path.DirectorySeparatorChar) + ".relocating-" + Guid.NewGuid().ToString("N");
         try
         {
-            await WaitForLeasesAsync(token).ConfigureAwait(false);
+            await WaitForUsersAsync(token).ConfigureAwait(false);
+            await operation.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+            ValidateLocation(destination);
+            if (string.Equals(Location, destination, StringComparison.OrdinalIgnoreCase)) return;
+            if (Deviant.Core.DirectoryBoundary.IsWithin(destination, Location) || Deviant.Core.DirectoryBoundary.IsWithin(Location, destination))
+                throw new IOException("Choose a separate cache folder.");
+            if (Directory.Exists(destination) && Directory.EnumerateFileSystemEntries(destination).Any())
+                throw new IOException("Choose an empty cache folder.");
+            ValidateLocation(Location);
+            EnsureAccounting(); RefreshChangedPaths();
             Directory.CreateDirectory(stage);
-            if (new DriveInfo(Path.GetPathRoot(destination)!).AvailableFreeSpace < UsageBytes)
+            ValidateLocation(stage);
+            if (new DriveInfo(Path.GetPathRoot(destination)!).AvailableFreeSpace < TrackedUsageBytes)
                 throw new IOException("The destination does not have enough free space.");
             foreach (var source in Files(Location))
             {
@@ -176,8 +137,15 @@ public sealed class CacheManager
             if (Directory.Exists(destination)) Directory.Delete(destination);
             Directory.Move(stage, destination);
             await SaveSettingsAsync(settings with { Location = destination,PreviousLocations=PreviousLocations.Append(Location).Distinct(StringComparer.OrdinalIgnoreCase).ToArray() }, token).ConfigureAwait(false);
+            ResetAccounting();
+            }
+            finally { operation.Release(); }
         }
-        finally { if (Directory.Exists(stage)) Directory.Delete(stage, true); operation.Release(); }
+        finally
+        {
+            try { if (Directory.Exists(stage)) Directory.Delete(stage, true); }
+            finally { EndMaintenance(); }
+        }
     }
     public Task RelocateAsync(string destination, CancellationToken token) => RelocateAsync(destination, null, token);
     public async Task RemovePreviousAsync(string previous,CancellationToken token=default)
@@ -188,6 +156,10 @@ public sealed class CacheManager
         await operation.WaitAsync(token).ConfigureAwait(false);
         try
         {
+            ValidateLocation(previous);
+            if (!PreviousLocations.Contains(previous, StringComparer.OrdinalIgnoreCase) ||
+                Deviant.Core.DirectoryBoundary.IsWithin(Location, previous) || Deviant.Core.DirectoryBoundary.IsWithin(previous, Location))
+                throw new IOException("This folder is not a retained previous cache.");
             await Task.Run(()=>
             {
                 if(!Directory.Exists(previous)) return;
@@ -200,27 +172,30 @@ public sealed class CacheManager
         }
         finally{operation.Release();}
     }
-    private Task WaitForLeasesAsync(CancellationToken token)
-    { lock (leaseGate) return leases.Count == 0 ? Task.CompletedTask : drained.Task.WaitAsync(token); }
-    private void Evict(long required, string? exclude)
-    {
-        var previewRoot = Path.Combine(Location, "previews-v1");
-        if (!Directory.Exists(previewRoot)) return;
-        var usage = PreviewUsageBytes - (exclude is not null && File.Exists(exclude) ? new FileInfo(exclude).Length : 0);
-        foreach (var file in Files(previewRoot).Where(p => p != exclude).OrderBy(File.GetLastWriteTimeUtc))
-        {
-            if (usage + required <= LimitBytes) break;
-            lock (leaseGate) { if (leases.ContainsKey(file)) continue; var size = new FileInfo(file).Length; File.Delete(file); usage -= size; }
-        }
-    }
     private async Task SaveSettingsAsync(CacheSettings next, CancellationToken token)
     {
         var temp = settingsPath + ".tmp";
         try { await File.WriteAllTextAsync(temp, JsonSerializer.Serialize(next), token).ConfigureAwait(false); token.ThrowIfCancellationRequested(); File.Move(temp, settingsPath, true); settings = next; }
         finally { if (File.Exists(temp)) File.Delete(temp); }
     }
-    private static IEnumerable<string> Files(string root) => Directory.Exists(root)
-        ? Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories) : [];
+    private static IEnumerable<string> Files(string root)
+    {
+        if (!Directory.Exists(root)) yield break;
+        var directories = new Stack<string>(); directories.Push(root);
+        while (directories.TryPop(out var directory))
+        {
+            if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("Cache folders cannot contain symbolic links or junctions.");
+            foreach (var entry in Directory.EnumerateFileSystemEntries(directory))
+            {
+                var attributes = File.GetAttributes(entry);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException("Cache folders cannot contain symbolic links or junctions.");
+                if ((attributes & FileAttributes.Directory) != 0) directories.Push(entry);
+                else yield return entry;
+            }
+        }
+    }
     private static void ValidateLimit(long bytes) { if (bytes < 0) throw new ArgumentOutOfRangeException(nameof(bytes)); }
     private static void ValidateWorkers(int workers) { if (workers is not (0 or 1 or 2 or 4)) throw new ArgumentOutOfRangeException(nameof(workers)); }
     public void RegisterProtectedDirectory(string directory)

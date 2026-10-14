@@ -61,10 +61,10 @@ public partial class SceneView : UserControl, IAsyncDisposable
     private bool selectingTree = false;
     private SceneTreeRow? selectedNode;
     private ResourceIdentity? selectedEntity;
-    private Task queryTask = Task.CompletedTask;
+    private readonly HashSet<Task> queryTasks = [];
     private Task discoveryTask = Task.CompletedTask;
     private Task loadTask = Task.CompletedTask;
-    private Task textureTask = Task.CompletedTask;
+    private readonly HashSet<Task> textureTasks = [];
     private CancellationTokenSource? textureCancellation;
     private long textureGeneration;
     private readonly DispatcherTimer searchTimer = new() { Interval = TimeSpan.FromMilliseconds(220) };
@@ -196,6 +196,8 @@ public partial class SceneView : UserControl, IAsyncDisposable
 
     public async Task SuspendAsync()
     {
+        exportCancellation?.Cancel();
+        try { await exportTask; } catch (OperationCanceledException) { } catch { }
         searchTimer.Stop();
         queryCancellation?.Cancel();
         loadCancellation?.Cancel();
@@ -204,11 +206,12 @@ public partial class SceneView : UserControl, IAsyncDisposable
         textureCancellation?.Cancel();
         renderCancellation?.Cancel();
         scenePipelineCancellation?.Cancel();
-        try { await queryTask; } catch (OperationCanceledException) { } catch { }
+        var pendingQueries = queryTasks.ToArray();
+        try { await Task.WhenAll(pendingQueries); } catch (OperationCanceledException) { } catch { }
         try { await discoveryTask; } catch (OperationCanceledException) { } catch { }
         try { await automaticDiscoveryTask; } catch (OperationCanceledException) { } catch { }
         try { await loadTask; } catch (OperationCanceledException) { } catch { }
-        try { await textureTask; } catch (OperationCanceledException) { } catch { }
+        try { await Task.WhenAll(textureTasks.ToArray()); } catch (OperationCanceledException) { } catch { }
         try { await renderTask; } catch (OperationCanceledException) { } catch { }
         try { await scenePipelineTask; } catch (OperationCanceledException) { } catch { }
     }
@@ -245,13 +248,26 @@ public partial class SceneView : UserControl, IAsyncDisposable
         var current = session;
         if (current is null) return;
         queryCancellation?.Cancel();
-        queryCancellation?.Dispose();
         queryCancellation = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
         var own = queryCancellation;
         var generation = ++queryGeneration;
-        queryTask = QueryCoreAsync(current, own, generation);
-        try { await queryTask; }
-        finally { if (ReferenceEquals(queryCancellation, own)) queryCancellation = null; own.Dispose(); }
+        queryActive = true;
+        activityTerminalStage = null;
+        UpdateLoadingProgress();
+        var task = QueryCoreAsync(current, own, generation);
+        queryTasks.Add(task);
+        try { await task; }
+        finally
+        {
+            queryTasks.Remove(task);
+            queryActive = queryTasks.Any(pending => !pending.IsCompleted);
+            UpdateLoadingProgress();
+            if (ReferenceEquals(queryCancellation, own))
+            {
+                queryCancellation = null;
+            }
+            own.Dispose();
+        }
     }
 
     private async Task QueryCoreAsync(ISceneCatalogSession current, CancellationTokenSource own, long generation)
@@ -281,8 +297,14 @@ public partial class SceneView : UserControl, IAsyncDisposable
             if (automaticDiscoveryActive || batchDiscoveryActive) DiscoverMore.IsEnabled = false;
             UpdateLoadingProgress();
         }
-        catch (OperationCanceledException) { if (generation == queryGeneration) Status.Text = "Search cancelled"; }
-        catch (Exception error) { if (generation == queryGeneration) Status.Text = error.Message; }
+        catch (OperationCanceledException)
+        {
+            if (generation == queryGeneration) { Status.Text = "Search cancelled"; activityTerminalStage = "Cancelled"; }
+        }
+        catch (Exception error)
+        {
+            if (generation == queryGeneration) { Status.Text = error.Message; activityTerminalStage = "Failed"; }
+        }
     }
 
     private async Task<SceneLoadedSection> TrackLoadAsync(ResourceIdentity identity, CancellationToken token)
@@ -400,6 +422,7 @@ public partial class SceneView : UserControl, IAsyncDisposable
         SceneViewport.SetSelection(null);
         OpenModelButton.IsEnabled = false;
         MappedTextures.ItemsSource = null;
+        MappedTexturesPanel.Visibility = Visibility.Collapsed;
         RenderSummary.Text = "";
         selectedNode = new SceneTreeRow(node, LabelFor(node));
         selectedEntity = associatedEntity;
@@ -476,6 +499,7 @@ public partial class SceneView : UserControl, IAsyncDisposable
         References.ItemsSource = references.Select(item => new SceneObjectReferenceRow(item)).ToArray();
         References.SelectedIndex = -1;
         OpenReference.IsEnabled = false;
+        SetLightingInspector(node.Identity, LightingChoicesForNode(entities), selectedEntity);
         Advanced.Text = $"Identity {node.Identity.Key}\nRevision {node.Record.Revision.PhysicalSourceStamp}\n" +
             $"Stored names: {string.Join(", ", section.NamesByNode.GetValueOrDefault(node.Identity)?.Select(item => item.Text) ?? [])}\n" +
             $"Flags 0x{node.Record.Flags:X8}\nPivot {Format(node.Record.Pivot)}\n" +
@@ -488,6 +512,8 @@ public partial class SceneView : UserControl, IAsyncDisposable
 
     private void ClearInspector()
     {
+        InvalidateTextureQuery();
+        ClearLightingInspector();
         SelectedName.Text = "Select a node";
         IdentityText.Text = PropertiesText.Text = LocalMatrix.Text = WorldMatrix.Text = Advanced.Text = "";
         Entities.ItemsSource = References.ItemsSource = null;
@@ -497,6 +523,7 @@ public partial class SceneView : UserControl, IAsyncDisposable
         Status.Text = "";
         RenderSummary.Text = "";
         MappedTextures.ItemsSource = null;
+        MappedTexturesPanel.Visibility = Visibility.Collapsed;
         OpenModelButton.IsEnabled = false;
         Page.Text = "";
         Previous.IsEnabled = Next.IsEnabled = false;
@@ -546,7 +573,7 @@ public partial class SceneView : UserControl, IAsyncDisposable
         catch (OperationCanceledException) { Status.Text = "Export cancelled"; }
         catch (Exception error) { Status.Text = error.Message; }
     }
-    private void Cancel_Click(object sender, RoutedEventArgs e) { queryCancellation?.Cancel(); loadCancellation?.Cancel(); discoveryCancellation?.Cancel(); automaticDiscoveryCancellation?.Cancel(); renderCancellation?.Cancel(); scenePipelineCancellation?.Cancel(); session?.CancelDiscovery(); }
+    private void Cancel_Click(object sender, RoutedEventArgs e) { cancellingActivity = IsLoading; largeLoadDecision?.TrySetCanceled(); exportCancellation?.Cancel(); searchTimer.Stop(); queryCancellation?.Cancel(); loadCancellation?.Cancel(); discoveryCancellation?.Cancel(); automaticDiscoveryCancellation?.Cancel(); textureCancellation?.Cancel(); renderCancellation?.Cancel(); scenePipelineCancellation?.Cancel(); session?.CancelDiscovery(); UpdateLoadingProgress(); }
     private async void Rows_DoubleClick(object sender, MouseButtonEventArgs e)
     {
         if (Rows.SelectedItem is not SceneCatalogRow row) return;
@@ -562,8 +589,24 @@ public partial class SceneView : UserControl, IAsyncDisposable
     private async void QueryTextures_Click(object sender, RoutedEventArgs e) => await QueryTexturesAsync();
     private async void TextureResults_DoubleClick(object sender, MouseButtonEventArgs e)
     {
-        if (TextureResults.SelectedItem is not TextureDiscoveryEntry entry || AssetNavigator is null || session is null) return;
-        try { await AssetNavigator.OpenAsync(entry.Identity, session.Revision, lifetime.Token); }
+        if (TextureResults.SelectedItem is SceneLightingTextureRow lightingRow)
+        {
+            if (lightingRow.Preview is { } preview && LightingTexturePreviewProvider is { } openPreview &&
+                session is not null && preview.Revision == session.Revision)
+            {
+                try { await openPreview(preview, lifetime.Token); }
+                catch (OperationCanceledException) { }
+                catch (Exception error) { Status.Text = error.Message; }
+            }
+            return;
+        }
+        var target = TextureResults.SelectedItem switch
+        {
+            TextureDiscoveryEntry entry => entry.Identity,
+            _ => null
+        };
+        if (target is null || AssetNavigator is null || session is null) return;
+        try { await AssetNavigator.OpenAsync(target, session.Revision, lifetime.Token); }
         catch (OperationCanceledException) { }
         catch (Exception error) { Status.Text = error.Message; }
     }
@@ -571,15 +614,29 @@ public partial class SceneView : UserControl, IAsyncDisposable
     private async Task QueryTexturesAsync()
     {
         var task = QueryTexturesCoreAsync();
-        textureTask = task;
+        textureTasks.Add(task);
         try { await task; }
-        finally { if (ReferenceEquals(textureTask, task)) textureTask = Task.CompletedTask; }
+        finally { textureTasks.Remove(task); }
+    }
+
+    private void InvalidateTextureQuery()
+    {
+        textureCancellation?.Cancel();
+        ++textureGeneration;
+        TextureResults.ItemsSource = null;
     }
 
     private async Task QueryTexturesCoreAsync()
     {
-        if (selectedNode is null || section is null || TextureOwnerQueryProvider is null) return;
-        var entities = section.EntitiesByNode.GetValueOrDefault(selectedNode.Identity) ?? [];
+        if (selectedNode is null || section is null || session is null || TextureOwnerQueryProvider is null) return;
+        var querySection = section;
+        var querySession = session;
+        var queryNode = selectedNode.Identity;
+        var light = SelectedLight;
+        if (light is not null && light.Result.Value is null) return;
+        var associated = section.EntitiesByNode.GetValueOrDefault(queryNode) ?? [];
+        IReadOnlyList<SceneEntityRecord> entities = light is null ? associated :
+            associated.Where(entity => entity.Identity == light.Result.Identity).ToArray();
         if (entities.Count == 0) { Status.Text = "No associated entities"; return; }
         textureCancellation?.Cancel();
         textureCancellation?.Dispose();
@@ -596,13 +653,22 @@ public partial class SceneView : UserControl, IAsyncDisposable
                 own.Token.ThrowIfCancellationRequested();
                 pages.Add(await TextureOwnerQueryProvider(entity.Identity, 0, 100, own.Token));
             }
-            if (generation != textureGeneration || own.IsCancellationRequested || section is null) return;
-            var expectedRevision = session?.Revision;
+            if (generation != textureGeneration || own.IsCancellationRequested || !ReferenceEquals(section, querySection) ||
+                !ReferenceEquals(session, querySession) || selectedNode?.Identity != queryNode ||
+                SelectedLight?.Result.Identity != light?.Result.Identity) return;
+            var expectedRevision = querySession.Revision;
             var allowedOwners = entities.Select(entity => entity.Identity).ToHashSet();
             if (expectedRevision is null || pages.Any(page => page.Revision != expectedRevision ||
                 !allowedOwners.Contains(page.Owner)))
                 throw new ArchiveException("SourceChanged", "The texture owner belongs to another archive revision.");
-            TextureResults.ItemsSource = pages.SelectMany(page => page.Page.Entries).ToArray();
+            if (light?.Result.Value is { } fields)
+            {
+                var rows = BuildLightingTextureRows(fields, light.TextureResolutions, pages.Single());
+                TextureResults.ItemsSource = rows;
+                LightingDetails.Text = LightingDetailsText(light) + "\n" +
+                    string.Join("\n", rows.Select(row => $"Texture {row.Slot + 1}: {row.Detail}"));
+            }
+            else TextureResults.ItemsSource = pages.SelectMany(page => page.Page.Entries).ToArray();
             var total = pages.Sum(page => page.Page.Total);
             Status.Text = pages.Any(page => page.State == TextureOwnerQueryState.Pending)
                 ? "Discovering textures…"
@@ -615,7 +681,8 @@ public partial class SceneView : UserControl, IAsyncDisposable
         {
             if (ReferenceEquals(textureCancellation, own)) textureCancellation = null;
             own.Dispose();
-            QueryTextures.IsEnabled = selectedNode is not null && entities.Count > 0 && TextureOwnerQueryProvider is not null;
+            if (generation == textureGeneration)
+                QueryTextures.IsEnabled = selectedNode is not null && entities.Count > 0 && TextureOwnerQueryProvider is not null;
         }
     }
 
@@ -626,6 +693,7 @@ public partial class SceneView : UserControl, IAsyncDisposable
         searchTimer.Stop();
         await UnloadAsync();
         await SceneViewport.DisposeAsync();
+        ViewportProcessing.Dispose();
         lifetime.Dispose();
     }
 

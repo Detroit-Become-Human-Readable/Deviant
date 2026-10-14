@@ -10,9 +10,23 @@ public partial class AudioWindow
     private TextureCatalogSession? textureCatalogs;
     private NativeTextureSession? textureNative;
     private TextureDiscoverySession? textureDiscovery;
+    private Task<TextureDiscoverySession>? textureDiscoveryCreation;
+    private IDisposable? textureDependencyPause;
     private Task textureNavigationDrain = Task.CompletedTask;
     private readonly Dictionary<string, NavigationItem> textureContextNodes = new(StringComparer.Ordinal);
     private readonly DispatcherTimer textureCatalogTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
+    private Task textureContextRefresh = Task.CompletedTask;
+    private bool textureContextRefreshPending;
+    private CancellationTokenSource? textureContextRefreshCancellation;
+    public Action TextureCatalogCancellation => CancelTextureCatalogWork;
+    public void CancelTextureCatalogWork()
+    {
+        textureCatalogTimer.Stop(); textureContextRefreshPending = false;
+        textureContextRefreshCancellation?.Cancel();
+        textureExplorer.CancelWork();
+        textureDiscovery?.Cancel();
+        textureCatalogs?.Cancel();
+    }
 
     private void PauseTextureWorkForNavigation()
     {
@@ -33,38 +47,102 @@ public partial class AudioWindow
         };
     }
 
-    private async Task EnsureTextureCatalogsAsync(AudioExplorerSession owner, CancellationToken token, bool ownerQuery = false)
+    private async Task EnsureNativeTextureSourceAsync(AudioExplorerSession owner, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         if (!ReferenceEquals(owner, session)) return;
-        if (textureCatalogs is not null && textureDiscovery is not null && textureNative is not null &&
+        if (textureCatalogs is not null && textureNative is not null &&
             ReferenceEquals(textureCatalogs.Snapshot, owner.Snapshot) &&
             textureCatalogs.Progress.State is not (TextureCatalogSessionState.Cancelled or TextureCatalogSessionState.Failed))
-        {
-            if (!ownerQuery && textureExplorer.LoadedRevision != textureDiscovery.Revision)
-                await textureExplorer.LoadAsync(textureDiscovery, textureNative, cache,
-                    (source, cancellation) => new NativeTextureDecoder().Read(source, cancellation), token);
-            else if (!ownerQuery && currentView == "textures" && textureExplorer.IsSuspended)
-                textureExplorer.Resume();
             return;
-        }
-        await ClearTextureCatalogsAsync(); token.ThrowIfCancellationRequested();
+
+        if (textureCatalogs is not null || textureNative is not null || textureDiscovery is not null || textureDiscoveryCreation is not null)
+            await ClearTextureCatalogsAsync();
+        token.ThrowIfCancellationRequested();
         if (!ReferenceEquals(owner, session)) return;
-        var catalogs = new TextureCatalogSession(owner.Snapshot, new(owner.Snapshot.IndexContentId, owner.Snapshot.PhysicalSourceStamp), sessionOptions: TextureCatalogOptions);
+        var catalogs = new TextureCatalogSession(owner.Snapshot, new(owner.Snapshot.IndexContentId, owner.Snapshot.PhysicalSourceStamp),
+            sessionOptions: TextureCatalogOptions, referenceProvider: EnsureSharedCatalogReferences(owner));
         textureCatalogs = catalogs;
+        textureDependencyPause = catalogs.PauseBackgroundDiscovery();
+        RefreshForegroundDiscoveryPause();
         textureNative = new(catalogs);
-        textureDiscovery = new(catalogs, textureNative, aliases, cache, TextureDiscoveryOptions);
-        catalogs.Updated += TextureCatalogsUpdated; textureDiscovery.Updated += TextureDiscoveryUpdated;
-        textureExplorer.DiscoveryCancel = () => { textureDiscovery?.Cancel(); catalogs.Cancel(); };
+        catalogs.Updated += TextureCatalogsUpdated;
+        _ = TrackLibraryTask(ObserveTextureCatalogsAsync(catalogs));
+    }
+
+    private async Task EnsureTextureCatalogsAsync(AudioExplorerSession owner, CancellationToken token, bool ownerQuery = false)
+    {
+        await EnsureNativeTextureSourceAsync(owner, token);
+        token.ThrowIfCancellationRequested();
+        if (!ReferenceEquals(owner, session) || closingInProgress) return;
+        var catalogs = textureCatalogs ?? throw new InvalidOperationException("Texture catalogs are unavailable.");
+        var textureOwner = textureNative ?? throw new InvalidOperationException("Textures are unavailable.");
+        textureDependencyPause?.Dispose(); textureDependencyPause = null;
+        if (textureDiscovery is null)
+        {
+            var discoveryOptions = TextureDiscoveryOptions;
+            var creation = textureDiscoveryCreation ??= Task.Run(() => new TextureDiscoverySession(catalogs, textureOwner, aliases, cache, discoveryOptions));
+            TextureDiscoverySession created;
+            try { created = await creation; }
+            catch
+            {
+                if (ReferenceEquals(textureDiscoveryCreation, creation)) textureDiscoveryCreation = null;
+                throw;
+            }
+            if (!ReferenceEquals(catalogs, textureCatalogs) || !ReferenceEquals(owner, session) || closingInProgress)
+            {
+                created.Cancel(); await created.DisposeAsync();
+                token.ThrowIfCancellationRequested(); return;
+            }
+            if (token.IsCancellationRequested)
+            {
+                if (textureDiscovery is null && ReferenceEquals(textureDiscoveryCreation, creation))
+                {
+                    textureDiscoveryCreation = null;
+                    created.Cancel(); await created.DisposeAsync();
+                }
+                token.ThrowIfCancellationRequested();
+            }
+            if (textureDiscovery is null && !ReferenceEquals(textureDiscoveryCreation, creation))
+            {
+                await EnsureTextureCatalogsAsync(owner, token, ownerQuery);
+                return;
+            }
+            if (textureDiscovery is null)
+            {
+                textureDiscovery = created;
+                created.Updated += TextureDiscoveryUpdated;
+                textureExplorer.DiscoveryCancel = () => { textureDiscovery?.Cancel(); catalogs.Cancel(); };
+            }
+            if (ReferenceEquals(textureDiscoveryCreation, creation)) textureDiscoveryCreation = null;
+        }
         if (!ownerQuery)
         {
-            await textureExplorer.LoadAsync(textureDiscovery, textureNative, cache,
-                (source, cancellation) => new NativeTextureDecoder().Read(source, cancellation), token);
+            if (textureExplorer.LoadedRevision != textureDiscovery.Revision)
+                await textureExplorer.LoadAsync(textureDiscovery, textureOwner, cache,
+                    (source, cancellation) => new NativeTextureDecoder().ReadDetailed(source, cancellation, maximumPreviewDimension: 1024).Document, token);
+            else if (!textureExplorer.HasDiscoveryCatalog)
+                await textureExplorer.AttachDiscoveryAsync(textureDiscovery, token);
+            else if (currentView == "textures" && textureExplorer.IsSuspended)
+                textureExplorer.Resume();
             if (token.IsCancellationRequested || !ReferenceEquals(owner, session) || currentView != "textures")
             { await textureExplorer.SuspendAsync(); token.ThrowIfCancellationRequested(); return; }
             await RefreshTextureCatalogsAsync();
         }
-        _ = TrackLibraryTask(ObserveTextureCatalogsAsync(catalogs));
+    }
+
+    private async Task AttachLinkedTextureCatalogsAsync(AudioExplorerSession owner, long navigation, CancellationToken token)
+    {
+        try
+        {
+            await EnsureTextureCatalogsAsync(owner, token, ownerQuery: true);
+            token.ThrowIfCancellationRequested();
+            if (!ReferenceEquals(owner, session) || navigation != navigationGeneration || currentView != "textures" ||
+                textureExplorer.IsSuspended || textureDiscovery is not { } discovery) return;
+            await textureExplorer.AttachDiscoveryAsync(discovery, token);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception error) { if (!closingInProgress && navigation == navigationGeneration) NavigationError(error); }
     }
 
     private async Task<TextureOwnerQueryResult> QueryTexturesByOwnerAsync(
@@ -86,7 +164,11 @@ public partial class AudioWindow
     private void ScheduleTextureContextRefresh(object? sender, object? expected)
     {
         _ = Dispatcher.BeginInvoke(() =>
-        { if (!ReferenceEquals(sender, expected) || closingInProgress) return; if (!textureCatalogTimer.IsEnabled) textureCatalogTimer.Start(); });
+        {
+            if (!ReferenceEquals(sender, expected) || closingInProgress) return;
+            if (!textureContextRefresh.IsCompleted) { textureContextRefreshPending = true; return; }
+            if (!textureCatalogTimer.IsEnabled) textureCatalogTimer.Start();
+        });
     }
     private async Task ObserveTextureCatalogsAsync(TextureCatalogSession current)
     {
@@ -96,9 +178,40 @@ public partial class AudioWindow
     }
     private Task RefreshTextureCatalogsAsync()
     {
+        if (closingInProgress || currentView != "textures" || textureDiscovery is null) return Task.CompletedTask;
+        textureContextRefreshPending = true;
+        if (!textureContextRefresh.IsCompleted) return textureContextRefresh;
+        textureContextRefresh = TrackLibraryTask(DrainTextureContextRefreshAsync());
+        return textureContextRefresh;
+    }
+
+    private async Task DrainTextureContextRefreshAsync()
+    {
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(navigationCancellation.Token);
+        textureContextRefreshCancellation = cancellation;
+        try
+        {
+            while (textureContextRefreshPending && !closingInProgress)
+            {
+                textureContextRefreshPending = false;
+                cancellation.Token.ThrowIfCancellationRequested();
+                await RefreshTextureCatalogsCoreAsync(cancellation.Token);
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(textureContextRefreshCancellation, cancellation)) textureContextRefreshCancellation = null;
+        }
+    }
+
+    private async Task RefreshTextureCatalogsCoreAsync(CancellationToken token)
+    {
         var current = textureDiscovery;
-        if (current is null || session is null || !ReferenceEquals(current.Snapshot, session.Snapshot)) return Task.CompletedTask;
-        var contexts = current.FilterOptions.Contexts;
+        if (currentView != "textures" || current is null || session is null || !ReferenceEquals(current.Snapshot, session.Snapshot)) return;
+        var navigation = navigationGeneration;
+        var options = await current.ReadFilterOptionsAsync(token);
+        if (navigation != navigationGeneration || currentView != "textures" || !ReferenceEquals(current, textureDiscovery)) return;
+        var contexts = options.Contexts;
         var available = contexts.Select(context => context.Key).ToHashSet(StringComparer.Ordinal);
         foreach (var key in textureContextNodes.Keys.Where(key => !available.Contains(key)).ToArray())
         { textureNavigation.Children.Remove(textureContextNodes[key]); textureContextNodes.Remove(key); }
@@ -109,22 +222,36 @@ public partial class AudioWindow
             else node.Label = context.Label;
         }
         if (currentView == "textures") { UpdateExplorerStatus(); RefreshActivity(); }
-        return Task.CompletedTask;
     }
     private async Task ClearTextureCatalogsAsync()
     {
         await ClearSceneRenderingAsync();
         textureCatalogTimer.Stop();
+        textureContextRefreshPending = false;
+        textureContextRefreshCancellation?.Cancel();
         var catalogs = textureCatalogs; var discovery = textureDiscovery; var native = textureNative;
+        var creation = textureDiscoveryCreation; textureDiscoveryCreation = null;
+        textureCatalogs = null;
         if (catalogs is not null) catalogs.Updated -= TextureCatalogsUpdated;
         if (discovery is not null) discovery.Updated -= TextureDiscoveryUpdated;
         textureExplorer.DiscoveryCancel = null;
         discovery?.Cancel(); catalogs?.Cancel();
+        textureDependencyPause?.Dispose(); textureDependencyPause = null;
+        textureForegroundPause?.Dispose(); textureForegroundPause = null;
+        if (creation is not null)
+        {
+            var pending = await creation;
+            pending.Cancel();
+            if (!ReferenceEquals(pending, discovery)) await pending.DisposeAsync();
+        }
         await textureExplorer.ClearAsync();
+        try { await textureContextRefresh; } catch (OperationCanceledException) { }
+        textureContextRefresh = Task.CompletedTask;
         try { await textureNavigationDrain; } catch { }
         textureNavigationDrain = Task.CompletedTask;
         textureCatalogs = null; textureDiscovery = null; textureNative = null;
         textureContextNodes.Clear(); textureNavigation.Children.Clear();
+        textureNavigation.Children.Add(ddsNavigation);
         if (discovery is not null) await discovery.DisposeAsync();
         if (native is not null) await native.DisposeAsync();
         if (catalogs is not null) await catalogs.DisposeAsync();
@@ -140,7 +267,7 @@ public partial class AudioWindow
         }
         token.ThrowIfCancellationRequested();
         if (navigation != navigationGeneration || current != textureDiscovery) return;
-        var values = new Dictionary<string, string>(textureExplorer.CaptureFilter()) { ["context"] = key };
+        var values = new Dictionary<string, string>(textureExplorer.CaptureFilter()) { ["context"] = key, ["kind"] = "1" };
         await textureExplorer.ApplyFilterAsync(values, token);
     }
     private async Task EnsureSavedTextureCatalogAsync(string key, CancellationToken token)

@@ -39,7 +39,7 @@ public sealed class TextureCatalogMembershipReader
             catalogIdentity.MemberPath is not null)
             throw new ArchiveException("InvalidTextureCatalog", "The CATALOG identity or revision does not belong to the selected archive snapshot.");
 
-        var owner = snapshot.Records.SingleOrDefault(record => record.Ordinal == catalogIdentity.Ordinal)
+        var owner = snapshot.FindRecord(catalogIdentity.Ordinal)
             ?? throw new ArchiveException("MissingTextureCatalog", "The selected CATALOG resource is absent from the archive snapshot.");
         if (owner.Type != CatalogResourceType)
             throw new ArchiveException("InvalidTextureCatalog", "Texture membership requires an indexed type-3 CATALOG resource.");

@@ -1,9 +1,23 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <BuildModelAtlas Condition="'$(BuildModelAtlas)' == '' and '$(OS)' == 'Windows_NT'">true</BuildModelAtlas>
+    <ModelAtlasBuildDirectory>$(MSBuildProjectDirectory)/obj/model-atlas</ModelAtlasBuildDirectory>
+    <ModelAtlasLibrary>$(ModelAtlasBuildDirectory)/Deviant.Export.Models.Native.dll</ModelAtlasLibrary>
+  </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Deviant.Formats.Models/Deviant.Formats.Models.csproj" />
     <ProjectReference Include="../Deviant.Export/Deviant.Export.csproj" />
+    <ProjectReference Include="../Deviant.Export.Textures/Deviant.Export.Textures.csproj" />
     <PackageReference Include="SharpGLTF.Core" Version="1.0.7" />
     <PackageReference Include="SharpGLTF.Toolkit" Version="1.0.7" />
   </ItemGroup>
+  <ItemGroup Condition="'$(BuildModelAtlas)' == 'true'">
+    <Content Include="$(ModelAtlasLibrary)" Link="Deviant.Export.Models.Native.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="../Deviant.Export.Models.Native/vendor/xatlas/LICENSE" Link="licenses/xatlas.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <ModelAtlasSources Include="../Deviant.Export.Models.Native/*.cpp;../Deviant.Export.Models.Native/*.h;../Deviant.Export.Models.Native/CMakeLists.txt;../Deviant.Export.Models.Native/vendor/xatlas/*.cpp;../Deviant.Export.Models.Native/vendor/xatlas/*.h;../../scripts/Build-ModelAtlas.ps1" />
+  </ItemGroup>
+  <Target Name="BuildModelAtlasLibrary" BeforeTargets="PrepareForBuild" Condition="'$(BuildModelAtlas)' == 'true' and '$(DesignTimeBuild)' != 'true'" Inputs="@(ModelAtlasSources)" Outputs="$(ModelAtlasLibrary)">
+    <Exec Command="powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../../scripts/Build-ModelAtlas.ps1&quot; -SourceDirectory &quot;$(MSBuildProjectDirectory)/../Deviant.Export.Models.Native&quot; -BuildDirectory &quot;$(ModelAtlasBuildDirectory)&quot; -Configuration &quot;Release&quot;" />
+  </Target>
 </Project>

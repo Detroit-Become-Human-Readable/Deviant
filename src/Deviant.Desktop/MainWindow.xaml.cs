@@ -98,6 +98,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         void Add(string label,string kind){var item=new MenuItem{Header=label};item.Click+=async(_,_)=>await RunControllerAsync(()=>inspect(source,row,kind));menu.Items.Add(item);}
         Add("References","references");
         if(row.Type==29)Add("Shader sources","shader");
+        if(row.Type==29)Add("Physics","physics");
+        if(row.Type==29)Add("Common groups","gmk");
         if(row.Type==Deviant.Formats.Animation.AnimationDataReader.ResourceType)Add("Animation record","animation");
         if(row.Type is 2229 or 2230)Add("Buffer","buffer");
         menu.PlacementTarget=sender as UIElement;if(sender is FrameworkElement element)element.ContextMenu=menu;menu.IsOpen=true;
@@ -548,3 +550,4 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         public string PhysicalSourceStamp => snapshot?.PhysicalSourceStamp ?? "—";
     }
 }
+

@@ -99,7 +99,7 @@ public sealed class AudioExportService
             var fallbackVolumeName = logicalVolume?.RelativeName ?? logicalOwner.VolumeName;
             var exportExtent = options.Format == AudioExportFormat.Original
                 ? media.OriginalSlice ?? media.DidxExtent ?? media.Slice : media.Slice;
-            var extension = options.Format switch { AudioExportFormat.Original => ".wem", AudioExportFormat.Wav => ".wav", _ => ".ogg" };
+            var extension = options.Format switch { AudioExportFormat.Original => media.Midi is not null || media.Codec == "MIDI" ? ".mid" : ".wem", AudioExportFormat.Wav => ".wav", _ => ".ogg" };
             var identityHash = SourceIdentity.HashFields("deviant-audio-export-name-v1", [identity.Key]);
             var relative = $"audio/p{logicalOwner.Package:D2}/id_{media.Id:X8}_r{logicalOwner.Ordinal:D8}_{identityHash[..12]}{extension}";
             entries[i] = CreateEntry(source, fallbackVolumeName, relative, options, AudioExportStatus.Pending);

@@ -5,11 +5,14 @@ using Deviant.Core;
 using Microsoft.Data.Sqlite;
 namespace Deviant.Catalog;
 
-public sealed class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
+public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
 {
     private readonly SqliteConnection connection;
     private readonly string revision;
+    private readonly string path;
     private readonly object gate = new();
+    private volatile bool characterProjectionWritesEnabled;
+    private volatile bool characterProjectionReady;
     private readonly Dictionary<Deviant.Assets.AssetQuery,long> counts = [];
     private long countDataVersion = -1;
     public static FeatureStore Open(ArchiveSnapshot snapshot, string? cacheRoot = null)
@@ -22,6 +25,7 @@ public sealed class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
     }
     private FeatureStore(string path, string revision)
     {
+        this.path = path;
         this.revision = revision;
         connection = new(new SqliteConnectionStringBuilder { DataSource = path, Mode = SqliteOpenMode.ReadWriteCreate, Pooling = false }.ToString());
         connection.Open();
@@ -56,6 +60,7 @@ public sealed class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
         using(var columns=connection.CreateCommand()){columns.CommandText="PRAGMA table_info(assets_v2)";using var rows=columns.ExecuteReader();while(rows.Read())if(rows.GetString(1)=="lookup_key")hasLookupKey=true;}
         if(!hasLookupKey){using var migrate=connection.CreateCommand();migrate.CommandText="ALTER TABLE assets_v2 ADD COLUMN lookup_key TEXT";migrate.ExecuteNonQuery();}
         using var temporary=connection.CreateCommand();temporary.CommandText="CREATE TEMP TABLE asset_replacement_keys(identity TEXT PRIMARY KEY); CREATE INDEX IF NOT EXISTS assets_v2_lookup ON assets_v2(revision,family,lookup_key,bank,sort_key,identity)";temporary.ExecuteNonQuery();
+        InitializeLocalizationStreamedGroups();
     }
     public T? Load<T>(string key, string version, CancellationToken token = default)
     {
@@ -136,14 +141,17 @@ public sealed class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
     {
         lock (gate) CatalogService.ExecuteInterruptible(connection, token, () =>
         {
+            InitializeCharacterProjectionForAssetWrites();
             using var transaction = connection.BeginTransaction();
-            if (replaceFamily is not null)
+            using (var clear = connection.CreateCommand())
             {
-                using var clear = connection.CreateCommand(); clear.Transaction = transaction;
-                clear.CommandText = "DELETE FROM asset_replacement_keys"; clear.ExecuteNonQuery();
+                clear.Transaction = transaction;
+                clear.CommandText = "DELETE FROM asset_replacement_keys";
+                clear.ExecuteNonQuery();
             }
             using var keep=connection.CreateCommand();keep.Transaction=transaction;keep.CommandText="INSERT OR IGNORE INTO asset_replacement_keys VALUES($identity)";
             keep.Parameters.Add("$identity",SqliteType.Text);
+            bool hasNonModelAssets=false;
             using var command = connection.CreateCommand(); command.Transaction = transaction;
             command.CommandText = """
                 INSERT INTO assets_v2(revision,identity,family,label,search,search_fold,sort_key,bank,language,codec,duration,channels,availability,completeness,payload,lookup_key)
@@ -161,7 +169,7 @@ public sealed class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
                 if (replaceFamily is not null && asset.Family != replaceFamily) throw new ArgumentException("Asset family differs from the replaced family.");
                 command.Parameters["$identity"].Value = asset.Identity.Key;
                 command.Parameters["$lookup"].Value = (object?)asset.LookupKey ?? DBNull.Value;
-                if(replaceFamily is not null){keep.Parameters["$identity"].Value=asset.Identity.Key;keep.ExecuteNonQuery();}
+                keep.Parameters["$identity"].Value=asset.Identity.Key;keep.ExecuteNonQuery();
                 command.Parameters["$family"].Value = asset.Family; command.Parameters["$label"].Value = asset.Label;
                 command.Parameters["$search"].Value = asset.SearchTerms ?? string.Join('\n', asset.Names.Select(n => n.Text).Prepend(asset.Label).Append(asset.Identity.Key));
                 command.Parameters["$fold"].Value = ((string)command.Parameters["$search"].Value!).ToUpperInvariant();
@@ -170,6 +178,17 @@ public sealed class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
                 command.Parameters["$codec"].Value = (object?)asset.Codec ?? DBNull.Value; command.Parameters["$duration"].Value = (object?)asset.DurationSeconds ?? DBNull.Value;
                 command.Parameters["$channels"].Value = (object?)asset.Channels ?? DBNull.Value; command.Parameters["$availability"].Value = (int)asset.Availability;
                 command.Parameters["$completeness"].Value = (int)asset.Completeness; command.Parameters["$payload"].Value = JsonSerializer.Serialize(asset); command.ExecuteNonQuery();
+                if (characterProjectionWritesEnabled && asset.Family == "character-model")
+                {
+                    using var row = connection.CreateCommand(); row.Transaction = transaction;
+                    row.CommandText = "SELECT row_id FROM assets_v2 WHERE revision=$revision AND identity=$identity";
+                    row.Parameters.AddWithValue("$revision", revision); row.Parameters.AddWithValue("$identity", asset.Identity.Key);
+                    RefreshCharacterProjection(asset, (long)row.ExecuteScalar()!, transaction);
+                }
+                else if (characterProjectionWritesEnabled)
+                {
+                    hasNonModelAssets = true;
+                }
             }
             if(replaceFamily is not null)
             {
@@ -177,9 +196,40 @@ public sealed class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
                 delete.CommandText="DELETE FROM assets_v2 WHERE revision=$revision AND family=$family AND identity NOT IN (SELECT identity FROM asset_replacement_keys)";
                 delete.Parameters.AddWithValue("$revision",revision);delete.Parameters.AddWithValue("$family",replaceFamily);delete.ExecuteNonQuery();
             }
+            if (characterProjectionWritesEnabled)
+            {
+                if (replaceFamily == "character-model") RemoveMissingCharacterProjections(transaction);
+                else if (replaceFamily is not null || hasNonModelAssets)
+                    RemoveReplacedCharacterProjections(transaction);
+            }
             transaction.Commit(); counts.Clear(); return true;
         });
     }
+
+    private void RemoveReplacedCharacterProjections(SqliteTransaction transaction)
+    {
+        using var list = connection.CreateCommand(); list.Transaction = transaction;
+        list.CommandText = "SELECT model.identity,model.actor,model.name_profile,model.classification_profile " +
+            "FROM temp.asset_replacement_keys changed JOIN character_projection_models model " +
+            "ON model.revision=$revision AND model.identity=changed.identity " +
+            "WHERE NOT EXISTS(SELECT 1 FROM assets_v2 asset WHERE asset.revision=model.revision " +
+            "AND asset.identity=model.identity AND asset.family='character-model')";
+        list.Parameters.AddWithValue("$revision", revision);
+        var removed = new List<(string Identity, string Actor, string Profile, string Classification)>();
+        using (var rows = list.ExecuteReader())
+            while (rows.Read()) removed.Add((rows.GetString(0), rows.GetString(1), rows.GetString(2), rows.GetString(3)));
+
+        var touchedGroups = new HashSet<(string Actor, string Profile, string Classification)>();
+        foreach (var item in removed)
+        {
+            var key = (item.Actor, item.Profile, item.Classification);
+            RemoveCharacterProjectionModel(item.Identity, key, transaction);
+            if (key.Actor.Length > 0) touchedGroups.Add(key);
+        }
+        foreach (var key in touchedGroups)
+            RebuildCharacterProjectionGroup(key.Actor, key.Profile, key.Classification, transaction);
+    }
+
     public long Count(Deviant.Assets.AssetQuery query, CancellationToken token = default)
     {
         lock (gate) return CatalogService.ExecuteInterruptible(connection, token, () =>
@@ -190,13 +240,21 @@ public sealed class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
           if(counts.Count>=128) counts.Clear(); counts[key]=count; return count; });
     }
     public IReadOnlyList<Deviant.Assets.AssetDescriptor> Query(Deviant.Assets.AssetQuery query, CancellationToken token = default)
+        => QueryRetained(query, null, token);
+    public IReadOnlyList<Deviant.Assets.AssetDescriptor> QueryRetained(Deviant.Assets.AssetQuery query,
+        Action<int>? retainPayload, CancellationToken token = default)
     {
         if (query.Offset < 0 || query.Limit is < 1 or > 10000) throw new ArgumentOutOfRangeException(nameof(query));
         lock (gate) return CatalogService.ExecuteInterruptible(connection, token, () =>
         {
             using var command = AssetPageCommand(query, "payload");
             var rows = new List<Deviant.Assets.AssetDescriptor>(); using var reader = command.ExecuteReader();
-            while (reader.Read()) { token.ThrowIfCancellationRequested(); rows.Add(JsonSerializer.Deserialize<Deviant.Assets.AssetDescriptor>(reader.GetString(0))!); }
+            while (reader.Read())
+            {
+                token.ThrowIfCancellationRequested();
+                var payload = reader.GetString(0); retainPayload?.Invoke(payload.Length);
+                rows.Add(JsonSerializer.Deserialize<Deviant.Assets.AssetDescriptor>(payload)!);
+            }
             return rows;
         });
     }
@@ -210,6 +268,26 @@ public sealed class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
             while (reader.Read()) { token.ThrowIfCancellationRequested(); keys.Add(reader.GetString(0)); }
             return keys;
         });
+    }
+    public long CaptureAssetPageBoundary(CancellationToken token = default)
+    {
+        lock (gate) return CatalogService.ExecuteInterruptible(connection, token, () =>
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT COALESCE(MAX(row_id),0) FROM assets_v2 WHERE revision=$revision";
+            command.Parameters.AddWithValue("$revision", revision);
+            return (long)command.ExecuteScalar()!;
+        });
+    }
+    public IReadOnlyList<Deviant.Assets.AssetDescriptor> QueryCharacterGroups(Deviant.Assets.AssetQuery query,
+        out long total, CancellationToken token = default, Action<int>? retainPayload = null)
+    {
+        if (!characterProjectionReady) throw new InvalidOperationException("Character projections must be prepared on a worker before querying.");
+        var page = QueryCharacterGroupsReadOnly(query, token);
+        total = page.Total;
+        if (retainPayload is not null)
+            foreach (var asset in page.Groups) retainPayload(JsonSerializer.Serialize(asset).Length);
+        return page.Groups;
     }
     private SqliteCommand AssetPageCommand(Deviant.Assets.AssetQuery query, string projection)
     {
@@ -239,6 +317,7 @@ public sealed class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
             Deviant.Assets.AssetSort.Channels=>"channels",
             Deviant.Assets.AssetSort.Availability=>"availability",
             Deviant.Assets.AssetSort.Completeness=>"completeness",
+            Deviant.Assets.AssetSort.Animations=>"CASE WHEN json_extract(payload,'$.Metadata.\"model.animation-state\"') IN ('complete','partial') THEN CAST(json_extract(payload,'$.Metadata.\"model.animation-count\"') AS INTEGER) END",
             _=>throw new ArgumentOutOfRangeException(nameof(query.Sort))
         };
         return field+(query.Descending?" DESC":" ASC")+" NULLS LAST,"+(field=="sort_key"?"":"sort_key ASC,")+"deviant_ordinal(identity) ASC,deviant_member(identity) ASC,identity ASC";
@@ -278,11 +357,73 @@ public sealed class FeatureStore : IDisposable, Deviant.Assets.IAssetCatalog
         Filter("bank", "=", query.GroupKey); Filter("language", "=", query.Language); Filter("codec", "=", query.Codec);
         Filter("lookup_key", "=", query.ExactKey);
         Filter("family", "=", query.Family);
+        if (query.CachedPayloadFilter is { } cachedPayload)
+        {
+            if (query.Family is null || cachedPayload.MaximumOrdinal < 0 || cachedPayload.MaximumPayloadBytes < 1)
+                throw new ArgumentException("Cached payload filtering requires a bounded asset family.", nameof(query));
+            command.CommandText += """
+                 AND CASE WHEN length(CAST(payload AS BLOB))<=$payloadMaximum AND json_valid(payload) THEN
+                    json_type(payload)='object' AND json_type(payload,'$.Identity')='object'
+                    AND json_type(payload,'$.Identity.Ordinal')='integer'
+                    AND json_extract(payload,'$.Identity.Ordinal')>=0 AND json_extract(payload,'$.Identity.Ordinal')<$payloadOrdinalCount
+                    AND json_extract(payload,'$.Identity.IndexContentId')=$payloadIndex
+                    AND json_extract(payload,'$.Identity.MemberPath')=$payloadMember
+                    AND identity=$payloadIndex||':'||CAST(json_extract(payload,'$.Identity.Ordinal') AS TEXT)||':'||$payloadMember
+                    AND json_extract(payload,'$.Revision.IndexContentId')=$payloadIndex
+                    AND json_extract(payload,'$.Revision.PhysicalSourceStamp')=$payloadStamp
+                    AND json_extract(payload,'$.Family')=family AND json_type(payload,'$.Label')='text'
+                    AND json_type(payload,'$.Names')='array' AND json_type(payload,'$.Extents')='array'
+                    AND json_type(payload,'$.Metadata')='object'
+                    AND json_extract(payload,$payloadMetadataPath)=$payloadMetadataValue
+                    AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.Names') n WHERE COALESCE(
+                        CASE WHEN n.type='object' THEN json_type(n.value,'$.Text')='text'
+                            AND json_type(n.value,'$.Source')='text'
+                            AND json_type(n.value,'$.Origin')='integer'
+                            AND json_extract(n.value,'$.Origin') BETWEEN 0 AND 5
+                            AND (json_type(n.value,'$.CollisionGroup') IS NULL OR json_type(n.value,'$.CollisionGroup') IN ('null','text'))
+                        ELSE 0 END,0)=0)
+                    AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.Extents') e WHERE COALESCE(
+                        CASE WHEN e.type='object' THEN json_type(e.value,'$.RelativeSource')='text'
+                            AND json_type(e.value,'$.Offset')='integer' AND json_type(e.value,'$.Length')='integer'
+                            AND json_extract(e.value,'$.Offset')>=0 AND json_extract(e.value,'$.Length')>=0
+                            AND (json_type(e.value,'$.PayloadSha256') IS NULL OR json_type(e.value,'$.PayloadSha256') IN ('null','text'))
+                        ELSE 0 END,0)=0)
+                    AND NOT EXISTS(SELECT 1 FROM json_each(payload,'$.Metadata') m WHERE m.type!='text')
+                 ELSE 0 END
+                """;
+            command.Parameters.AddWithValue("$payloadMaximum", cachedPayload.MaximumPayloadBytes);
+            command.Parameters.AddWithValue("$payloadOrdinalCount", cachedPayload.MaximumOrdinal);
+            command.Parameters.AddWithValue("$payloadIndex", cachedPayload.Revision.IndexContentId);
+            command.Parameters.AddWithValue("$payloadStamp", cachedPayload.Revision.PhysicalSourceStamp);
+            command.Parameters.AddWithValue("$payloadMember", cachedPayload.MemberPath);
+            command.Parameters.AddWithValue("$payloadMetadataPath", "$.Metadata." + JsonSerializer.Serialize(cachedPayload.MetadataKey));
+            command.Parameters.AddWithValue("$payloadMetadataValue", cachedPayload.MetadataValue);
+        }
+        if (query.MaximumCatalogRow is { } boundary)
+        {
+            command.CommandText += " AND row_id<=$catalogBoundary";
+            command.Parameters.AddWithValue("$catalogBoundary", boundary);
+        }
+        if (query.ModelKind is { } kind)
+        {
+            command.CommandText += " AND json_extract(payload,'$.Metadata.\"model.kind\"')=$modelKind";
+            command.Parameters.AddWithValue("$modelKind", kind);
+        }
+        if (query.ModelNameProfile is { } nameProfile)
+        {
+            command.CommandText += " AND json_extract(payload,'$.Metadata.\"model.name-profile\"')=$modelNameProfile";
+            command.Parameters.AddWithValue("$modelNameProfile", nameProfile);
+        }
+        if (query.CharacterGroup is { } character)
+        {
+            command.CommandText += " AND json_extract(payload,'$.Metadata.\"character.key\"')=$characterGroup";
+            command.Parameters.AddWithValue("$characterGroup", character);
+        }
         Filter("channels", "=", query.Channels); Filter("availability", "=", query.Availability is { } a ? (int)a : null);
         Filter("completeness", "=", query.Completeness is { } c ? (int)c : null);
         if (query.MinimumDuration is { } min) { command.CommandText += " AND duration >= $minimum"; command.Parameters.AddWithValue("$minimum", min); }
         if (query.MaximumDuration is { } max) { command.CommandText += " AND duration <= $maximum"; command.Parameters.AddWithValue("$maximum", max); }
         return command;
     }
-    public void Dispose() { lock (gate) { Checkpoint(); connection.Dispose(); } }
+    public void Dispose() { DisposeTextureProjectionReaders(); DisposeCharacterReadConnection(); lock (gate) { Checkpoint(); connection.Dispose(); } }
 }

@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using Deviant.Assets;
 using Deviant.Browser;
+using Deviant.Catalog;
 using Deviant.Export.Localization;
 using Deviant.Formats.Localization;
 using Deviant.Formats.Localization.Model;
@@ -164,8 +165,13 @@ public sealed class LocalizationReaderTests
             await session.DisposeAsync();
             using (var cached = Deviant.Catalog.FeatureStore.Open(snapshot, fixture.CachePath))
             {
-                Assert.NotNull(cached.Load<JsonDocument>("localization.ready", LocalizationSchema.AssetIndexVersion));
-                Assert.Equal(24, cached.Count(new Deviant.Assets.AssetQuery(Family: LocalizationSchema.AssetFamily)));
+                using var generation = cached.OpenLocalizationGeneration<LocalizationGenerationHead>(
+                    LocalizationCacheContract.RecordStoreVersion, LocalizationCacheContract.SearchProjectionVersion,
+                    HeadIdentity, head => head.IndexContentId == snapshot.IndexContentId);
+                Assert.NotNull(generation);
+                Assert.Equal(24, generation!.Head.RecordCount);
+                Assert.Equal(24, cached.QueryLocalizationPage<LocalizationGenerationHead, LocalizationRecord>(
+                    generation, new AssetQuery(Family: LocalizationSchema.AssetFamily, Limit: 1)).Total);
             }
             await using var warmed = await LocalizationSession.OpenAsync(snapshot, fixture.CachePath);
             Assert.True(warmed.IsEnrichmentComplete);
@@ -174,6 +180,10 @@ public sealed class LocalizationReaderTests
         }
         finally { if (Directory.Exists(outputRoot)) Directory.Delete(outputRoot, recursive: true); if (Directory.Exists(fixture.CachePath)) Directory.Delete(fixture.CachePath, recursive: true); }
     }
+
+    private static LocalizationGenerationIdentity HeadIdentity(LocalizationGenerationHead head) => new(
+        head.InputSnapshotId, head.ParsedResultId, head.RecordStoreVersion, head.SearchProjectionVersion,
+        head.JsonPolicyVersion, head.RecordCount);
 
     [Fact]
     public async Task UnresolvedPointersAreFilterableAsMissingAssets()

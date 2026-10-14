@@ -27,6 +27,9 @@ struct PSInput
     float4 wp : POSITION1;
 	float4 sp : TEXCOORD1;
 	float2 t : TEXCOORD0; // tex coord
+    float2 uv1 : TEXCOORD2;
+    float2 uv2 : TEXCOORD3;
+    float2 uv3 : TEXCOORD4;
 	float3 t1 : TANGENT; // tangent
 	float3 t2 : BINORMAL; // bi-tangent
 	float4 c : COLOR; // solid color (for debug)

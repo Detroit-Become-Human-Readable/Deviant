@@ -25,10 +25,11 @@ public sealed class LocalizationProjectionTests
         var query=new LocalizationQuery(Language:"ENG",Sort:AssetSort.Name,Descending:true,Offset:5,Limit:4);
         var before=await session.QueryAsync(query);
         var cacheKey=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(IndexLayout.ParserVersion+"\n"+SourceIdentity.IndexCacheKey(snapshot.IndexContentId)))).ToLowerInvariant();
+        var revision=SourceIdentity.DerivedCacheKey(snapshot.IndexContentId,snapshot.PhysicalSourceStamp);
         using(var database=new SqliteConnection(new SqliteConnectionStringBuilder{DataSource=Path.Combine(fixture.CachePath,"catalog-"+cacheKey+".sqlite3"),Pooling=false}.ToString()))
         {
-            database.Open();using var command=database.CreateCommand();command.CommandText="UPDATE assets_v2 SET payload='not-json' WHERE family=$family";
-            command.Parameters.AddWithValue("$family",LocalizationSchema.AssetFamily);
+            database.Open();using var command=database.CreateCommand();command.CommandText="UPDATE localization_generation_rows SET payload='not-json' WHERE revision=$revision AND collection='search-assets' AND generation=(SELECT generation FROM localization_generation_active WHERE revision=$revision AND record_store_version=$version)";
+            command.Parameters.AddWithValue("$revision",revision);command.Parameters.AddWithValue("$version",LocalizationCacheContract.RecordStoreVersion);
             Assert.Equal(26,command.ExecuteNonQuery());
         }
         var after=await session.QueryAsync(query);

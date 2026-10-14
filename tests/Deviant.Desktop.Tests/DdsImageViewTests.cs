@@ -6,6 +6,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Deviant.Assets;
 using Deviant.Core;
+using Deviant.Formats.Textures;
 using Xunit;
 
 namespace Deviant.Desktop.Tests;
@@ -13,6 +14,22 @@ namespace Deviant.Desktop.Tests;
 [Collection("WPF")]
 public sealed class DdsImageViewTests
 {
+    [Fact]
+    public void NativePreviewChoosesASmallerMipAndRetainsTheHigherMipForExplicitSelection()
+    {
+        var bytes = new byte[148 + 2048 * 4 * 4 + 1024 * 2 * 4 + 512 * 1 * 4];
+        "DDS "u8.CopyTo(bytes);
+        Put(4, 124); Put(8, 0x2100F); Put(12, 4); Put(16, 2048); Put(20, 2048 * 4); Put(28, 3);
+        Put(76, 32); Put(80, 4); "DX10"u8.CopyTo(bytes.AsSpan(84)); Put(108, 0x401008);
+        Put(128, 28); Put(132, 3); Put(140, 1);
+        var document = new DdsTextureReader().Read(bytes);
+        Assert.Equal(1, NativeTextureView.SelectPreviewMip(document));
+        Assert.Equal(3, document.Info.MipCount);
+        Assert.Equal(2048, document.MipLevels[0].Width);
+        Assert.Equal(0, NativeTextureView.SelectPreviewMip(document, maximumEdge: 2048));
+        void Put(int offset, uint value) => BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset, 4), value);
+    }
+
     [Fact]
     public void RendersRgbaAndRejectsChangedBytesWithRetainedLengthAndWriteTime()
     {

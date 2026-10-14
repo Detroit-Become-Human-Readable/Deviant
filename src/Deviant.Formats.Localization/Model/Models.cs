@@ -11,10 +11,8 @@ public static class LocalizationSchema
 {
     public const string AssetFamily = "localization.record";
     public const string ItemCollection = "localization.records";
-    public const string ReaderVersion = "localization-v1";
-    public static string CacheVersion => ReaderVersion + ":" +
-        typeof(Deviant.Formats.Localization.LocalizationSnapshotReader).Assembly.ManifestModule.ModuleVersionId;
-    public static string AssetIndexVersion => CacheVersion + ":asset-index-v2";
+    public static string CacheVersion => LocalizationCacheContract.RecordStoreVersion;
+    public static string AssetIndexVersion => LocalizationCacheContract.SearchProjectionVersion;
 }
 
 public sealed record LocalizationExtent(string Field, string RelativeSource, long Offset, long Length);

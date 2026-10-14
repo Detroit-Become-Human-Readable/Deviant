@@ -1,4 +1,5 @@
 using System.IO;
+using System.Collections.Concurrent;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -8,6 +9,7 @@ using Deviant.Assets;
 using Deviant.Browser;
 using Deviant.Catalog;
 using Deviant.Core;
+using Deviant.Formats.Textures;
 using Xunit;
 
 namespace Deviant.Desktop.Tests;
@@ -15,6 +17,162 @@ namespace Deviant.Desktop.Tests;
 [Collection("WPF")]
 public sealed class TextureExplorerViewTests
 {
+    [Fact]
+    public void InitialPagePublishesBeforeFilterOptionsAreRead() => Run((view, catalog) =>
+    {
+        Assert.NotEmpty(view.CurrentResources);
+    }, beforeLoad: (view, catalog) => catalog.FilterQuery = () =>
+    {
+        view.Dispatcher.Invoke(() => Assert.NotEmpty(view.CurrentResources));
+        return new([new(4, 2)], ["BGRA8"], ["Diffuse"], []);
+    });
+
+    [Fact]
+    public void FilterQueriesRunOutsideTheDispatcher() => Run((view, catalog) =>
+    {
+        Pump(view.ApplyFilterAsync(new Dictionary<string, string>()));
+        Assert.NotEmpty(view.CurrentResources);
+    }, beforeLoad: (view, catalog) => catalog.FilterQuery = () =>
+    {
+        Assert.False(view.Dispatcher.CheckAccess());
+        return new([new(4, 2)], ["BGRA8"], ["Diffuse"], []);
+    });
+
+    [Fact]
+    public void MetadataListingDoesNotReadNativePixelsUntilThumbnailsAreEnabled()
+    {
+        NativeReadObserver? observer = null; IDisposable? subscription = null;
+        try
+        {
+            Run((view, catalog) =>
+            {
+                var readsObserver = observer!;
+                Assert.False(view.ThumbnailsEnabled);
+                Assert.NotEmpty(view.CurrentResources);
+                Assert.Empty(readsObserver.Reads);
+                Pump(view.RefreshAsync());
+                catalog.Replace(catalog.Entries[0] with { Label = "Updated metadata" });
+                Pump(WaitUntilAsync(() => view.CurrentResources.Any(card => card.Label == "Updated metadata")));
+                Assert.Empty(readsObserver.Reads);
+                Assert.Null(view.NativeImageBrowser.CurrentSource);
+                view.ThumbnailsEnabled = true;
+                Pump(WaitUntilAsync(() => readsObserver.Reads.Count > 0));
+                Pump(WaitUntilAsync(() => Field<Dictionary<ResourceIdentity, BitmapSource>>(view, "nativeThumbnails").Count > 0));
+                view.ThumbnailsEnabled = false;
+                Pump(WaitUntilAsync(() => Field<HashSet<Task>>(view, "operations").Count == 0));
+                Assert.Empty(Field<Dictionary<ResourceIdentity, BitmapSource>>(view, "nativeThumbnails"));
+                var reads = readsObserver.Reads.Count;
+                Pump(view.RefreshAsync());
+                Assert.Equal(reads, readsObserver.Reads.Count);
+            }, beforeLoad: (_, catalog) =>
+            {
+                observer = new(catalog.Entries.Select(entry => entry.Identity.Key).ToHashSet(StringComparer.Ordinal));
+                subscription = AssetLoadDiagnostics.Listener.Subscribe(observer, name => name == AssetLoadDiagnostics.MeasurementName);
+            });
+        }
+        finally { subscription?.Dispose(); }
+    }
+
+    [Fact]
+    public void TurningThumbnailsOffDoesNotCancelAnAwaitingSelectedPreview() => Run((view, catalog) =>
+    {
+        var gate = Field<SemaphoreSlim>(view, "nativeGate");
+        Assert.True(gate.Wait(0));
+        try
+        {
+            view.ThumbnailsEnabled = true;
+            Pump(view.SelectResourceAsync(catalog.Entries[0].Identity));
+            Assert.Equal(TexturePreviewState.Loading, view.CurrentPreviewState);
+            view.ThumbnailsEnabled = false;
+        }
+        finally { gate.Release(); }
+        Pump(WaitUntilAsync(() => view.CurrentPreviewState == TexturePreviewState.Ready));
+        Assert.Equal(catalog.Entries[0].Identity, view.NativeImageBrowser.CurrentSource!.SelectedIdentity);
+        Assert.Empty(Field<Dictionary<ResourceIdentity, BitmapSource>>(view, "nativeThumbnails"));
+    });
+
+    [Fact]
+    public void NameUpdatesKeepValidThumbnailsWithoutNativePayloadReloads()
+    {
+        NativeReadObserver? observer = null; IDisposable? subscription = null;
+        try
+        {
+            Run((view, catalog) =>
+            {
+                var readsObserver = observer!;
+                view.ThumbnailsEnabled = true;
+                Pump(WaitUntilAsync(() => Field<Dictionary<ResourceIdentity, BitmapSource>>(view, "nativeThumbnails").Count == 3));
+                Pump(WaitUntilAsync(() => Field<HashSet<Task>>(view, "operations").Count == 0));
+                var thumbs = Field<Dictionary<ResourceIdentity, BitmapSource>>(view, "nativeThumbnails");
+                var first = catalog.Entries[0]; var bitmap = thumbs[first.Identity]; var reads = readsObserver.Reads.Count;
+                catalog.Replace(first with { Label = "Renamed metadata" });
+                Pump(WaitUntilAsync(() => view.CurrentResources.Any(card => card.Label == "Renamed metadata")));
+                Assert.Same(bitmap, thumbs[first.Identity]);
+                Assert.Equal(reads, readsObserver.Reads.Count);
+            }, beforeLoad: (_, catalog) =>
+            {
+                observer = new(catalog.Entries.Select(entry => entry.Identity.Key).ToHashSet(StringComparer.Ordinal));
+                subscription = AssetLoadDiagnostics.Listener.Subscribe(observer, name => name == AssetLoadDiagnostics.MeasurementName);
+            });
+        }
+        finally { subscription?.Dispose(); }
+    }
+
+    [Fact]
+    public void DefaultScopeAndResetKeepUnnamedImagesAheadOfLightingNames() => Run((view, catalog) =>
+    {
+        TextureDiscoveryQuery? captured = null;
+        catalog.QueryOverride = (query, token) => { captured = query; return Task.FromResult(catalog.Page(query, token)); };
+        Pump(view.RefreshAsync());
+        Assert.Equal(TextureKindFilter.Images, captured!.Kind);
+        Assert.False(captured.SortByName);
+        Assert.False(captured.IncludeLodBuffers);
+        Pump(view.ApplyFilterAsync(new Dictionary<string, string> { ["kind"] = "1", ["sort"] = "0" }));
+        Assert.Equal(TextureKindFilter.Lighting, captured!.Kind);
+        Assert.True(captured.NamedFirst);
+        Assert.Equal("1", view.CaptureFilter()["kind"]);
+        Pump(view.ApplyFilterAsync(new Dictionary<string, string> { ["kind"] = "2" }));
+        Assert.Equal(TextureKindFilter.All, captured!.Kind);
+        Assert.True(captured.IncludeLodBuffers);
+        Invoke(view, "Reset_Click", view, new RoutedEventArgs());
+        Pump(WaitUntilAsync(() => captured!.Kind == TextureKindFilter.Images && !captured.SortByName));
+    });
+
+    [Fact]
+    public void SelectingACardRemovesItsOldThumbnailUntilTheDetailSourceIsReady() => Run((view, catalog) =>
+    {
+        Pump(WaitUntilAsync(() => Field<HashSet<Task>>(view, "operations").Count == 0));
+        var identity = catalog.Entries[0].Identity;
+        var thumbs = Field<Dictionary<ResourceIdentity, BitmapSource>>(view, "nativeThumbnails");
+        thumbs[identity] = BitmapSource.Create(1, 1, 96, 96, System.Windows.Media.PixelFormats.Bgra32, null, new byte[] { 0, 0, 255, 255 }, 4);
+        var gate = Field<SemaphoreSlim>(view, "nativeGate");
+        Assert.True(gate.Wait(0));
+        try
+        {
+            Pump(view.SelectResourceAsync(identity));
+            Assert.False(thumbs.ContainsKey(identity));
+            Assert.Equal(TexturePreviewState.Loading, view.CurrentPreviewState);
+        }
+        finally { gate.Release(); }
+        Pump(WaitUntilAsync(() => view.CurrentPreviewState == TexturePreviewState.Ready));
+        view.CancelWork();
+        Assert.Equal(TexturePreviewState.Cancelled, view.CurrentPreviewState);
+        Assert.Empty(thumbs);
+    });
+
+    [Fact]
+    public void FailedConversionDoesNotRepublishAnOldThumbnailForTheSelectedCard() => Run((view, catalog) =>
+    {
+        var identity = catalog.Entries[0].Identity;
+        var thumbs = Field<Dictionary<ResourceIdentity, BitmapSource>>(view, "nativeThumbnails");
+        thumbs[identity] = BitmapSource.Create(1, 1, 96, 96, System.Windows.Media.PixelFormats.Bgra32, null, new byte[] { 0, 0, 255, 255 }, 4);
+        Pump(view.SelectResourceAsync(identity));
+        Pump(WaitUntilAsync(() => view.CurrentPreviewState == TexturePreviewState.Failed));
+        Assert.Equal("UnsupportedNativeTextureConversion", view.PreviewFailure!.Code);
+        Assert.False(thumbs.ContainsKey(identity));
+        Assert.Null(view.NativeImageBrowser.CurrentSource);
+    }, (source, token) => throw new TextureFormatException("UnsupportedNativeTextureConversion", "This texture conversion is unavailable."));
+
     [Theory]
     [InlineData("01234567-89ab-cdef-0123-456789abcdef_Room_Specular.dds", "Room_Specular.dds")]
     [InlineData("0123456789abcdef0123456789abcdef-Room.dds", "Room.dds")]
@@ -103,6 +261,7 @@ public sealed class TextureExplorerViewTests
     [Fact]
     public void CatalogUpdatesKeepSelectionAndAliasDraftAndResolvedLinksNavigate() => Run((view, catalog) =>
     {
+        view.ThumbnailsEnabled = true;
         var first = catalog.Entries[0]; Pump(view.SelectResourceAsync(first.Identity));
         Pump(WaitUntilAsync(() => view.NativeImageBrowser.CurrentSource?.SelectedIdentity == first.Identity));
         Pump(WaitUntilAsync(() => Field<Dictionary<ResourceIdentity, BitmapSource>>(view, "nativeThumbnails").Count == 3));
@@ -135,6 +294,7 @@ public sealed class TextureExplorerViewTests
     [Fact]
     public void RgbThumbnailsAndNativePreviewDrainBeforeResumeAndClear() => Run((view, catalog) =>
     {
+        view.ThumbnailsEnabled = true;
         var first = catalog.Entries[0]; Pump(view.SelectResourceAsync(first.Identity));
         Pump(WaitUntilAsync(() => view.NativeImageBrowser.CurrentSource?.SelectedIdentity == first.Identity));
         var channels = (ComboBox)view.NativeImageBrowser.ImageBrowser.FindName("Channels"); Assert.Equal("RGB", channels.SelectedItem);
@@ -171,7 +331,9 @@ public sealed class TextureExplorerViewTests
         Assert.Empty(Field<HashSet<Task>>(view, "operations"));
     });
 
-    private static void Run(Action<TextureExplorerView, TestCatalog> check) => WorkspaceCommitTests.Run((window, fixture) =>
+    private static void Run(Action<TextureExplorerView, TestCatalog> check,
+        Func<NativeTextureSource, CancellationToken, DdsTextureDocument>? reader = null,
+        Action<TextureExplorerView, TestCatalog>? beforeLoad = null) => WorkspaceCommitTests.Run((window, fixture) =>
     {
         NativeTextureFixture.WriteArchive(fixture.Index, zeroAlpha: true); Pump(window.OpenArchiveAsync(fixture.Index));
         var snapshot = window.CurrentSession!.Snapshot; var revision = new SourceRevision(snapshot.IndexContentId, snapshot.PhysicalSourceStamp);
@@ -183,7 +345,8 @@ public sealed class TextureExplorerViewTests
         try
         {
             host.Show(); Pump(catalogs.EnrichmentTask);
-            Pump(view.LoadAsync(discovery, native, new CacheManager(Path.Combine(fixture.Root, "texture-settings"), new(fixture.Cache)), (source, token) => new NativeTextureDecoder().Read(source, token)));
+            beforeLoad?.Invoke(view, discovery);
+            Pump(view.LoadAsync(discovery, native, new CacheManager(Path.Combine(fixture.Root, "texture-settings"), new(fixture.Cache)), reader ?? ((source, token) => new NativeTextureDecoder().Read(source, token))));
             Pump(Task.Delay(50)); check(view, discovery);
         }
         finally
@@ -191,6 +354,18 @@ public sealed class TextureExplorerViewTests
             Pump(view.DisposeAsync().AsTask()); host.Close(); Pump(native.DisposeAsync().AsTask()); Pump(catalogs.DisposeAsync().AsTask());
         }
     });
+
+    private sealed class NativeReadObserver(HashSet<string> keys) : IObserver<KeyValuePair<string, object?>>
+    {
+        public ConcurrentQueue<AssetLoadMeasurement> Reads { get; } = new();
+        public void OnNext(KeyValuePair<string, object?> item)
+        {
+            if (item.Value is AssetLoadMeasurement { Stage: "ArchiveRead", Key: not null } read && keys.Contains(read.Key))
+                Reads.Enqueue(read);
+        }
+        public void OnCompleted() { }
+        public void OnError(Exception error) { }
+    }
 
     private sealed class TestCatalog : ITextureDiscoveryCatalog
     {
@@ -209,7 +384,8 @@ public sealed class TextureExplorerViewTests
         public ArchiveSnapshot Snapshot { get; }
         public SourceRevision Revision { get; }
         public TextureDiscoveryEntry[] Entries { get; private set; }
-        public TextureDiscoveryFilterOptions FilterOptions => new([new(4, 2)], ["BGRA8"], ["Diffuse"], []);
+        public Func<TextureDiscoveryFilterOptions>? FilterQuery { get; set; }
+        public TextureDiscoveryFilterOptions FilterOptions => FilterQuery?.Invoke() ?? new([new(4, 2)], ["BGRA8"], ["Diffuse"], []);
         public TextureNamingCoverage Coverage => new(Entries.Length, Entries.Length, Entries.Length, 0, 0, 0, Entries.Count(entry => entry.Alias is not null), 0, 1, 1, false, ["Synthetic metadata"], []);
         public event EventHandler? Updated;
         public Func<TextureDiscoveryQuery, CancellationToken, Task<TextureDiscoveryPage>>? QueryOverride { get; set; }

@@ -32,6 +32,7 @@ public partial class BufferInspectionView : UserControl, IAsyncDisposable
 
     public BufferInspectionView() => InitializeComponent();
     public event EventHandler? SelectedResourceChanged;
+    public event EventHandler? CancellationRequested;
     public DecodeResult<BufferInspectionDocument>? CurrentInspection => inspection;
     public ResourceIdentity? SelectedIdentity => inspection?.Identity;
     public string? SelectedLabel => inspection is null ? null : SourceName.Text;
@@ -232,7 +233,7 @@ public partial class BufferInspectionView : UserControl, IAsyncDisposable
     private static bool IsDigest(string? value) => value is { Length: 64 } && value.All(Uri.IsHexDigit);
     private Task Track(Task task) { operations.Add(task); _ = ObserveAsync(task); return task; }
     private async Task ObserveAsync(Task task) { try { await task; } catch (Exception) { } finally { operations.Remove(task); } }
-    private void Cancel_Click(object sender, RoutedEventArgs e) { loadCancellation?.Cancel(); pageCancellation?.Cancel(); jobCancellation?.Cancel(); navigationCancellation?.Cancel(); }
+    private void Cancel_Click(object sender, RoutedEventArgs e) => CancelActivity();
     private void Reset()
     {
         snapshot = null; inspection = null; byteOffset = 0; updating = true;
@@ -247,3 +248,4 @@ public partial class BufferInspectionView : UserControl, IAsyncDisposable
     }
     public async ValueTask DisposeAsync() { lifetime.Cancel(); await ClearAsync(); }
 }
+

@@ -11,6 +11,49 @@ public sealed class DdsTextureReaderTests
     private readonly DdsTextureReader reader = new();
     private readonly DdsTextureDecoder decoder = new();
 
+    [Fact]
+    public void OwnedBufferTransferPreservesValidationAndPixelProvenance()
+    {
+        var source = TextureFixtureBuilder.CreateDx10(2, 1, 29, [1, 2, 3, 4, 250, 128, 64, 255]);
+        var copied = reader.Read(source);
+        var transferred = reader.TakeOwnership(source);
+        Assert.Equal(copied.ContentSha256, transferred.ContentSha256);
+        Assert.Equal(copied.Info, transferred.Info);
+        Assert.True(System.Runtime.InteropServices.MemoryMarshal.TryGetArray(transferred.OriginalBytes, out var owned));
+        Assert.Same(source, owned.Array);
+        Assert.Equal(decoder.ViewRgbaSubresource(copied, copied.DefaultSelection).Rgba8.ToArray(),
+            decoder.ViewRgbaSubresource(transferred, transferred.DefaultSelection).Rgba8.ToArray());
+        Assert.Throws<TextureFormatException>(() => reader.TakeOwnership(new byte[32]));
+    }
+
+    [Theory]
+    [InlineData(28u)]
+    [InlineData(29u)]
+    public void RgbaViewSharesOnlyTheOwnedDocumentBytesAndMatchesPixelConversion(uint format)
+    {
+        byte[] pixels = [1, 2, 3, 4, 250, 128, 64, 255];
+        var source = TextureFixtureBuilder.CreateDx10(2, 1, format, pixels);
+        var document = reader.Read(source);
+        Array.Fill(source, (byte)0);
+        var view = decoder.ViewRgbaSubresource(document, document.DefaultSelection);
+        Assert.Equal(pixels, view.Rgba8.ToArray());
+        Assert.Equal(decoder.DecodeMip(document).Rgba8.ToArray(), view.Rgba8.ToArray());
+        Assert.Equal(format == 29, view.IsSrgb);
+        Assert.True(System.Runtime.InteropServices.MemoryMarshal.TryGetArray(document.OriginalBytes, out var owned));
+        Assert.True(System.Runtime.InteropServices.MemoryMarshal.TryGetArray(view.Rgba8, out var viewed));
+        Assert.Same(owned.Array, viewed.Array); Assert.NotSame(source, viewed.Array);
+        Assert.Equal(document.Subresources[0].SourceOffset, viewed.Offset);
+        using var cancel = new CancellationTokenSource(); cancel.Cancel();
+        Assert.Throws<OperationCanceledException>(() => decoder.ViewRgbaSubresource(document, document.DefaultSelection, cancel.Token));
+    }
+
+    [Fact]
+    public void RgbaViewRejectsFormatsThatNeedConversion()
+    {
+        var document = reader.Read(TextureFixtureBuilder.CreateDx10(1, 1, 87, [1, 2, 3, 4]));
+        Assert.Throws<TextureFormatException>(() => decoder.ViewRgbaSubresource(document, document.DefaultSelection));
+    }
+
     [Theory]
     [InlineData(0u, 0)]
     [InlineData(1u, 0)]

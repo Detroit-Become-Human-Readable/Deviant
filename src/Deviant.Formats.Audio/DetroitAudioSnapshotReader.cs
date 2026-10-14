@@ -10,13 +10,14 @@ using ResourceIdentity = Deviant.Assets.ResourceIdentity;
 namespace Deviant.Formats.Audio;
 
 /// <summary>Reads the managed, metadata-only view of Detroit: Become Human PC audio resources.</summary>
-public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revisionProvider = null)
+public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? revisionProvider = null)
 {
+    public const int EventMediaVersion = 2;
     private const int MaximumWrapperBytes = 16 * 1024 * 1024;
     private const int MaximumProbeBytes = 4 * 1024;
     private const uint WwiseVorbisPluginId = 0x00040001;
     private const byte LanguageSpecificSourceFlag = 1;
-    private static readonly HashSet<uint> AudioResourceTypes = [29, 1016, 1022, 1023, 1031, 1033, 4091];
+    private static readonly HashSet<uint> AudioResourceTypes = [29, 65, 1016, 1022, 1023, 1031, 1033, 4091];
     private static readonly byte[] BankContainerMagic = Encoding.ASCII.GetBytes("CSNDBKDT");
     private static readonly byte[] DialogueMagic = Encoding.ASCII.GetBytes("CSNDDATA");
     private static readonly byte[] EventMagic = Encoding.ASCII.GetBytes("CSNDEVNT");
@@ -94,7 +95,19 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
         using (var archive = new PackageReader(snapshot, revisionProvider))
             await PopulateCatalogAsync(catalog, archive, progress, () => ValidateSnapshotSources(snapshot), cancellationToken).ConfigureAwait(false);
         ValidateSnapshotSources(snapshot);
-        progress?.Report(new AudioReadProgress("Audio ready", catalog.Media.Count, catalog.Media.Count, Snapshot: CreateSnapshot(catalog)));
+        if (progress is not null)
+        {
+            var changedMedia = catalog.Media.ToArray();
+            var changedKeys = changedMedia.Select(media => media.Identity).Where(identity => identity is not null)
+                .Select(identity => identity!.Key).ToHashSet(StringComparer.Ordinal);
+            var changedCopies = new List<MediaEntry>(changedMedia.Length);
+            var finalSnapshot = CreateSnapshot(catalog, changedMediaKeys: changedKeys, changedMediaCopies: changedCopies);
+            progress.Report(new AudioReadProgress("Audio ready", catalog.Media.Count, catalog.Media.Count,
+                Snapshot: finalSnapshot)
+            { ChangedMediaIdentities = changedMedia
+                    .Select(media => media.Identity).Where(identity => identity is not null).Select(identity => identity!)
+                    .Distinct().ToArray(), ChangedMedia = changedCopies });
+        }
         return new(catalog, catalog.Diagnostics.AsReadOnly());
     }
 
@@ -164,10 +177,14 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
             .ToDictionary(group => group.Key, group => group.Count());
         var eventIndex = 0;
         var completed = 0;
+        var preclassifiedBankKeys = new HashSet<string>(StringComparer.Ordinal);
+        List<MediaEntry>? pendingBankMedia = progress is null ? null : [];
 
         foreach (var descriptor in bankDescriptors)
         {
             token.ThrowIfCancellationRequested();
+            var firstBankMediaIndex = catalog.Media.Count;
+            var firstBankDeclarationIndex = catalog.SourceDeclarations.Count;
             using var metadataReadScope = archive.BeginMetadataReadScope(descriptor.Identity!, "descriptor", bankScope: true);
             try
             {
@@ -217,6 +234,14 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
                 var bankKey = descriptor.Key;
                 var dataSlice = new DataSlice(container.Slice.FilePath, checked(container.Slice.Offset + bankOffset), bankLength);
                 var bank = ParseBankFromSlice(bankKey, name, actualId, dataSlice, descriptor.Identity!, container.Identity!, bankNameById, catalog, archive);
+                var localDeclarations = catalog.SourceDeclarations.Skip(firstBankDeclarationIndex)
+                    .GroupBy(source => source.Declaration.Id)
+                    .ToDictionary(group => group.Key, group => group.ToArray());
+                var localEmbeddedMedia = catalog.Media.Skip(firstBankMediaIndex)
+                    .Where(media => media.BankKey == bank.Key && !media.Key.Contains(":source:", StringComparison.Ordinal)).ToArray();
+                ClassifyEmbeddedMediaForBank(bank, localEmbeddedMedia,
+                    mediaId => localDeclarations.GetValueOrDefault(mediaId, []));
+                preclassifiedBankKeys.Add(bank.Key);
                 archive.AttachToCurrentMetadataReadScope(bank);
                 foreach (var media in catalog.Media.Where(item => item.BankKey == bank.Key))
                     archive.AttachToCurrentMetadataReadScope(media);
@@ -228,15 +253,18 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
                         catalog.Names[evidenceIndex] = catalog.Names[evidenceIndex] with { Kind = NameKind.Verified, Confidence = "High", HashMethod = "FNV-1 lower UTF-8" };
                 }
                 EnrichEventsFromBank(catalog, bank, namedEvents);
-                bank.Objects.Clear();
                 catalog.Banks.Add(bank);
+                if (pendingBankMedia is not null)
+                    pendingBankMedia.AddRange(catalog.Media.Skip(firstBankMediaIndex));
                 completed++;
 
                 if (completed == 1 || completed % 32 == 0 || completed == bankDescriptors.Count)
                 {
                     ensureSourceRevision();
                     metadataReadScope.Dispose();
-                    PublishSnapshot(progress, catalog, "Reading banks", completed, bankDescriptors.Count, bankName);
+                    PublishSnapshot(progress, catalog, "Reading banks", completed, bankDescriptors.Count, bankName,
+                        pendingBankMedia);
+                    pendingBankMedia?.Clear();
                 }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -291,6 +319,9 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
 
         // The 4091 COM_CONT records are the authoritative bridge from named dialogue headers to
         // their type-1033 audio resources and type-1031 dialogue-event resources.
+        if (headerRecords.Count > MaximumDialogueHeaders) throw new ArchiveException("DialogueHeaderLimit", "The archive contains too many dialogue headers.");
+        var audioTargets = DialogueTargets(audioResources);
+        var eventTargets = DialogueTargets(eventRecords.Where(row => row.Type == 1031));
         var audioToDialogue = new Dictionary<uint, List<(uint EventId, string HeaderName, ResourceRecord Header)>>();
         foreach (var header in headerRecords)
         {
@@ -299,10 +330,21 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
             if (!archive.TryReadResource(header, MaximumWrapperBytes, out var bytes) || !TryParseComContainer(bytes, out var references))
             {
                 catalog.Diagnostics.Add(new Diagnostic("MalformedDialogueHeader", "The dialogue header did not contain a valid COM_CONT reference table.", header.Key));
+                if (header.Identity is { } malformedIdentity)
+                {
+                    var unresolved = new Deviant.Assets.ReferenceResolution(Deviant.Assets.ReferenceStatus.Unresolved, [], "The dialogue header reference table could not be read.");
+                    catalog.DialogueHeaderAssociations.Add(new(malformedIdentity, unresolved, unresolved,
+                        metadataReadScope?.ReadDigests.ToArray() ?? [], metadataReadScope?.CoverageComplete == true));
+                }
                 continue;
             }
             var audioIds = references.Where(reference => reference.Type == 1033).Select(reference => reference.Id).Distinct().ToArray();
             var eventIds = references.Where(reference => reference.Type == 1031).Select(reference => reference.Id).Distinct().ToArray();
+            if (header.Identity is { } headerIdentity)
+                catalog.DialogueHeaderAssociations.Add(new(headerIdentity,
+                    ResolveDialogueTargets(audioIds, audioTargets, "audio"),
+                    ResolveDialogueTargets(eventIds, eventTargets, "event"),
+                    metadataReadScope?.ReadDigests.ToArray() ?? [], metadataReadScope?.CoverageComplete == true));
             var headerName = string.Empty;
             if (audioIds.Length != 1 || eventIds.Length != 1)
             {
@@ -321,9 +363,11 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
                 relationshipReadBaselines[header.Key] = (metadataReadScope.ReadDigests, metadataReadScope.CoverageComplete);
         }
 
+        catalog.DialogueHeaderVersion = DialogueHeaderAssociationVersion;
         if (hasLocalizationResources)
             catalog.Diagnostics.Add(new Diagnostic("LocalizationDeferred", "Localization resources are retained for the dedicated localization reader and are not scanned during audio enrichment."));
         var audioIndex = 0;
+        List<MediaEntry>? pendingDialogueMedia = progress is null ? null : [];
         foreach (var resource in audioResources)
         {
             token.ThrowIfCancellationRequested();
@@ -371,11 +415,14 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
                     entry.MetadataReadDigests = merged ?? [];
                 }
                 catalog.Media.Add(entry);
+                pendingDialogueMedia?.Add(entry);
                 if (audioIndex == 1 || audioIndex % 4096 == 0 || audioIndex == audioResources.Count)
                 {
                     ensureSourceRevision();
                     metadataReadScope?.Dispose();
-                    PublishSnapshot(progress, catalog, "Reading dialogue media", audioIndex, audioResources.Count, entry.DisplayName);
+                    PublishSnapshot(progress, catalog, "Reading dialogue media", audioIndex, audioResources.Count,
+                        entry.DisplayName, pendingDialogueMedia);
+                    pendingDialogueMedia?.Clear();
                 }
                 else if (audioIndex % 512 == 0)
                     progress?.Report(new AudioReadProgress("Reading dialogue media", audioIndex, audioResources.Count, entry.DisplayName));
@@ -387,12 +434,69 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
         }
 
         RecoverExecutableNames(catalog, token, progress);
-        ResolveAllBankMedia(catalog, token, progress, ensureSourceRevision);
+        ResolveAllBankMedia(catalog, token, progress, ensureSourceRevision, preclassifiedBankKeys);
+        ReadMidiResources(catalog, archive, progress, ensureSourceRevision, token);
+        RetainEventMediaLinks(catalog, token);
         if (catalog.Banks.Any(bank => bank.IndexedObjectCount > 0))
             catalog.Diagnostics.Add(new Diagnostic("EventGraphDeferred", "HIRC playback graphs are loaded on demand for a selected bank."));
 
         MarkNameCollisions(catalog);
         await Task.CompletedTask.ConfigureAwait(false);
+    }
+
+    /// <summary>Rebuilds event links from cached bank extents and their verified metadata.</summary>
+    public async Task<AudioSnapshotResult> ReadCachedEventLinksAsync(ArchiveSnapshot snapshot, AudioCatalog cached,
+        IProgress<AudioReadProgress>? progress = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentNullException.ThrowIfNull(cached);
+        if (cached.IndexContentId != snapshot.IndexContentId || cached.PhysicalSourceStamp != snapshot.PhysicalSourceStamp)
+            throw new ArchiveException("InvalidIdentity", "The cached audio catalog belongs to another archive revision.");
+        ValidateSnapshotSources(snapshot);
+        var catalog = CreateSnapshot(cached, copyMediaMetadata: false);
+        if (cached.EventMediaVersion >= 1)
+        {
+            AudioEventNameRecovery.Apply(catalog, cancellationToken);
+            AudioMediaNaming.Apply(catalog, cancellationToken);
+            MarkNameCollisions(catalog);
+            catalog.EventMediaVersion = EventMediaVersion;
+            ValidateSnapshotSources(snapshot);
+            return new(catalog, catalog.Diagnostics.AsReadOnly());
+        }
+        var verifier = new AudioMetadataVerifier(snapshot, revisionProvider);
+        using var archive = new PackageReader(snapshot, revisionProvider);
+        var completed = 0;
+        foreach (var bank in catalog.Banks)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var chunks = bank.Chunks.Where(chunk => chunk.Tag == "HIRC").ToArray();
+            if (bank.Version is 118 or 120 && chunks.Length == 1 && chunks[0].Slice.Length <= MaximumWrapperBytes)
+            {
+                var hirc = chunks[0].Slice;
+                if (bank.Identity is null || !StringComparer.OrdinalIgnoreCase.Equals(hirc.FilePath, bank.Slice.FilePath) ||
+                    hirc.Offset < bank.Slice.Offset || hirc.Length < 0 ||
+                    !IndexLayout.InBounds(hirc.Offset - bank.Slice.Offset, hirc.Length, bank.Slice.Length))
+                    throw new ArchiveException("InvalidRange", "The cached bank metadata is outside its bank payload.");
+                await verifier.VerifyBankAsync(bank, cancellationToken).ConfigureAwait(false);
+                var offset = hirc.Offset;
+                var bytes = archive.ReadAt(bank.Slice.FilePath, offset, checked((int)hirc.Length), "HIRC");
+                ParseHirc(bank, bytes, new AudioCatalog(), offset);
+            }
+            progress?.Report(new AudioReadProgress("Updating audio names", ++completed, catalog.Banks.Count, bank.Name));
+        }
+        RetainEventMediaLinks(catalog, cancellationToken);
+        MarkNameCollisions(catalog);
+        ValidateSnapshotSources(snapshot);
+        return new(catalog, catalog.Diagnostics.AsReadOnly());
+    }
+
+    private static void RetainEventMediaLinks(AudioCatalog catalog, CancellationToken token)
+    {
+        CatalogRelationships.Build(catalog, token);
+        AudioEventNameRecovery.Apply(catalog, token);
+        AudioMediaNaming.Apply(catalog, token);
+        foreach (var bank in catalog.Banks) bank.Objects.Clear();
+        catalog.EventMediaVersion = EventMediaVersion;
     }
 
     private static bool TryParseComContainer(ReadOnlySpan<byte> bytes, out List<ResourceReference> references)
@@ -981,28 +1085,14 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
         }
     }
 
-    private static void ResolveAllBankMedia(AudioCatalog catalog, CancellationToken token,
-        IProgress<AudioReadProgress>? progress, Action ensureSourceRevision)
+    private static void ClassifyEmbeddedMediaForBank(BankInfo bank, IReadOnlyList<MediaEntry> entries,
+        Func<uint, IReadOnlyList<MediaSourceEvidence>> sourceEvidenceForId)
     {
-        var mediaByBankAndId = catalog.Media.Where(item => !item.Key.Contains(":source:", StringComparison.Ordinal))
-            .GroupBy(item => (BankKey: item.BankKey, Id: item.Id)).ToDictionary(group => group.Key, group => group.ToArray());
-        var mediaById = catalog.Media.GroupBy(item => item.Id).ToDictionary(group => group.Key, group => group.ToArray());
-        var mediaByBank = mediaByBankAndId.GroupBy(pair => pair.Key.BankKey)
-            .ToDictionary(group => group.Key, group => group.SelectMany(pair => pair.Value).ToArray());
-        var declarationsByBankAndId = catalog.SourceDeclarations
-            .Select(source => (BankKey: source.BankKey, Source: source))
-            .GroupBy(item => (BankKey: item.BankKey, Id: item.Source.Declaration.Id))
-            .ToDictionary(group => group.Key, group => group.Select(item => item.Source).ToArray());
-        var declarationsByBank = declarationsByBankAndId.GroupBy(pair => pair.Key.BankKey)
-            .ToDictionary(group => group.Key, group => group.Select(pair => (Id: pair.Key.Id, Evidence: pair.Value)).ToArray());
-        // All embedded occurrences must be classified before any is offered as a full stream.
-        var embeddedBanksCompleted = 0;
-        foreach (var bank in catalog.Banks)
+        foreach (var entry in entries)
         {
-            token.ThrowIfCancellationRequested();
-            foreach (var entry in mediaByBank.GetValueOrDefault(bank.Key, []))
+            var evidence = sourceEvidenceForId(entry.Id);
+            try
             {
-                var evidence = declarationsByBankAndId.GetValueOrDefault((bank.Key, entry.Id), []);
                 entry.SourceEvidence.AddRange(evidence);
                 entry.Completeness = MediaCompleteness.Unverified;
                 if (entry.Slice.Length == 0) { entry.Availability = SourceAvailability.Missing; continue; }
@@ -1035,14 +1125,54 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
                 if (streamModes.Length > 1)
                 {
                     entry.ResolutionDetails += " Conflicting stream declarations were retained.";
-                    bank.Diagnostics.Add(new("ConflictingSourceDeclarations", $"Media {entry.Id} has conflicting source storage declarations.", entry.Key));
+                    bank.Diagnostics.Add(new("ConflictingSourceDeclarations", $"Media {entry.Id} has conflicting stream declarations.", entry.Key));
                 }
+            }
+            finally { entry.SourceDeclarationProcessingComplete = true; }
+        }
+    }
+
+    private static void ResolveAllBankMedia(AudioCatalog catalog, CancellationToken token,
+        IProgress<AudioReadProgress>? progress, Action ensureSourceRevision, IReadOnlySet<string> preclassifiedBankKeys)
+    {
+        var mediaByBankAndId = catalog.Media.Where(item => !item.Key.Contains(":source:", StringComparison.Ordinal))
+            .GroupBy(item => (BankKey: item.BankKey, Id: item.Id)).ToDictionary(group => group.Key, group => group.ToArray());
+        var mediaById = catalog.Media.GroupBy(item => item.Id).ToDictionary(group => group.Key, group => group.ToArray());
+        var mediaByBank = mediaByBankAndId.GroupBy(pair => pair.Key.BankKey)
+            .ToDictionary(group => group.Key, group => group.SelectMany(pair => pair.Value).ToArray());
+        var declarationsByBankAndId = catalog.SourceDeclarations
+            .Select(source => (BankKey: source.BankKey, Source: source))
+            .GroupBy(item => (BankKey: item.BankKey, Id: item.Source.Declaration.Id))
+            .ToDictionary(group => group.Key, group => group.Select(item => item.Source).ToArray());
+        var declarationsByBank = declarationsByBankAndId.GroupBy(pair => pair.Key.BankKey)
+            .ToDictionary(group => group.Key, group => group.Select(pair => (Id: pair.Key.Id, Evidence: pair.Value)).ToArray());
+        // All embedded occurrences must be classified before any is offered as a full stream.
+        var embeddedBanksCompleted = 0;
+        List<MediaEntry>? pendingClassificationMedia = progress is null ? null : [];
+        foreach (var bank in catalog.Banks)
+        {
+            token.ThrowIfCancellationRequested();
+            List<MediaEntry>? changedMedia = progress is null ? null : [];
+            var alreadyClassified = preclassifiedBankKeys.Contains(bank.Key);
+            var bankMedia = mediaByBank.GetValueOrDefault(bank.Key, []);
+            if (!alreadyClassified)
+            {
+                if (progress is not null) changedMedia!.AddRange(bankMedia.Where(entry => entry.Identity is not null));
+                ClassifyEmbeddedMediaForBank(bank, bankMedia,
+                    mediaId => declarationsByBankAndId.GetValueOrDefault((bank.Key, mediaId), []));
+                if (pendingClassificationMedia is not null) pendingClassificationMedia.AddRange(changedMedia!);
             }
             embeddedBanksCompleted++;
             if (embeddedBanksCompleted == 1 || embeddedBanksCompleted % 64 == 0 || embeddedBanksCompleted == catalog.Banks.Count)
             {
                 ensureSourceRevision();
-                PublishSnapshot(progress, catalog, "Classifying embedded media", embeddedBanksCompleted, catalog.Banks.Count, bank.Name);
+                if (alreadyClassified)
+                    progress?.Report(new AudioReadProgress("Classifying embedded media", embeddedBanksCompleted,
+                        catalog.Banks.Count, bank.Name));
+                else
+                    PublishSnapshot(progress, catalog, "Classifying embedded media", embeddedBanksCompleted,
+                        catalog.Banks.Count, bank.Name, pendingClassificationMedia);
+                if (!alreadyClassified) pendingClassificationMedia?.Clear();
             }
         }
         // A fixed set prevents newly synthesized resolutions from becoming candidates.
@@ -1051,9 +1181,11 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
         var independentById = independent.GroupBy(item => item.Id).ToDictionary(group => group.Key, group => group.ToArray());
         var comparisonCache = new ResolutionComparisonCache();
         var externalBanksCompleted = 0;
+        List<MediaEntry>? pendingExternalMedia = progress is null ? null : [];
         foreach (var bank in catalog.Banks)
         {
             token.ThrowIfCancellationRequested();
+            List<MediaEntry>? changedMedia = progress is null ? null : [];
             foreach (var (mediaId, group) in declarationsByBank.GetValueOrDefault(bank.Key, []))
             {
                 var declarations = group.Select(value => value.Declaration).Distinct().ToArray();
@@ -1151,6 +1283,8 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
                             resolvedFromRaw ? "Compatible media ID/language, supported non-streamed WEM declaration, exact declared size, SHA-256, and exact bytes; raw source records remain unverified"
                                 : "SHA-256, length, and exact bytes in compatible media ID/language context"));
                 catalog.Media.Add(entry);
+                if (entry.Identity is not null) changedMedia?.Add(entry);
+                if (entry.Identity is not null) pendingExternalMedia?.Add(entry);
                 if (selected is not null)
                 {
                     entry.Names.Add(new(selected.DisplayName, "ExternalMediaCandidate", source.Id, NameKind.Description, selected.Key, selected.Slice.Offset));
@@ -1162,7 +1296,9 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
             if (externalBanksCompleted == 1 || externalBanksCompleted % 64 == 0 || externalBanksCompleted == catalog.Banks.Count)
             {
                 ensureSourceRevision();
-                PublishSnapshot(progress, catalog, "Resolving bank media", externalBanksCompleted, catalog.Banks.Count, bank.Name);
+                PublishSnapshot(progress, catalog, "Resolving bank media", externalBanksCompleted, catalog.Banks.Count,
+                    bank.Name, pendingExternalMedia);
+                pendingExternalMedia?.Clear();
             }
         }
     }
@@ -1504,21 +1640,38 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
         }
     }
 
-    private static void PublishSnapshot(IProgress<AudioReadProgress>? progress, AudioCatalog catalog, string phase, int done, int total, string? detail)
+    private static void PublishSnapshot(IProgress<AudioReadProgress>? progress, AudioCatalog catalog, string phase,
+        int done, int total, string? detail, IReadOnlyList<MediaEntry>? changedMedia = null)
     {
         if (progress is null) return;
-        progress.Report(new AudioReadProgress(phase, done, total, detail, CreateSnapshot(catalog)));
+        var changedKeys = new HashSet<string>(StringComparer.Ordinal);
+        if (changedMedia is not null)
+            foreach (var media in changedMedia)
+                if (media.Identity is { } identity) changedKeys.Add(identity.Key);
+        var changedCopies = new List<MediaEntry>(changedMedia?.Count ?? 0);
+        var snapshot = CreateSnapshot(catalog, includeDialogueHeaderAssociations: false,
+            changedMediaKeys: changedKeys, changedMediaCopies: changedCopies);
+        var changedIdentities = changedMedia is null ? Array.Empty<ResourceIdentity>() : changedMedia
+            .Select(media => media.Identity).Where(identity => identity is not null).Select(identity => identity!)
+            .Distinct().ToArray();
+        progress.Report(new AudioReadProgress(phase, done, total, detail, snapshot)
+        { ChangedMediaIdentities = changedIdentities, ChangedMedia = changedCopies });
     }
 
-    private static AudioCatalog CreateSnapshot(AudioCatalog source)
+    private static AudioCatalog CreateSnapshot(AudioCatalog source, bool copyMediaMetadata = true,
+        bool includeDialogueHeaderAssociations = true, IReadOnlySet<string>? changedMediaKeys = null,
+        List<MediaEntry>? changedMediaCopies = null)
     {
         var snapshot = new AudioCatalog
             {
                 SourcePath = source.SourcePath, Fingerprint = source.Fingerprint, IndexContentId = source.IndexContentId,
                 PhysicalSourceStamp = source.PhysicalSourceStamp, SourceVolumes = source.SourceVolumes.ToList(),
                 IndexStamp = source.IndexStamp,
-                Resources = source.Resources.ToArray(), IndexedResourceCount = source.IndexedResourceCount
+                Resources = source.Resources.ToArray(), IndexedResourceCount = source.IndexedResourceCount,
+                EventMediaVersion = source.EventMediaVersion,
+                DialogueHeaderVersion = includeDialogueHeaderAssociations ? source.DialogueHeaderVersion : 0
             };
+        if (includeDialogueHeaderAssociations) snapshot.DialogueHeaderAssociations.AddRange(source.DialogueHeaderAssociations);
         snapshot.Diagnostics.AddRange(source.Diagnostics);
         snapshot.Names.AddRange(source.Names);
         snapshot.Localization.AddRange(source.Localization);
@@ -1532,22 +1685,6 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
             copy.Chunks.AddRange(bank.Chunks);
             copy.Diagnostics.AddRange(bank.Diagnostics);
             copy.AmbiguousObjectIds.UnionWith(bank.AmbiguousObjectIds);
-            foreach (var (id, value) in bank.Objects)
-            {
-                var obj = new BankObject
-                {
-                    Id = value.Id, Type = value.Type, Identity = value.Identity, BodySlice = value.BodySlice, ParentId = value.ParentId, TargetId = value.TargetId,
-                    TargetFlags = value.TargetFlags, TargetBankId = value.TargetBankId, StateGroupId = value.StateGroupId, StateValueId = value.StateValueId, SwitchGroupKind = value.SwitchGroupKind,
-                    SwitchGroupId = value.SwitchGroupId, DefaultSwitchId = value.DefaultSwitchId, ActionType = value.ActionType,
-                    VolumeDb = value.VolumeDb, PitchCents = value.PitchCents, DelaySeconds = value.DelaySeconds,
-                    Sequential = value.Sequential, LoopCount = value.LoopCount, Support = value.Support
-                };
-                obj.Children.AddRange(value.Children); obj.Actions.AddRange(value.Actions); obj.Sources.AddRange(value.Sources);
-                obj.OwnedChildren.AddRange(value.OwnedChildren);
-                obj.Clips.AddRange(value.Clips); obj.Markers.AddRange(value.Markers); obj.Branches.AddRange(value.Branches); obj.Limitations.AddRange(value.Limitations);
-                obj.DecisionPaths.AddRange(value.DecisionPaths.Select(path => path with { Values = path.Values.ToList() }));
-                copy.Objects.Add(id, obj);
-            }
             snapshot.Banks.Add(copy);
         }
         foreach (var media in source.Media)
@@ -1557,17 +1694,31 @@ public sealed class DetroitAudioSnapshotReader(ISourceRevisionProvider? revision
                 Key = media.Key, Identity = media.Identity, PayloadIdentity = media.PayloadIdentity, Id = media.Id, BankKey = media.BankKey, BankName = media.BankName, Name = media.Name,
                 DisplayLabel = media.DisplayLabel, RawLanguageId = media.RawLanguageId,
                 Language = media.Language, Category = media.Category, Codec = media.Codec, SampleRate = media.SampleRate,
-                Channels = media.Channels, Duration = media.Duration, MeasuredDuration = media.MeasuredDuration, Slice = media.Slice,
+                Channels = media.Channels, Duration = media.Duration, MeasuredDuration = media.MeasuredDuration, Slice = media.Slice, Midi = media.Midi,
                 OriginalSlice = media.OriginalSlice, DidxExtent = media.DidxExtent, State = media.State,
                 NameKind = media.NameKind, IsRiff = media.IsRiff, Subtitle = media.Subtitle,
                 MetadataReadCoverageComplete = media.MetadataReadCoverageComplete,
-                Completeness = media.Completeness, ContainerValidity = media.ContainerValidity, Availability = media.Availability, ResolutionDetails = media.ResolutionDetails
+                Completeness = media.Completeness, SourceDeclarationProcessingComplete = media.SourceDeclarationProcessingComplete,
+                ContainerValidity = media.ContainerValidity, Availability = media.Availability, ResolutionDetails = media.ResolutionDetails
             };
-            copy.MetadataReadDigests.AddRange(media.MetadataReadDigests);
-            copy.SourceEvidence.AddRange(media.SourceEvidence); copy.Aliases.AddRange(media.Aliases); copy.EventKeys.AddRange(media.EventKeys);
-            copy.Candidates.AddRange(media.Candidates); copy.CandidateRejections.AddRange(media.CandidateRejections);
-            copy.EquivalenceEvidence.AddRange(media.EquivalenceEvidence); copy.Names.AddRange(media.Names);
+            if (copyMediaMetadata)
+            {
+                copy.MetadataReadDigests.AddRange(media.MetadataReadDigests);
+                copy.SourceEvidence.AddRange(media.SourceEvidence);
+                copy.Candidates.AddRange(media.Candidates); copy.CandidateRejections.AddRange(media.CandidateRejections);
+                copy.EquivalenceEvidence.AddRange(media.EquivalenceEvidence);
+            }
+            else
+            {
+                copy.MetadataReadDigests = media.MetadataReadDigests;
+                copy.SourceEvidence = media.SourceEvidence;
+                copy.Candidates = media.Candidates; copy.CandidateRejections = media.CandidateRejections;
+                copy.EquivalenceEvidence = media.EquivalenceEvidence;
+            }
+            copy.Aliases.AddRange(media.Aliases); copy.EventKeys.AddRange(media.EventKeys); copy.Names.AddRange(media.Names);
             snapshot.Media.Add(copy);
+            if (changedMediaCopies is not null && copy.Identity is { } identity && changedMediaKeys?.Contains(identity.Key) == true)
+                changedMediaCopies.Add(copy);
         }
         foreach (var item in source.Events)
         {

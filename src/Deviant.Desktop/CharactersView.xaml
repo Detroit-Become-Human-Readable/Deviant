@@ -1,0 +1,200 @@
+<UserControl x:Class="Deviant.Desktop.CharactersView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:Deviant.Desktop"
+             Foreground="{DynamicResource WindowForeground}">
+    <UserControl.Resources>
+        <local:NameOriginLabelConverter x:Key="NameOriginLabel" />
+    </UserControl.Resources>
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <DockPanel Margin="0,0,0,12">
+            <TextBlock x:Name="BrowserHeading" Text="Characters" FontSize="20" FontWeight="SemiBold" />
+            <ComboBox x:Name="BrowserMode" Width="120" Margin="12,0,0,0" SelectedIndex="0" SelectionChanged="BrowserModeChanged">
+                <ComboBoxItem Content="Characters"/><ComboBoxItem Content="Models"/>
+            </ComboBox>
+            <ComboBox x:Name="BrowserSort" Width="145" Margin="6,0,0,0" SelectedIndex="0" SelectionChanged="BrowserModeChanged">
+                <ComboBoxItem Content="Name"/><ComboBoxItem Content="Most animations"/><ComboBoxItem Content="Fewest animations"/>
+            </ComboBox>
+            <Button x:Name="IndexMoreButton" Content="Refresh results" Margin="12,0,0,0" Visibility="Collapsed" Click="IndexMoreClicked" />
+            <Button x:Name="IndexCancelButton" Content="Cancel indexing" Margin="6,0,0,0" Visibility="Collapsed" Click="IndexCancelClicked" />
+            <TextBox x:Name="Search" Width="260" Height="32" Margin="12,0,0,0"
+                     HorizontalAlignment="Right" VerticalAlignment="Center"
+                     ToolTip="Search entries and names" AutomationProperties.Name="Search characters"
+                     TextChanged="SearchChanged" />
+        </DockPanel>
+
+        <Grid x:Name="ContentLayout" Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="1.3*" MinWidth="190" />
+                <ColumnDefinition Width="8" />
+                <ColumnDefinition Width="1.2*" MinWidth="190" />
+                <ColumnDefinition Width="8" />
+                <ColumnDefinition Width="1*" MinWidth="190" />
+            </Grid.ColumnDefinitions>
+
+            <DockPanel Grid.Column="0">
+                <TextBlock Text="Entries" DockPanel.Dock="Top" FontWeight="SemiBold" Margin="0,0,0,8" />
+                <ListView x:Name="Entries" SelectionChanged="EntrySelectionChanged"
+                          PreviewKeyDown="EntriesPreviewKeyDown"
+                          MouseDoubleClick="EntriesDoubleClick"
+                          VirtualizingPanel.IsVirtualizing="True"
+                          VirtualizingPanel.VirtualizationMode="Recycling"
+                          AutomationProperties.Name="Character entries">
+                    <ListView.View><GridView>
+                        <GridViewColumn Header="Name" Width="250">
+                            <GridViewColumn.CellTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis" ToolTip="{Binding Label}" />
+                                </DataTemplate>
+                            </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Availability" Width="105" DisplayMemberBinding="{Binding Availability}" />
+                        <GridViewColumn Header="Animations" Width="85" DisplayMemberBinding="{Binding AnimationCount}" />
+                    </GridView></ListView.View>
+                </ListView>
+            </DockPanel>
+
+            <GridSplitter x:Name="EntriesPreviewSplitter" Grid.Column="1" Width="8" HorizontalAlignment="Stretch"
+                          VerticalAlignment="Stretch" ResizeDirection="Columns"
+                          AutomationProperties.Name="Resize entries and preview" />
+
+            <DockPanel Grid.Column="2" Margin="10,0">
+                <DockPanel DockPanel.Dock="Top" Margin="0,0,0,8">
+                    <TextBlock Text="Preview" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <Button x:Name="PreviewButton" Content="Preview" HorizontalAlignment="Right"
+                            IsEnabled="False" Click="PreviewClicked" />
+                    <Button x:Name="CancelPreviewButton" Content="Cancel" HorizontalAlignment="Right"
+                            Visibility="Collapsed" Margin="6,0,0,0" Click="CancelPreviewClicked" />
+                </DockPanel>
+                <TextBlock x:Name="PreviewStatus" DockPanel.Dock="Bottom" Margin="0,8,0,0"
+                           TextWrapping="Wrap" />
+                <Border BorderBrush="{DynamicResource ControlBorder}" BorderThickness="1"
+                        Background="{DynamicResource SurfaceBackground}">
+                    <ContentControl x:Name="PreviewHost" MinWidth="160" MinHeight="160"
+                                    HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch">
+                        <TextBlock x:Name="PreviewPrompt" Text="Select an entry" HorizontalAlignment="Center"
+                                   VerticalAlignment="Center" TextWrapping="Wrap" Margin="12" />
+                    </ContentControl>
+                </Border>
+            </DockPanel>
+
+            <GridSplitter x:Name="PreviewDetailsSplitter" Grid.Column="3" Width="8" HorizontalAlignment="Stretch"
+                          VerticalAlignment="Stretch" ResizeDirection="Columns"
+                          AutomationProperties.Name="Resize preview and details" />
+
+            <ScrollViewer Grid.Column="4" Margin="10,0,0,0" VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled">
+            <StackPanel>
+                <TextBlock x:Name="SelectedName" Text="Select an entry" DockPanel.Dock="Top"
+                           FontSize="18" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Margin="0,0,0,8"
+                           ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+                <TextBlock x:Name="NameStatus" Visibility="Collapsed" Margin="0,0,0,8"
+                           TextWrapping="Wrap" AutomationProperties.Name="Selected name type" />
+                <StackPanel x:Name="VariantsPanel" Visibility="Collapsed" Margin="0,0,0,8">
+                    <TextBlock Text="Model variant" Margin="0,0,0,4"/>
+                    <ComboBox x:Name="CharacterVariants" DisplayMemberPath="Label" SelectionChanged="CharacterVariantChanged"/>
+                </StackPanel>
+                <StackPanel x:Name="ModelContextPanel" DockPanel.Dock="Top" Visibility="Collapsed" Margin="0,0,0,8">
+                    <TextBlock Text="Resource group" Margin="0,0,0,4" />
+                    <ComboBox x:Name="ModelContexts" DisplayMemberPath="Label" SelectionChanged="ModelContextChanged"
+                              AutomationProperties.Name="Model resource group" />
+                </StackPanel>
+                <TextBlock x:Name="BindingStatus" DockPanel.Dock="Top" TextWrapping="Wrap" Margin="0,0,0,8" />
+                <StackPanel x:Name="ModelChoicesPanel" DockPanel.Dock="Top" Visibility="Collapsed" Margin="0,0,0,8">
+                    <TextBlock Text="Detail" Margin="0,0,0,4" />
+                    <ComboBox x:Name="ModelChoices" DisplayMemberPath="Label" SelectionChanged="ModelChoiceChanged"
+                              AutomationProperties.Name="Model detail" />
+                </StackPanel>
+                <TextBox x:Name="Summary" IsReadOnly="True" TextWrapping="Wrap"
+                         VerticalScrollBarVisibility="Auto" BorderThickness="0" MaxHeight="96"
+                         Background="Transparent" VerticalContentAlignment="Top" />
+                <WrapPanel Margin="0,6,0,0">
+                    <Button x:Name="LoadPoseButton" Content="Load pose" Visibility="Collapsed"
+                            Margin="0,0,6,0" Click="LoadPoseClicked" />
+                    <Button x:Name="ExportFbxButton" Content="Export FBX" Visibility="Collapsed"
+                            Click="ExportFbxClicked" />
+                    <Button x:Name="CancelExportButton" Content="Cancel" Visibility="Collapsed"
+                            Margin="6,0,0,0" Click="CancelExportClicked" />
+                </WrapPanel>
+                <TextBlock x:Name="ExportStatus" TextWrapping="Wrap" Margin="0,4,0,0" />
+                <Expander x:Name="NamesExpander" Header="Names" Visibility="Collapsed" Margin="0,8,0,0"
+                          AutomationProperties.Name="Recorded model names">
+                    <ListBox x:Name="NamesList" MaxHeight="132" Margin="0,6,0,0"
+                             HorizontalContentAlignment="Stretch"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                             VirtualizingPanel.IsVirtualizing="True"
+                             VirtualizingPanel.VirtualizationMode="Recycling"
+                             AutomationProperties.Name="Recorded names and their types">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Margin="0,2">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="{Binding Text}" TextTrimming="CharacterEllipsis"
+                                               ToolTip="{Binding Text}" Margin="0,0,8,0" />
+                                    <TextBlock Grid.Column="1" Text="{Binding Origin, Converter={StaticResource NameOriginLabel}}" />
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </Expander>
+                <Expander x:Name="RigExpander" Header="Rig" DockPanel.Dock="Bottom" Margin="0,8,0,0"
+                          Expanded="RigExpanded" Collapsed="RigCollapsed"
+                          AutomationProperties.Name="Rig hierarchy and names">
+                    <StackPanel MaxHeight="300" Margin="0,6,0,0">
+                        <TextBlock x:Name="RigStatus" Text="Open to inspect the selected model." TextWrapping="Wrap" Margin="0,0,0,6" />
+                        <TextBox x:Name="RigSearch" Height="28" Margin="0,0,0,6"
+                                 ToolTip="Search hierarchy and names" AutomationProperties.Name="Search rig nodes"
+                                 TextChanged="RigSearchChanged" />
+                        <ListBox x:Name="RigNodes" Height="112" SelectionChanged="RigNodeChanged"
+                                 VirtualizingPanel.IsVirtualizing="True"
+                                 VirtualizingPanel.VirtualizationMode="Recycling"
+                                 AutomationProperties.Name="Rig hierarchy nodes">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate><TextBlock Text="{Binding Label}" Margin="{Binding IndentMargin}"
+                                                         TextTrimming="CharacterEllipsis" ToolTip="{Binding Label}" /></DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                        <TextBlock Text="Name candidates" FontWeight="SemiBold" Margin="0,6,0,2" />
+                        <ListBox x:Name="RigNameCandidates" Height="72"
+                                 VirtualizingPanel.IsVirtualizing="True"
+                                 VirtualizingPanel.VirtualizationMode="Recycling"
+                                 AutomationProperties.Name="Rig name candidates">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate><TextBlock Text="{Binding Label}" TextWrapping="Wrap" /></DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                        <Expander Header="Advanced" Margin="0,6,0,0">
+                        <TextBox x:Name="RigAdvanced" IsReadOnly="True" FontFamily="Consolas"
+                                 TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                                 HorizontalScrollBarVisibility="Auto" MaxHeight="72" />
+                        </Expander>
+                    </StackPanel>
+                </Expander>
+                <Expander Header="Advanced" DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                    <TextBox x:Name="Advanced" IsReadOnly="True" FontFamily="Consolas"
+                             TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                             HorizontalScrollBarVisibility="Auto" MaxHeight="240" />
+                </Expander>
+            </StackPanel>
+            </ScrollViewer>
+        </Grid>
+
+        <DockPanel Grid.Row="2" Margin="0,10,0,0">
+            <StackPanel x:Name="ResultsPaging" DockPanel.Dock="Right" Orientation="Horizontal" Visibility="Collapsed">
+                <TextBlock x:Name="ResultRange" VerticalAlignment="Center" Margin="0,0,8,0" />
+                <Button x:Name="PreviousResults" Content="Previous" Click="PreviousResultsClicked" />
+                <Button x:Name="NextResults" Content="Next" Margin="6,0,0,0" Click="NextResultsClicked" />
+            </StackPanel>
+            <TextBlock x:Name="Status" Text="No entries" VerticalAlignment="Center" />
+        </DockPanel>
+    </Grid>
+</UserControl>

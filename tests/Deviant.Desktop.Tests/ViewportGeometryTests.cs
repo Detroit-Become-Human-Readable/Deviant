@@ -7,6 +7,69 @@ namespace Deviant.Desktop.Tests;
 
 public sealed class ViewportGeometryTests
 {
+    [Fact]
+    public void SecondaryUvCoordinatesSurviveViewportConversion()
+    {
+        var primitive = Triangle(1) with { TextureCoordinates = [
+            [new(.25f, .75f), Vector2.Zero, Vector2.One],
+            [new(.5f, .625f), Vector2.Zero, Vector2.One],
+            [new(.125f, .375f), Vector2.Zero, Vector2.One]] };
+        var converted = ViewportGeometry.Convert(primitive, primitive.Submeshes[0]);
+        var sets = Assert.IsType<ViewportMeshGeometry>(converted).TextureCoordinateSets;
+        Assert.Equal(new Vector2(.125f, .375f), sets[2][0]);
+        Assert.Equal(3L * 84 + 3L * 4, ViewportGeometry.GeometryBytes(3, 3));
+    }
+
+    [Fact]
+    public void ParallelTangentFrameKeepsGeometryWithoutNormalMapping()
+    {
+        var primitive = Triangle(1) with { Tangents = [new(0, 0, 1, 1), new(0, 0, 1, 1), new(0, 0, 1, 1)] };
+        Assert.False(ViewportGeometry.HasUsableTangentFrame(primitive));
+        Assert.Throws<InvalidDataException>(() => ViewportGeometry.Convert(primitive, primitive.Submeshes[0], requireTangentFrame: true));
+        var converted = ViewportGeometry.Convert(primitive, primitive.Submeshes[0]);
+        Assert.Equal(3, converted.Positions!.Count);
+        Assert.All(converted.Normals!, normal => Assert.Equal(Vector3.UnitZ, normal));
+        Assert.All(converted.Tangents!, tangent => Assert.Equal(Vector3.Zero, tangent));
+        Assert.Equal([0, 1, 2], converted.TriangleIndices!);
+    }
+
+    [Fact]
+    public void ZeroVertexNormalsUseFaceNormalsForDisplay()
+    {
+        var primitive = Triangle(1) with { Normals = [Vector3.Zero, Vector3.Zero, Vector3.Zero] };
+        Assert.False(ViewportGeometry.HasUsableNormals(primitive));
+        Assert.False(ViewportGeometry.HasUsableTangentFrame(primitive));
+        var converted = ViewportGeometry.Convert(primitive, primitive.Submeshes[0]);
+        Assert.All(converted.Normals!, normal => Assert.Equal(Vector3.UnitZ, normal));
+        Assert.Equal(Vector3.Zero, primitive.Normals[0]);
+    }
+
+    [Fact]
+    public void SceneCameraPreservesDepthBetweenNearbySurfaces()
+    {
+        const double radius = 20, far = 2000;
+        var near = ViewportGeometry.CameraNearPlane(radius);
+        Assert.Equal(ProjectedDepth(radius / 10000, far, 50), ProjectedDepth(radius / 10000, far, 50.002));
+        Assert.NotEqual(ProjectedDepth(near, far, 50), ProjectedDepth(near, far, 50.002));
+
+        static float ProjectedDepth(double near, double far, double distance) =>
+            (float)(far / (far - near) - far * near / ((far - near) * distance));
+    }
+
+    [Theory]
+    [InlineData(.01)]
+    [InlineData(1)]
+    [InlineData(20)]
+    [InlineData(1000)]
+    [InlineData(10000)]
+    public void CameraNearPlaneRemainsUsableAcrossAssetScales(double radius)
+    {
+        var near = ViewportGeometry.CameraNearPlane(radius);
+        Assert.True(double.IsFinite(near));
+        Assert.InRange(near, Math.Max(radius / 10000, .0001), radius);
+        if (radius <= 2500) Assert.InRange(near, .001, .25);
+    }
+
     [Theory]
     [InlineData(1f, 1f)]
     [InlineData(-1f, -1f)]
@@ -60,7 +123,7 @@ public sealed class ViewportGeometryTests
     {
         Assert.Equal(3L * HelixToolkit.SharpDX.DefaultVertex.SizeInBytes,
             ViewportGeometry.ConversionBytes(3, 3, true) - ViewportGeometry.RetainedConversionBytes(3, 3, true));
-        Assert.Equal(3L * 72 + 3L * 4, ViewportGeometry.RetainedConversionBytes(3, 3, true));
+        Assert.Equal(3L * 96 + 3L * 4, ViewportGeometry.RetainedConversionBytes(3, 3, true));
     }
 
     [Fact]

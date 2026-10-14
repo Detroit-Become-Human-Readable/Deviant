@@ -17,6 +17,8 @@ public partial class App : Application
         if (ControllerFactory is null && WindowInitialized is null)
         {
             var audioWindow = AudioWindowFactory?.Invoke() ?? new AudioWindow();
+            if (AudioWindowFactory is null)
+                audioWindow.SourceInitialized += (_, _) => WindowPlacement.ApplyInitial(audioWindow);
             MainWindow = audioWindow;
             audioWindow.Show();
         }
@@ -35,3 +37,4 @@ public partial class App : Application
         base.OnExit(e);
     }
 }
+

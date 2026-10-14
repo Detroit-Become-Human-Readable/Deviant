@@ -19,6 +19,8 @@ public partial class AudioWindow
     }
     private async Task InspectBufferAsync(ResourceIdentity identity,long navigation,CancellationToken token)
     {
+        await commonGroupNavigationDrain.WaitAsync(token);
+        if(navigation!=navigationGeneration)return;
         EnsureBufferRequestAllowed();
         var owner=session??throw new InvalidOperationException("Open an archive first.");
         bufferReadCancellation?.Cancel();
@@ -49,12 +51,15 @@ public partial class AudioWindow
             try{await Task.WhenAll(pending);}catch{}
             foreach(var task in pending)bufferReads.Remove(task);
             await bufferView.ClearAsync();
+            ReleaseCommonGroups();
         }
         finally{--bufferDrainDepth;}
     }
     private void EnsureBufferRequestAllowed()
     {
         if(closingInProgress)throw new InvalidOperationException("The window is closing.");
-        if(bufferDrainDepth!=0)throw new InvalidOperationException("The workspace is changing.");
+        if(bufferDrainDepth!=0 || workspaceTransitionDepth!=0)throw new InvalidOperationException("The workspace is changing.");
     }
 }
+
+

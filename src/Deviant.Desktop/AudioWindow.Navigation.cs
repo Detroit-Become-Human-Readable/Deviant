@@ -18,14 +18,17 @@ public partial class AudioWindow
     private LibraryState libraryState = new();
     private WorkspaceEntry? workspace;
     private string currentView = "home";
+    private string audioResultStatus = "Ready";
     private string libraryView = "bookmarks";
     private Guid? displayedCollection;
     private ResourceIdentity? lastVisitedIdentity;
     private readonly NavigationItem audioNavigation = new("Audio", "audio");
     private readonly NavigationItem bankNavigation = new("Banks", "audio");
     private readonly NavigationItem audioLanguageNavigation = new("Languages", "audio");
-    private readonly NavigationItem stringsNavigation = new("Strings", "strings");
+    private readonly NavigationItem stringsNavigation = new("Dialogue & Strings", "strings");
+    private readonly NavigationItem charactersNavigation = new("Characters", "characters");
     private readonly NavigationItem textureNavigation = new("Textures","textures");
+    private readonly NavigationItem ddsNavigation = new("DDS images", "dds");
     private readonly NavigationItem scenesNavigation = new("Scenes", "scenes");
     private readonly ObservableCollection<NavigationItem> explorerRoots=[];
     private readonly NavigationItem stringLanguageNavigation = new("Languages", "strings");
@@ -43,7 +46,7 @@ public partial class AudioWindow
     private async Task DrainLibraryTasksAsync(){while(libraryTasks.Count>0){var batch=libraryTasks.ToArray();try{await Task.WhenAll(batch);}catch{}foreach(var task in batch)libraryTasks.Remove(task);}}
     private CancellationTokenSource navigationCancellation=new();
     private (long Generation,CancellationToken Token) BeginNavigation()
-    {navigationCancellation.Cancel();navigationCancellation.Dispose();navigationCancellation=new();return(++navigationGeneration,navigationCancellation.Token);}
+    {workspacePreparation?.NotifyActivity();navigationCancellation.Cancel();navigationCancellation.Dispose();navigationCancellation=new();PauseCommonGroupsForNavigation();return(++navigationGeneration,navigationCancellation.Token);}
     private void NavigationError(Exception error){HomeStatus.Text=StatusText.Text=LibraryEmpty.Text=error.Message;}
 
     private void InitializeNavigation()
@@ -52,7 +55,9 @@ public partial class AudioWindow
         library = new(aliases.LibraryRoot);
         audioNavigation.Children.Add(bankNavigation); audioNavigation.Children.Add(audioLanguageNavigation);
         stringsNavigation.Children.Add(stringLanguageNavigation);
-        foreach(var node in new[]{new NavigationItem("Home","home"),audioNavigation,stringsNavigation,scenesNavigation,new NavigationItem("DDS images","dds"),inspectionNavigation,new NavigationItem("Bookmarks","bookmarks"),collectionsNavigation,new NavigationItem("Recent items","recent"),new NavigationItem("Saved filters","filters")})explorerRoots.Add(node);
+        textureNavigation.Children.Add(ddsNavigation);
+        textureExplorer.OpenDdsRequested += OpenDds_Click;
+        foreach(var node in new[]{new NavigationItem("Home","home"),audioNavigation,stringsNavigation,textureNavigation,charactersNavigation,scenesNavigation,inspectionNavigation,new NavigationItem("Bookmarks","bookmarks"),collectionsNavigation,new NavigationItem("Recent items","recent"),new NavigationItem("Saved filters","filters")})explorerRoots.Add(node);
         ExplorerTree.ItemsSource=explorerRoots;
         stringsView.SelectedRecordChanged += (_, _) => SelectionForLibraryChanged();
         stringsView.ChoicesChanged += (_, _) => UpdateExplorerGroups();
@@ -63,6 +68,7 @@ public partial class AudioWindow
         bufferView.SelectedResourceChanged+=(_,_)=>SelectionForLibraryChanged();
         Loaded += async (_, _) => { try { await TrackLibraryTask(RefreshLibraryAsync()); } catch (Exception error) { HomeStatus.Text = error.Message; } };
         AudioStatusPanel.Visibility = Visibility.Collapsed;
+        RefreshWorkspaceNavigation();
     }
 
     private async Task RefreshLibraryAsync()
@@ -91,12 +97,13 @@ public partial class AudioWindow
         catch (Exception error) { HomeStatus.Text = error.Message; }
         if(!ReferenceEquals(session,owner)||closingInProgress)return;
         lastVisitedIdentity = null;
+        audioResultStatus = "Ready";
         relatedCancellation?.Cancel();relatedIdentity=null;
         audioRelationships?.ClearBankGraphCache();audioRelationships=null;relationshipSession=null;
         animationLoadedRevision=null;inspectionNavigation.Children.Clear();
         if(snapshot.Records.Any(row=>row.Type==Deviant.Formats.Animation.AnimationDataReader.ResourceType))inspectionNavigation.Children.Add(new("Animation records","animation"));
         if(snapshot.Records.Any(row=>row.Type==29))inspectionNavigation.Children.Add(new("Container sources","shader-picker"));
-        if(snapshot.Records.Any(row=>row.Type is 2229 or 2230)){if(!explorerRoots.Contains(textureNavigation))explorerRoots.Insert(3,textureNavigation);}else explorerRoots.Remove(textureNavigation);
+        if(snapshot.Records.Any(row=>row.Type==29))inspectionNavigation.Children.Add(new("Physics","physics-picker"));
         bankNodes.Clear(); audioLanguageNodes.Clear(); stringLanguageNodes.Clear();
         bankNavigation.Children.Clear(); audioLanguageNavigation.Children.Clear(); stringLanguageNavigation.Children.Clear();
         UpdateExplorerGroups();
@@ -121,9 +128,16 @@ public partial class AudioWindow
     }
     private void ShowBrowse(string view)
     {
+        if (!RequireWorkspaceNavigation()) return;
+        SelectLibraryTab();
+        if (view != "audio") audioDialogueCancellation?.Cancel();
+        if (view != "physics") SuspendPhysics();
+        PhysicsHost.Visibility = view == "physics" ? Visibility.Visible : Visibility.Collapsed;
         if (view != "textures") PauseTextureWorkForNavigation();
-        if (view != "scenes") _ = sceneView.SuspendAsync();
+        if (view is not ("scenes" or "model")) PauseSceneWorkForNavigation();
+        if (view != "buffer") PauseCommonGroupsForNavigation();
         currentView = view;
+        SelectExplorerView(view == "model" ? "scenes" : view == "dds" ? "textures" : view);
         if (view == "audio") EnsureAudioEnrichment();
         HomeHost.Visibility = LibraryHost.Visibility = Visibility.Collapsed; ContentHost.Visibility = Visibility.Visible;
         AudioLayout.Visibility = view == "audio" ? Visibility.Visible : Visibility.Collapsed;
@@ -138,16 +152,25 @@ public partial class AudioWindow
         stringsMode = view == "strings";
         SaveFilterButton.IsEnabled = session is not null&&view is "audio" or "strings" or "textures";
         SelectionForLibraryChanged(); UpdatePlaybackPresentation();UpdateExplorerStatus();
-        RefreshActivity();
+        UpdateWorkspaceStatus();
     }
     private void Home_Click(object sender,RoutedEventArgs e)
     {
+        SelectLibraryTab();
+        SuspendPhysics();
         BeginNavigation();
+        PauseSceneWorkForNavigation();
         PauseTextureWorkForNavigation();
         currentView="home";HomeHost.Visibility=Visibility.Visible;LibraryHost.Visibility=ContentHost.Visibility=AudioStatusPanel.Visibility=Visibility.Collapsed;
         SelectExplorerView("home");
         BookmarkButton.IsEnabled=SaveFilterButton.IsEnabled=false;UpdatePlaybackPresentation();
         UpdateExplorerStatus();
+        UpdateWorkspaceStatus();
+    }
+    private void UpdateWorkspaceStatus()
+    {
+        if (!foregroundBusy)
+            StatusText.Text = currentView switch { "audio" => audioResultStatus, "physics" => physicsStatus.Text, _ => ExplorerStatus.Text };
         RefreshActivity();
     }
     private void UpdateExplorerStatus()
@@ -157,9 +180,9 @@ public partial class AudioWindow
             "audio" when session?.EnrichmentTask.IsCanceled==true=>"Audio indexing cancelled",
             "audio" when session?.EnrichmentTask.IsFaulted==true=>"Audio indexing failed",
             "audio" when session?.IsEnrichmentComplete!=true=>"Indexing audio…",
-            "strings" when stringsView.CurrentSession?.EnrichmentTask.IsCanceled==true=>"String indexing cancelled",
-            "strings" when stringsView.CurrentSession?.EnrichmentTask.IsFaulted==true=>"String indexing failed",
-            "strings" when stringsView.CurrentSession?.IsEnrichmentComplete!=true=>"Indexing strings…",
+            "strings" when stringsView.CurrentSession?.EnrichmentTask.IsCanceled==true=>"Text indexing cancelled",
+            "strings" when stringsView.CurrentSession?.EnrichmentTask.IsFaulted==true=>"Text indexing failed",
+            "strings" when stringsView.CurrentSession?.IsEnrichmentComplete!=true=>"Indexing text…",
             "textures" when textureCatalogs is null=>"Loading catalogs…",
             "textures" when textureCatalogs?.Progress.State==TextureCatalogSessionState.Running=>"Indexing catalogs…",
             "textures" when textureCatalogs?.Progress.State==TextureCatalogSessionState.Cancelled=>"Catalog indexing cancelled",
@@ -167,7 +190,7 @@ public partial class AudioWindow
             "textures" when textureCatalogs?.Progress.DiscoveryIncomplete==true=>"Catalog discovery incomplete",
             "textures" when textureDiscovery?.EnrichmentTask.IsCanceled==true=>"Texture indexing cancelled",
             "textures" when textureDiscovery?.EnrichmentTask.IsFaulted==true=>"Texture indexing failed",
-            "textures" when textureDiscovery?.EnrichmentTask.IsCompleted!=true=>"Indexing textures…",
+            "textures" when textureDiscovery?.EnrichmentTask.IsCompleted!=true=>"Indexing names…",
             "scenes" when sceneSession?.Progress.IsRunning==true=>"Discovering scenes…",
             "scenes" when sceneSession?.Progress.HasMore==true=>"More scenes available",
             "scenes" when sceneSession is not null=>$"{sceneSession.Progress.Available:N0} scenes",
@@ -186,10 +209,12 @@ public partial class AudioWindow
     public AssetFamilyView AssetBrowser=>familyView;
     public async Task ShowTexturesAsync(CancellationToken token=default)
     {
+        if (!RequireWorkspaceNavigation()) return;
         var current = session;
         if (current is null) return;
         var navigation = navigationGeneration;
         ShowBrowse("textures");
+        await sceneNavigationDrain.WaitAsync(token);
         await textureNavigationDrain.WaitAsync(token);
         if (navigation != navigationGeneration || currentView != "textures" || !ReferenceEquals(current, session)) return;
         token.ThrowIfCancellationRequested();
@@ -212,16 +237,20 @@ public partial class AudioWindow
     private async void Explorer_SelectedItemChanged(object sender,RoutedPropertyChangedEventArgs<object> e)
     {
         if(synchronizingExplorer || e.NewValue is not NavigationItem node) return;
+        if (!IsWorkspaceValidated && node.View != "home") { RequireWorkspaceNavigation(); return; }
         var navigation=BeginNavigation();
         try
         {
             if(node.View=="home") { Home_Click(this,new());return; }
+            if(node.View=="characters") { await ShowCharactersCoreAsync(navigation.Token, navigation); return; }
             if(node.View=="dds") {ShowBrowse("dds");return;}
             if(node.View=="textures"){await ShowTexturesAsync(navigation.Token);if(node.Group is not null)await SelectTextureContextAsync(node.Group,navigation.Generation,navigation.Token);return;}
             if(node.View=="scenes"){await ShowScenesAsync(navigation.Token);return;}
             if(node.View=="animation"){await ShowAnimationAsync(navigation.Token);return;}
             if(node.View=="shader-picker")
             {if(session is null)return;var choice=ContainerChoiceDialog.Read(this,session.Snapshot);if(choice is not null)await InspectShaderResourceAsync(choice,navigation.Token);return;}
+            if(node.View=="physics-picker")
+            {if(session is null)return;var choice=ContainerChoiceDialog.Read(this,session.Snapshot);if(choice is not null)await InspectPhysicsAsync(choice,navigation.Token);return;}
             if(node.View is "bookmarks" or "recent" or "filters" or "collections" or "collection") { ShowLibrary(node.View,node.Id);return; }
             if(session is null) { Home_Click(this,new());HomeStatus.Text="Open a workspace to browse assets.";return; }
             if(node.View=="strings") { await ShowStringsAsync(navigation.Token);if(navigation.Generation!=navigationGeneration)return;if(node.Language is not null) await stringsView.ApplyFilterAsync(new Dictionary<string,string>{{"language",node.Language}},navigation.Token); }
@@ -237,8 +266,11 @@ public partial class AudioWindow
     }
     private (string View,ResourceIdentity Identity,SourceRevision Revision,string Label)? SelectedDiscovery()
     {
+        if(currentView=="characters" && charactersView.SelectedDescriptor is {} character)return("characters",character.Identity,character.Revision,character.Label);
+        if(currentView=="physics" && physicsLease is {} physics)return("physics",physics.MemberIdentity,physics.Revision,(physicsFrames.SelectedItem as PhysicsFrameChoice)?.Label ?? "Physics record");
         if(currentView=="references"&&referencesView.SelectedIdentity is{}reference&&referencesView.LoadedRevision is{}referenceRevision)return("references",reference,referenceRevision,referencesView.SelectedLabel??"Resource references");
         if(currentView=="textures"&&textureExplorer.SelectedIdentity is{}texture&&textureExplorer.LoadedRevision is{}textureRevision)return("textures",texture,textureRevision,textureExplorer.SelectedLabel??"Texture");
+        if(currentView=="buffer" && commonGroupMode && commonGroupLease is {} group && ReferenceEquals(bufferView.CurrentInspection,group.Inspection))return("gmk",group.MemberIdentity,group.Revision,(commonGroupFrames.SelectedItem as CommonGroupChoice)?.Label ?? "Common group");
         if(currentView=="buffer"&&bufferView.SelectedIdentity is{}buffer&&bufferView.LoadedRevision is{}bufferRevision)return("buffer",buffer,bufferRevision,bufferView.SelectedLabel??"Buffer");
         if(currentView=="animation"&&animationView.SelectedIdentity is{}animation&&session is{}animationSession)return("animation",animation,new(animationSession.Snapshot.IndexContentId,animationSession.Snapshot.PhysicalSourceStamp),animationView.SelectedLabel??"Animation record");
         if(currentView=="scenes"&&sceneView.SelectedIdentity is{}scene&&sceneView.LoadedRevision is{}sceneRevision)return("scenes",scene,sceneRevision,sceneView.SelectedLabel??"Scene node");
@@ -278,6 +310,10 @@ public partial class AudioWindow
     };
     private void ShowLibrary(string view,Guid? collectionId=null)
     {
+        PauseCommonGroupsForNavigation();
+        SelectLibraryTab();
+        PauseSceneWorkForNavigation();
+        SuspendPhysics();
         PauseTextureWorkForNavigation();
         currentView="library";libraryView=view;displayedCollection=collectionId;
         HomeHost.Visibility=ContentHost.Visibility=AudioStatusPanel.Visibility=Visibility.Collapsed;LibraryHost.Visibility=Visibility.Visible;
@@ -292,8 +328,9 @@ public partial class AudioWindow
             "collections"=>libraryState.Collections.Select(item=>new LibraryRow(item.Name,"User collection","",$"{item.Bookmarks.Count:N0} bookmarks",CollectionId:item.Id)),
             _=>libraryState.Bookmarks.Where(item=>view!="collection"||collection?.Bookmarks.Contains(item.Id)==true).Select(item=>new LibraryRow(item.Label,item.View,names.GetValueOrDefault(item.WorkspaceId,"Workspace"),RevisionStatus(item.WorkspaceId,item.Revision),item.WorkspaceId,item.Identity,item.Revision,item.Id))
         };
-        var visible=rows.ToArray();LibraryList.ItemsSource=visible;LibraryEmpty.Text=visible.Length==0?view=="filters"?"Save a filter from Audio or Strings.":view=="collections"?"Create a collection for your bookmarks.":"Bookmark an asset to return to it later.":"";
+        var visible=rows.ToArray();LibraryList.ItemsSource=visible;LibraryEmpty.Text=visible.Length==0?view=="filters"?"Save a filter from Audio or Dialogue & Strings.":view=="collections"?"Create a collection for your bookmarks.":"Bookmark an asset to return to it later.":"";
         UpdatePlaybackPresentation();
+        UpdateWorkspaceStatus();
     }
     private string RevisionStatus(Guid id,SourceRevision revision)=>libraryState.Workspaces.FirstOrDefault(item=>item.Id==id)?.Revision==revision?"":"Source changed";
     private async void Library_DoubleClick(object sender,MouseButtonEventArgs e)=>await OpenLibrarySelectionAsync();
@@ -320,8 +357,18 @@ public partial class AudioWindow
     {
         if(session is null||session.Snapshot.IndexContentId!=identity.IndexContentId)throw new InvalidOperationException("This item belongs to another archive.");
         var current=session;
+        if(view=="characters")
+        {
+            charactersView.SetSearchQuery("", notify: false);
+            await ShowCharactersCoreAsync(token, (generation, token), requestedIdentity: identity);
+            if(generation!=navigationGeneration || !ReferenceEquals(current,session))return;
+            charactersView.SelectResource(identity);
+            return;
+        }
         if(view=="references"){await InspectReferencesAsync(identity,token);return;}
+        if(view=="gmk"){await InspectCommonGroupsCoreAsync(identity,generation,token);return;}
         if(view=="buffer"){await InspectBufferAsync(identity,generation,token);return;}
+        if(view=="physics"){await InspectPhysicsAsync(identity,token);return;}
         if(view=="textures"){await ShowTexturesAsync(token);if(generation!=navigationGeneration)return;await textureExplorer.SelectResourceAsync(identity,token);return;}
         if(view=="animation"){await ShowAnimationAsync(token);if(generation!=navigationGeneration)return;await animationView.SelectResourceAsync(identity,token);return;}
         if(view=="scenes"){await ShowScenesAsync(token);if(generation!=navigationGeneration)return;await sceneView.SelectResourceAsync(identity,token);return;}
@@ -407,3 +454,5 @@ internal sealed class LibraryNameDialog : Window
     }
     public static string? Read(Window owner,string title){var dialog=new LibraryNameDialog(title){Owner=owner};return dialog.ShowDialog()==true?dialog.name.Text.Trim():null;}
 }
+
+

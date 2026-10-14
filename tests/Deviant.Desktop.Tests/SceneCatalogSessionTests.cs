@@ -3,6 +3,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Numerics;
 using System.Text;
+using System.Text.Json;
 using Deviant.Archives;
 using Deviant.Assets;
 using Deviant.Browser;
@@ -15,6 +16,41 @@ namespace Deviant.Desktop.Tests;
 
 public sealed class SceneCatalogSessionTests
 {
+    [Fact]
+    public async Task KeepsLightsAndTextureSlotsAttachedToTheirOwnEntity()
+    {
+        using var fixture = new SceneArchiveFixture();
+        fixture.WriteArchive(includeLights: true);
+        var snapshot = await fixture.OpenSnapshotAsync();
+        await using var session = await SceneCatalogSession.OpenAsync(snapshot, fixture.CreateCache(), new AliasStore(fixture.LibraryRoot));
+        await session.DiscoverMoreAsync();
+        var descriptor = Assert.Single((await session.QueryAsync(limit: 10)).Entries);
+        var loaded = await session.LoadAsync(descriptor.Identity);
+        Assert.Equal(3, loaded.IblLightsByEntity.Count);
+        var node = Assert.Single(loaded.Result.Value!.Hierarchy.Nodes);
+        var associated = loaded.EntitiesByNode[node.Identity];
+        var first = loaded.IblLightsByEntity.Single(pair => pair.Value.Result.Value!.OwnerName.Text == "Light A");
+        var second = loaded.IblLightsByEntity.Single(pair => pair.Value.Result.Value!.OwnerName.Text == "Light B");
+        Assert.NotEqual(first.Key, second.Key);
+        Assert.Contains(associated, entity => entity.Identity == first.Key);
+        Assert.Contains(associated, entity => entity.Identity == second.Key);
+        Assert.Equal(first.Key, first.Value.Result.Value!.Identity);
+        Assert.Equal(first.Key, first.Value.Result.Value.GetTextureResourceReference(0)!.Owner);
+        Assert.Equal(1f, first.Value.Result.Value.Intensity.GetValue());
+        Assert.Equal(2f, second.Value.Result.Value!.Intensity.GetValue());
+        Assert.Equal(new[] { ReferenceStatus.Unique, ReferenceStatus.Missing, ReferenceStatus.Ambiguous },
+            first.Value.TextureResolutions.Select(item => item.Status));
+        Assert.Single(first.Value.TextureResolutions[0].Candidates);
+        Assert.Empty(first.Value.TextureResolutions[1].Candidates);
+        Assert.Equal(2, first.Value.TextureResolutions[2].Candidates.Count);
+        Assert.Equal(ReferenceStatus.Unresolved, Assert.Single(second.Value.TextureResolutions).Status);
+        Assert.Null(second.Value.Result.Value.GetTextureResourceReference(0));
+        var unplaced = loaded.IblLightsByEntity.Single(pair => pair.Value.Result.Value!.OwnerName.Text == "Unplaced light");
+        Assert.DoesNotContain(loaded.EntitiesByNode.Values.SelectMany(items => items), entity => entity.Identity == unplaced.Key);
+        Assert.Equal(3f, unplaced.Value.Result.Value!.Intensity.GetValue());
+        Assert.Contains(loaded.Result.Value.Diagnostics, item => item.Identity == unplaced.Key && item.Code == "EntityNodeUnresolved");
+    }
+
     [Fact]
     public async Task DiscoversLoadsNamesTransformsAndVerifiedCatalogNavigation()
     {
@@ -49,7 +85,7 @@ public sealed class SceneCatalogSessionTests
     public async Task ExportsRelativeSourceMetadataAndRevalidatesChangedSource()
     {
         using var fixture = new SceneArchiveFixture();
-        fixture.WriteArchive();
+        fixture.WriteArchive(includeLights: true);
         var snapshot = await fixture.OpenSnapshotAsync();
         var cache = fixture.CreateCache();
         await using var session = await SceneCatalogSession.OpenAsync(snapshot, cache, new AliasStore(fixture.LibraryRoot));
@@ -63,6 +99,21 @@ public sealed class SceneCatalogSessionTests
         Assert.Contains("deviant-scene-structure-v1", json, StringComparison.Ordinal);
         Assert.Contains("sample.dat", json, StringComparison.Ordinal);
         Assert.DoesNotContain(fixture.Root, json, StringComparison.OrdinalIgnoreCase);
+        using (var exported = JsonDocument.Parse(json))
+        {
+            var lights = exported.RootElement.GetProperty("IblLights");
+            Assert.Equal(3, lights.GetArrayLength());
+            foreach (var light in lights.EnumerateArray())
+            {
+                var identity = light.GetProperty("Identity").GetProperty("MemberPath").GetString();
+                Assert.Equal(identity, light.GetProperty("Result").GetProperty("Value").GetProperty("Identity").GetProperty("MemberPath").GetString());
+                Assert.Equal("assets/probe.bin", light.GetProperty("Result").GetProperty("Value").GetProperty("SourcePath").GetProperty("Text").GetString());
+            }
+            var first = lights.EnumerateArray().Single(light => light.GetProperty("Result").GetProperty("Value")
+                .GetProperty("OwnerName").GetProperty("Text").GetString() == "Light A");
+            Assert.Equal(new[] { (int)ReferenceStatus.Unique, (int)ReferenceStatus.Missing, (int)ReferenceStatus.Ambiguous },
+                first.GetProperty("TextureResolutions").EnumerateArray().Select(item => item.GetProperty("Status").GetInt32()));
+        }
 
         var sentinel = "keep-existing";
         await File.WriteAllTextAsync(output, sentinel);
@@ -148,10 +199,10 @@ public sealed class SceneCatalogSessionTests
         public string LibraryRoot => Path.Combine(Root, "library");
         public string OutputRoot { get; } = Path.Combine(Path.GetTempPath(), "DeviantGeneratedSceneOutputs", Guid.NewGuid().ToString("N"));
 
-        public void WriteArchive(bool includeTooLargeCandidate = false)
+        public void WriteArchive(bool includeTooLargeCandidate = false, bool includeLights = false)
         {
             Directory.CreateDirectory(SourceRoot); Directory.CreateDirectory(OutputRoot);
-            var decoded = BuildDecodedDirectory();
+            var decoded = BuildDecodedDirectory(includeLights);
             var container = BuildSegs(decoded);
             var catalog = BuildCatalogResource();
             var catalogOffset = container.Length;
@@ -180,15 +231,24 @@ public sealed class SceneCatalogSessionTests
             if (Directory.Exists(OutputRoot)) Directory.Delete(OutputRoot, recursive: true);
         }
 
-        private byte[] BuildDecodedDirectory()
+        private byte[] BuildDecodedDirectory(bool includeLights)
         {
-            var frames = new[]
+            var frames = new List<(uint Type, uint Id, byte[] Payload)>
             {
                 (Type: 2002u, Id: 11u, Payload: NodePayload()),
                 (Type: 3u, Id: 10u, Payload: InlineCatalogPayload()),
                 (Type: 2207u, Id: 12u, Payload: EntityCatalogPayload()),
                 (Type: 2202u, Id: 99u, Payload: EnvironmentPayload())
             };
+            if (includeLights)
+            {
+                frames.Add((2211, 41, IblPayload("Light A", 1, [(2137, 51), (2137, 53), (2137, 52)])));
+                frames.Add((2211, 42, IblPayload("Light B", 2, [(0, 0)])));
+                frames.Add((2211, 43, IblPayload("Unplaced light", 3, [(2137, 51)], nodeId: 99)));
+                frames.Add((2137, 51, new byte[4]));
+                frames.Add((2137, 52, new byte[4]));
+                frames.Add((2137, 52, new byte[4]));
+            }
             var body = new MemoryStream();
             foreach (var frame in frames)
             {
@@ -196,11 +256,11 @@ public sealed class SceneCatalogSessionTests
                 body.WriteByte(0); WriteLittleEndian(body, 0); WriteLittleEndian(body, 0);
                 body.Write(frame.Payload);
             }
-            var dcInfoBodyLength = checked(8u + (uint)frames.Length * 8u);
+            var dcInfoBodyLength = checked(8u + (uint)frames.Count * 8u);
             var directoryLength = checked(16 + (int)dcInfoBodyLength);
             var result = new MemoryStream();
             result.Write("DC_INFO "u8); WriteLittleEndian(result, 3); WriteLittleEndian(result, dcInfoBodyLength);
-            WriteLittleEndian(result, 0); WriteLittleEndian(result, (uint)frames.Length);
+            WriteLittleEndian(result, 0); WriteLittleEndian(result, (uint)frames.Count);
             foreach (var frame in frames) { WriteLittleEndian(result, frame.Type); WriteLittleEndian(result, frame.Id); }
             result.Write("DC_DATA "u8); WriteLittleEndian(result, 23); WriteLittleEndian(result, (uint)body.Length);
             result.Write(body.ToArray());
@@ -249,6 +309,33 @@ public sealed class SceneCatalogSessionTests
             "ENTITY  "u8.CopyTo(bytes.AsSpan(32)); Put(bytes, 40, 7); Put(bytes, 44, 2002); Put(bytes, 48, 11); "ENTCATLG"u8.CopyTo(bytes.AsSpan(81)); Put(bytes, 89, 2);
             var cursor = 93; Put(bytes, cursor, (uint)instance.Length); cursor += 4; Encoding.ASCII.GetBytes(instance).CopyTo(bytes, cursor); cursor += instance.Length;
             Put(bytes, cursor, (uint)catalog.Length); cursor += 4; Encoding.ASCII.GetBytes(catalog).CopyTo(bytes, cursor); cursor += catalog.Length; Put(bytes, cursor, 3); Put(bytes, cursor + 4, 10); return bytes;
+        }
+
+        private static byte[] IblPayload(string name, float intensity, (uint Type, uint Id)[] references, uint nodeId = 11)
+        {
+            const string path = "assets/probe.bin";
+            var record = new byte[115 + references.Length * 8 + name.Length + path.Length];
+            "IBLLIGHT"u8.CopyTo(record); Put(record, 8, 13); record[12] = 1;
+            for (var index = 0; index < 6; index++)
+            {
+                Single(record, 13 + 4 * index, index % 2 == 0 ? -index - 1 : index);
+                Single(record, 37 + 4 * index, index % 2 == 0 ? -index - 2 : index + 1);
+            }
+            Single(record, 69, .5f); Single(record, 73, intensity); record[81] = 1;
+            Put(record, 87, (uint)references.Length);
+            var cursor = 95;
+            foreach (var reference in references)
+            { Put(record, cursor, reference.Type); Put(record, cursor + 4, reference.Id); cursor += 8; }
+            Put(record, cursor, 0); cursor += 4;
+            Put(record, cursor, (uint)name.Length); cursor += 4;
+            Encoding.ASCII.GetBytes(name).CopyTo(record, cursor); cursor += name.Length;
+            Put(record, cursor, (uint)path.Length); cursor += 4;
+            Encoding.ASCII.GetBytes(path).CopyTo(record, cursor);
+            var payload = new byte[81 + record.Length];
+            EntityCatalogPayload().AsSpan(0, 81).CopyTo(payload);
+            Put(payload, 48, nodeId);
+            record.CopyTo(payload, 81);
+            return payload;
         }
 
         private static byte[] EnvironmentPayload()

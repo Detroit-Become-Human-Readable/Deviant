@@ -12,6 +12,7 @@ public partial class SceneView
     private Task automaticDiscoveryTask = Task.CompletedTask;
     private long automaticDiscoveryGeneration;
     private bool automaticDiscoveryActive, batchDiscoveryActive, sectionLoadingActive, renderLoadingActive;
+    private bool queryActive;
     private string renderLoadingStage = "Reading scene";
     private int renderLoadingCompleted, renderLoadingTotal;
     private bool renderLoadingTotalKnown;
@@ -21,7 +22,7 @@ public partial class SceneView
     public SceneActivityProgress ActivityProgress { get; private set; } = new(false, "Ready", 0, 0);
 
     public bool IsDiscoveringAll => automaticDiscoveryActive;
-    public bool IsLoading => automaticDiscoveryActive || batchDiscoveryActive || sectionLoadingActive || renderLoadingActive || scenePipelineActive || regionsLoadingActive;
+    public bool IsLoading => exportActive || queryActive || automaticDiscoveryActive || batchDiscoveryActive || sectionLoadingActive || renderLoadingActive || scenePipelineActive || regionsLoadingActive;
 
     public async Task DiscoverAllAsync(CancellationToken token = default)
     {
@@ -95,7 +96,9 @@ public partial class SceneView
         string stage;
         int completed, total;
         bool known;
-        if (renderLoadingActive)
+        if (exportActive)
+        { stage = "Exporting FBX"; completed = total = 0; known = false; }
+        else if (renderLoadingActive)
         {
             stage = renderLoadingStage; completed = renderLoadingCompleted; total = renderLoadingTotal;
             known = renderLoadingTotalKnown;
@@ -103,6 +106,10 @@ public partial class SceneView
         else if (regionsLoadingActive)
         {
             stage = "Finding regions"; completed = regionsCompleted; total = regionsTotal; known = total > 0;
+        }
+        else if (queryActive)
+        {
+            stage = "Searching scenes"; completed = total = 0; known = false;
         }
         else if (sectionLoadingActive || scenePipelineActive)
         {
@@ -112,8 +119,24 @@ public partial class SceneView
         {
             stage = "Discovering scenes"; completed = discovery?.Visited ?? 0; total = discovery?.Candidates ?? 0; known = total > 0;
         }
-        if (!IsLoading) stage = activityTerminalStage ?? "Ready";
+        if (!IsLoading) { stage = activityTerminalStage ?? "Ready"; cancellingActivity = false; }
+        else if (cancellingActivity) { stage = "Cancelling…"; known = false; }
+        else if (largeLoadDecision is not null) { stage = "Continue loading this scene?"; known = false; }
         var update = new SceneActivityProgress(IsLoading, stage, completed, known ? total : 0);
+        var viewportLoading = sectionLoadingActive || renderLoadingActive || scenePipelineActive || regionsLoadingActive;
+        var showOverlay = viewportLoading && SceneViewport.VisiblePartCount == 0;
+        ViewportLoadingOverlay.Visibility = showOverlay ? Visibility.Visible : Visibility.Collapsed;
+        ViewportLoadingOverlay.IsHitTestVisible = false;
+        SceneViewport.IsEnabled = !viewportLoading || SceneViewport.VisiblePartCount > 0;
+        ViewportProcessing.IsActive = showOverlay && largeLoadDecision is null;
+        ViewportProcessing.Visibility = largeLoadDecision is null ? Visibility.Visible : Visibility.Collapsed;
+        ViewportLoadingProgress.Visibility = largeLoadDecision is null ? Visibility.Visible : Visibility.Collapsed;
+        ViewportLoadingProgress.IsIndeterminate = viewportLoading && !known;
+        ViewportLoadingProgress.Maximum = Math.Max(1, update.Total);
+        ViewportLoadingProgress.Value = Math.Clamp(completed, 0, Math.Max(1, update.Total));
+        ViewportLoadingStage.Text = stage;
+        ViewportLoadingCount.Text = known ? $"{completed:N0} / {total:N0}" : "";
+        ViewportLoadingCount.Visibility = known ? Visibility.Visible : Visibility.Collapsed;
         ActivityProgress = update;
         ActivityProgressChanged?.Invoke(this, update);
     }

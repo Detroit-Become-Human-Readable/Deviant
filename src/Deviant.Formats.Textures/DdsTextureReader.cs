@@ -74,6 +74,15 @@ public sealed class DdsTextureReader
         return ReadOwned(bytes, identity, revision);
     }
 
+    /// <summary>Transfers a buffer to the document. The caller must not modify it after this call.</summary>
+    public DdsTextureDocument TakeOwnership(byte[] bytes, ResourceIdentity? identity = null, SourceRevision? revision = null)
+    {
+        ArgumentNullException.ThrowIfNull(bytes);
+        if (bytes.Length > MaximumInputBytes)
+            throw Error("TextureTooLarge", "The DDS file exceeds the decoder's input limit.");
+        return ReadOwned(bytes, identity, revision);
+    }
+
     private static DdsTextureDocument ReadOwned(byte[] bytes, ResourceIdentity? identity, SourceRevision? revision)
     {
         if (revision is not null && identity is null)
@@ -309,7 +318,7 @@ public sealed class DdsTextureReader
             null, 4, 0x00FF_0000, 0x0000_FF00, 0x0000_00FF, 0, IsSrgb: format == 93),
         85 => new(TextureStorageFormat.Bgr565, "B5G6R5_UNORM", null, 2, 0xF800, 0x07E0, 0x001F, 0),
         86 => new(TextureStorageFormat.Bgra5551, "B5G5R5A1_UNORM", null, 2, 0x7C00, 0x03E0, 0x001F, 0x8000),
-        61 => new(TextureStorageFormat.Luminance8, "R8_UNORM", null, 1, 0xFF, 0, 0, 0, Luminance: true),
+        61 => new(TextureStorageFormat.Luminance8, "R8_UNORM", null, 1, 0xFF, 0, 0, 0),
         65 => new(TextureStorageFormat.Alpha8, "A8_UNORM", null, 1, 0, 0, 0, 0xFF, AlphaOnly: true),
         _ => throw Error("UnsupportedFormat", $"DXGI format {format} is not supported.")
     };

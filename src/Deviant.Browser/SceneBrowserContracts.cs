@@ -1,5 +1,6 @@
 using Deviant.Assets;
 using Deviant.Core;
+using Deviant.Formats.Textures;
 
 namespace Deviant.Browser;
 
@@ -13,10 +14,18 @@ public sealed record SceneDiscoveryProgress(bool IsRunning, int Visited, int Can
 
 public sealed record SceneCatalogPage(IReadOnlyList<AssetDescriptor> Entries, long Total, long Offset);
 
+public sealed record SceneIblLight(DecodeResult<IblLightStoredFields> Result,
+    IReadOnlyList<ReferenceResolution> TextureResolutions);
+
 public sealed record SceneLoadedSection(AssetDescriptor Descriptor, DecodeResult<SceneSectionDocument> Result,
     IReadOnlyDictionary<ResourceIdentity, IReadOnlyList<NameEvidence>> NamesByNode,
     IReadOnlyDictionary<ResourceIdentity, IReadOnlyList<SceneEntityRecord>> EntitiesByNode,
-    IReadOnlyDictionary<ResourceIdentity, IReadOnlyList<AssetRelationship>> ReferencesByNode);
+    IReadOnlyDictionary<ResourceIdentity, IReadOnlyList<AssetRelationship>> ReferencesByNode)
+{
+    public IReadOnlyDictionary<ResourceIdentity, SceneIblLight> IblLightsByEntity { get; init; } =
+        new System.Collections.ObjectModel.ReadOnlyDictionary<ResourceIdentity, SceneIblLight>(
+            new Dictionary<ResourceIdentity, SceneIblLight>());
+}
 
 public interface ISceneCatalogSession : IAsyncDisposable
 {

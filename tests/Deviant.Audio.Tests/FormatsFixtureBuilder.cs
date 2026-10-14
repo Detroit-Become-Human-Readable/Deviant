@@ -20,7 +20,7 @@ internal sealed class FormatsFixtureBuilder : IDisposable
     }
 
     public static FormatsFixtureBuilder CreateAudioCatalog(uint bankVersion = 120, bool duplicateContainer = false, bool duplicateDialogueAudio = false,
-        uint dialoguePackage = 0)
+        uint dialoguePackage = 0, bool includeSoundEventName = true)
     {
         var fixture = new FormatsFixtureBuilder();
         Directory.CreateDirectory(fixture.directory);
@@ -29,7 +29,7 @@ internal sealed class FormatsFixtureBuilder : IDisposable
         var bankName = "fixture_bank";
         var bankId = Fnv1(bankName);
         var bankWem = MakeWem([1, 2, 3, 4]).Concat(new byte[] { 0xA5, 0x5A, 0x12, 0x34 }).ToArray();
-        const uint soundEventId = 0x3456789A;
+        var soundEventId = Fnv1("Play_Fixture_Sound");
         var bank = MakeBank(bankId, bankMediaId, bankWem, soundEventId, bankVersion);
         const uint containerResourceId = 700;
         fixture.AddResource(29, containerResourceId, MakeDataContainer(bank));
@@ -50,7 +50,33 @@ internal sealed class FormatsFixtureBuilder : IDisposable
         fixture.AddResource(1016, 911, MakeLocalization(5, "FRE", dialogueKey, "Sous-titre synthétique"));
         fixture.AddResource(1016, 912, MakePointerLocalization());
 
-        fixture.AddResource(1023, 903, MakeWrappedEvent(soundEventId, "Play_Fixture_Sound"));
+        if (includeSoundEventName) fixture.AddResource(1023, 903, MakeWrappedEvent(soundEventId, "Play_Fixture_Sound"));
+        fixture.WriteIndex();
+        return fixture;
+    }
+
+    public static FormatsFixtureBuilder CreateDialogueMediaCatalog(int mediaCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(mediaCount);
+        var fixture = new FormatsFixtureBuilder();
+        Directory.CreateDirectory(fixture.directory);
+        var wem = MakeWem([1, 2, 3, 4]);
+        for (var index = 0; index < mediaCount; index++)
+        {
+            var id = checked((uint)(1000 + index));
+            fixture.AddResource(1033, id, MakeDialogueMedia($"Generated_Line_{index:D5}_ENG", wem));
+        }
+        fixture.WriteIndex();
+        return fixture;
+    }
+
+    public static FormatsFixtureBuilder CreateUnreferencedEmbeddedBank()
+    {
+        var fixture = CreateEmpty();
+        const uint mediaId = 0x7A6B5C4D;
+        const string bankName = "generated_music_bank";
+        var bank = MakeBankForSources(Fnv1(bankName), [(mediaId, MakeWem([4, 3, 2, 1]))], []);
+        fixture.AddBankFixture(1, bankName, bank);
         fixture.WriteIndex();
         return fixture;
     }

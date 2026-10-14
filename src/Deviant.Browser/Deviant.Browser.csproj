@@ -4,14 +4,17 @@
     <ProjectReference Include="../Deviant.Archives/Deviant.Archives.csproj" />
     <ProjectReference Include="../Deviant.Catalog/Deviant.Catalog.csproj" />
     <ProjectReference Include="../Deviant.Export/Deviant.Export.csproj" />
+    <ProjectReference Include="../Deviant.Export.Models/Deviant.Export.Models.csproj" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Deviant.Assets/Deviant.Assets.csproj" />
     <ProjectReference Include="../Deviant.Formats.Audio/Deviant.Formats.Audio.csproj" />
     <ProjectReference Include="../Deviant.Formats.Textures/Deviant.Formats.Textures.csproj" />
     <ProjectReference Include="../Deviant.Formats.Containers/Deviant.Formats.Containers.csproj" />
+    <ProjectReference Include="../Deviant.Formats.Narrative/Deviant.Formats.Narrative.csproj" />
     <ProjectReference Include="../Deviant.Formats.Scenes/Deviant.Formats.Scenes.csproj" />
     <ProjectReference Include="../Deviant.Formats.Models/Deviant.Formats.Models.csproj" />
+    <ProjectReference Include="../Deviant.Formats.Animation/Deviant.Formats.Animation.csproj" />
     <ProjectReference Include="../Deviant.Formats.Shaders/Deviant.Formats.Shaders.csproj" />
     <ProjectReference Include="../Deviant.Audio/Deviant.Audio.csproj" />
     <ProjectReference Include="../Deviant.Export.Audio/Deviant.Export.Audio.csproj" />

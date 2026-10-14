@@ -18,7 +18,17 @@ public partial class AudioWindow
     {
         var row=CurrentRow;var current=session;
         if(row is null||current is null){relatedCancellation?.Cancel();++relatedGeneration;relatedIdentity=null;RelatedList.ItemsSource=null;RelatedStatus.Text="Select a clip";if(!ReferenceEquals(relationshipSession,current)){audioRelationships?.ClearBankGraphCache();audioRelationships=null;relationshipSession=null;}return;}
-        if(!current.IsEnrichmentComplete){relatedCancellation?.Cancel();++relatedGeneration;relatedIdentity=null;RelatedList.ItemsSource=null;RelatedStatus.Text="Indexing relationships…";return;}
+        if(!current.IsEnrichmentComplete)
+        {
+            relatedCancellation?.Cancel(); ++relatedGeneration; relatedIdentity=null; RelatedList.ItemsSource=null;
+            RelatedStatus.Text=current.CurrentProgress.Phase switch
+            {
+                "Cancelled" => "Relationships not indexed.",
+                "Enrichment failed" => "Relationships unavailable.",
+                _ => "Indexing relationships…"
+            };
+            return;
+        }
         if(relatedIdentity==row.Identity)return;
         relatedIdentity=row.Identity;relatedCancellation?.Cancel();relatedCancellation?.Dispose();relatedCancellation=new();var token=relatedCancellation.Token;var generation=++relatedGeneration;
         RelatedList.ItemsSource=null;RelatedStatus.Text="Loading relationships…";
@@ -37,8 +47,14 @@ public partial class AudioWindow
     }
     private static string RelatedLabel(AudioExplorerSession current,AssetRelationship link)
     {
+        if (AudioRelationshipPresentation.EventLabel(link, current.Catalog.Events) is {} eventLabel) return eventLabel;
         var target=link.NavigationTarget;
-        if(target is not null&&current.ResolveSelection([target]).FirstOrDefault() is{}media)return media.Label;
+        if(target is not null)
+        {
+            var media = current.ResolveSelection([target]);
+            if (media.Count == 1) return media[0].Label;
+            if (media.Count > 1) return string.Join(" / ", media.Select(row => row.Label).Distinct()) + " · Ambiguous";
+        }
         if(target is not null&&current.Catalog.Banks.FirstOrDefault(bank=>bank.Identity==target) is{}bank)
             return current.Banks.FirstOrDefault(choice=>choice.Key==bank.Key)?.Label??"Bank";
         return link.Kind switch{AssetRelationshipKind.Container=>"Container",AssetRelationshipKind.Member=>"Bank",AssetRelationshipKind.Media=>"Audio",AssetRelationshipKind.Event=>"Event",AssetRelationshipKind.Dependency=>"Playback reference",_=>link.Kind.ToString()};

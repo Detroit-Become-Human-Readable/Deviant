@@ -3,10 +3,11 @@
  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
  xmlns:local="clr-namespace:Deviant.Desktop" Foreground="{DynamicResource WindowForeground}">
  <DockPanel Margin="12">
-  <WrapPanel DockPanel.Dock="Top" Margin="0,0,0,8">
-   <Button Content="Back to scene" Click="Back_Click"/>
-   <TextBlock x:Name="ModelName" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center" Margin="8,0,0,0"/>
-  </WrapPanel>
+  <DockPanel DockPanel.Dock="Top" Margin="0,0,0,8">
+   <Button x:Name="BackButton" DockPanel.Dock="Left" Content="Back to scene" Click="Back_Click"/>
+   <TextBlock x:Name="ModelName" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center" Margin="8,0,0,0"
+              TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
+  </DockPanel>
   <DockPanel x:Name="ModelLoadingPanel" DockPanel.Dock="Top" Visibility="Collapsed" Margin="0,0,0,8">
    <local:ProcessingAnimation x:Name="ModelProcessing" DockPanel.Dock="Left" Margin="0,0,8,0"/>
    <StackPanel VerticalAlignment="Center"><DockPanel Margin="0,0,0,4"><TextBlock x:Name="ModelLoadingCount" DockPanel.Dock="Right" HorizontalAlignment="Right"/><TextBlock x:Name="ModelLoadingStage" Text="Preparing model"/></DockPanel>
@@ -14,15 +15,26 @@
    </StackPanel>
   </DockPanel>
   <TextBlock x:Name="ModelStatus" DockPanel.Dock="Bottom" TextWrapping="Wrap" Margin="0,6,0,0"/>
-  <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="6"/><ColumnDefinition Width="260"/></Grid.ColumnDefinitions>
+  <Grid x:Name="ModelLayout" SizeChanged="ModelLayout_SizeChanged"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="8"/><ColumnDefinition Width="260"/></Grid.ColumnDefinitions>
+   <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="0"/><RowDefinition Height="0"/></Grid.RowDefinitions>
    <local:AssetViewport x:Name="ModelViewport"/>
-   <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch"/>
-   <DockPanel Grid.Column="2" Margin="8,0,0,0">
+   <GridSplitter x:Name="ModelInspectorSplitter" Grid.Column="1" Width="8" HorizontalAlignment="Stretch" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" VerticalAlignment="Stretch" DragCompleted="ModelInspectorSplitter_DragCompleted"/>
+   <DockPanel x:Name="ModelInspector" Grid.Column="2" Margin="8,0,0,0" ClipToBounds="True">
+    <ToggleButton x:Name="ModelDetailsToggle" DockPanel.Dock="Top" Content="Details" IsChecked="True"
+                  HorizontalAlignment="Left" Margin="0,0,0,4" Visibility="Collapsed"
+                  Checked="ModelDetailsToggle_Changed" Unchecked="ModelDetailsToggle_Changed"/>
+    <DockPanel x:Name="ModelInspectorBody">
     <TextBlock x:Name="ModelSummary" DockPanel.Dock="Top" TextWrapping="Wrap" Margin="0,0,0,8"/>
     <TabControl>
      <TabItem Header="Textures"><ListBox x:Name="ModelTextures" DisplayMemberPath="Label" MouseDoubleClick="ModelTextures_DoubleClick"/></TabItem>
+     <TabItem x:Name="ModelAnimationTab" Header="Animation" Visibility="Collapsed">
+      <StackPanel Margin="8"><TextBlock x:Name="ModelAnimationName" TextTrimming="CharacterEllipsis" Margin="0,0,0,8"/>
+       <local:AnimationPlaybackView x:Name="ModelAnimationPlayback" PlaybackFailed="ModelAnimationFailed"/>
+      </StackPanel>
+     </TabItem>
      <TabItem Header="Details"><ScrollViewer VerticalScrollBarVisibility="Auto"><TextBox x:Name="ModelDetails" IsReadOnly="True" FontFamily="Consolas" TextWrapping="Wrap" BorderThickness="0"/></ScrollViewer></TabItem>
     </TabControl>
+    </DockPanel>
    </DockPanel>
   </Grid>
  </DockPanel>

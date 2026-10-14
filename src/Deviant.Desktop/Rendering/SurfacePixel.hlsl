@@ -1,6 +1,13 @@
 // HIDDEN_GRID_HELPER
 Texture2D<float3> texNormalMap : register(t1);
 SamplerState samplerSurface : register(s0);
+Texture2D<float> surfaceSceneDepth : register(t63);
+
+float ReadSceneViewDepth(float2 pixel)
+{
+    float depth = surfaceSceneDepth.Load(int3(int2(pixel), 0));
+    return mProjection._43 / (depth + mProjection._33);
+}
 
 float3 EncodeSrgb(float3 value)
 {
@@ -22,6 +29,7 @@ float4 main(PSInput input) : SV_Target
             + normalize(input.t2) * signedNormal.y);
     }
     // MATERIAL_BODY
+    if (surfaceUnlit) return float4(EncodeSrgb(surfaceColor), surfaceOpacity);
     float3 color = vLightAmbient.rgb * surfaceColor + input.c2.rgb;
     float3 view = normalize(input.vEye.xyz);
     for (int i = 0; i < NumLights; ++i)

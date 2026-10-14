@@ -1,7 +1,12 @@
 using System.Buffers.Binary;
 using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+using Deviant.Archives;
 using Deviant.Browser;
+using Deviant.Catalog;
 using Deviant.Core;
+using Microsoft.Data.Sqlite;
 using Xunit;
 
 namespace Deviant.Desktop.Tests;
@@ -22,7 +27,6 @@ public sealed class CatalogSessionTests : IAsyncDisposable
         await using var session = await CatalogSession.OpenAsync(Index, Cache, progress);
 
         Assert.Equal(4, session.Snapshot.Records.Count);
-        Assert.Contains(progress.Values, value => value.Phase == "Building catalog index");
         var page = await session.ReadPageAsync(new ResourceQuery(Type: 7, Limit: 1));
         Assert.Equal(3, page.Total);
         Assert.Single(page.Rows);
@@ -36,6 +40,9 @@ public sealed class CatalogSessionTests : IAsyncDisposable
             session.ReadPageAsync(new ResourceQuery(Package: 1, Limit: 10)));
         Assert.Equal(3, pages[0].Rows.Count);
         Assert.Single(pages[1].Rows);
+
+        await session.PersistenceTask;
+        Assert.Contains(progress.Values, value => value.Phase == "Building catalog index");
 
         await session.DisposeAsync();
         await Assert.ThrowsAnyAsync<ObjectDisposedException>(() => session.ReadPageAsync(new ResourceQuery()));
@@ -76,6 +83,80 @@ public sealed class CatalogSessionTests : IAsyncDisposable
         lease.Dispose();
         await disposal;
         await Assert.ThrowsAnyAsync<ObjectDisposedException>(() => session.ReadPageAsync(new ResourceQuery()));
+    }
+
+    [Fact]
+    public async Task SessionQueriesBeforePersistenceAndCancellingBuildLeavesCacheReusable()
+    {
+        WriteSyntheticArchive();
+        var sourceSnapshot = await new ArchiveReader().OpenAsync(Index);
+        var featureKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+            IndexLayout.ParserVersion + "\n" + SourceIdentity.IndexCacheKey(sourceSnapshot.IndexContentId)))).ToLowerInvariant();
+        Directory.CreateDirectory(Cache);
+        using var featureDatabase = new SqliteConnection(new SqliteConnectionStringBuilder
+        { DataSource = Path.Combine(Cache, "catalog-" + featureKey + ".sqlite3"), Mode = SqliteOpenMode.ReadWriteCreate, Pooling = false }.ToString());
+        featureDatabase.Open();
+        using (var journal = featureDatabase.CreateCommand()) { journal.CommandText = "PRAGMA journal_mode=WAL;"; journal.ExecuteNonQuery(); }
+        using (var begin = featureDatabase.CreateCommand()) { begin.CommandText = "BEGIN IMMEDIATE;"; begin.ExecuteNonQuery(); }
+        var featureWriteLockHeld = true;
+        using var persistenceEntered = new ManualResetEventSlim();
+        using var releasePersistence = new ManualResetEventSlim();
+        var progress = new InlineProgress(value =>
+        {
+            if (value.Phase != "Building catalog index" || value.Completed != 0) return;
+            persistenceEntered.Set();
+            releasePersistence.Wait();
+        });
+
+        Task<CatalogSession>? opening = null;
+        CatalogSession? session = null;
+        ArchiveSnapshot? snapshot = null;
+        try
+        {
+            opening = CatalogSession.OpenAsync(Index, Cache, progress);
+            Assert.True(await Task.Run(() => persistenceEntered.Wait(TimeSpan.FromSeconds(5))),
+                "Catalog persistence did not reach the deterministic gate.");
+
+            session = await opening.WaitAsync(TimeSpan.FromSeconds(2));
+            snapshot = session.Snapshot;
+            Assert.False(session.PersistenceTask.IsCompleted);
+            var page = await session.ReadPageAsync(new ResourceQuery(Type: 7, Limit: 10))
+                .WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.Equal(3, page.Total);
+            Assert.Equal(new long[] { 0, 2, 3 }, page.Rows.Select(row => row.Ordinal));
+
+            var disposal = session.DisposeAsync().AsTask();
+            Assert.False(disposal.IsCompleted);
+            releasePersistence.Set();
+            await disposal.WaitAsync(TimeSpan.FromSeconds(5));
+            session = null;
+
+            using (var rollback = featureDatabase.CreateCommand()) { rollback.CommandText = "ROLLBACK;"; rollback.ExecuteNonQuery(); }
+            featureWriteLockHeld = false;
+
+            using var reopened = CatalogService.Open(snapshot!, Cache);
+            Assert.False(reopened.ReusedIndexRows);
+            Assert.Equal(snapshot!.Records.Count, reopened.Count(new ResourceQuery(Limit: 10)));
+        }
+        finally
+        {
+            releasePersistence.Set();
+            if (featureWriteLockHeld)
+            {
+                try { using var rollback = featureDatabase.CreateCommand(); rollback.CommandText = "ROLLBACK;"; rollback.ExecuteNonQuery(); }
+                catch (SqliteException) { }
+            }
+            if (session is not null) await session.DisposeAsync();
+            else if (opening is not null && snapshot is null)
+            {
+                try
+                {
+                    var lateSession = await opening.WaitAsync(TimeSpan.FromSeconds(15));
+                    await lateSession.DisposeAsync();
+                }
+                catch (Exception) { }
+            }
+        }
     }
 
     [Fact]

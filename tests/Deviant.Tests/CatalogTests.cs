@@ -22,6 +22,30 @@ public sealed class CatalogTests : IDisposable
     }
 
     [Fact]
+    public void InMemoryQueriesMatchPersistedCatalogForFiltersSearchAndPaging()
+    {
+        var snapshot = Snapshot();
+        using var memory = CatalogService.OpenInMemory(snapshot);
+        using var persisted = CatalogService.Open(snapshot, cacheRoot);
+        ResourceQuery[] queries =
+        [
+            new(Type: 0x2A, Offset: 1, Limit: 1),
+            new(Id: 0xABC, Limit: 2),
+            new(Search: "0xabc", Limit: 10),
+            new(Search: "id:abc", Limit: 10),
+            new(Search: "ordinal:2", Limit: 10),
+            new(Search: "volume:sample.d01", Limit: 10),
+            new(Search: "%", Limit: 10)
+        ];
+
+        foreach (var query in queries)
+        {
+            Assert.Equal(persisted.Count(query), memory.Count(query));
+            Assert.Equal(persisted.Query(query).Select(row => row.Ordinal), memory.Query(query).Select(row => row.Ordinal));
+        }
+    }
+
+    [Fact]
     public void ReusesRawIndexRowsButRefreshesValidityForTheFreshSnapshot()
     {
         using (var initial = CatalogService.Open(Snapshot(), cacheRoot))

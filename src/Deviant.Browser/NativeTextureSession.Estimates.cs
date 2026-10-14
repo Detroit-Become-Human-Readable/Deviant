@@ -12,6 +12,10 @@ public sealed partial class NativeTextureSession
 {
     public async Task<NativeTextureSourceEstimate> EstimateNativeSourceAsync(ResourceIdentity nativeTextureIdentity,
         ResourceIdentity catalogIdentity, NativeContainerLease companion, CancellationToken token = default)
+        => await EstimateNativeSourceAsync(nativeTextureIdentity, catalogIdentity, companion, int.MaxValue, token).ConfigureAwait(false);
+
+    public async Task<NativeTextureSourceEstimate> EstimateNativeSourceAsync(ResourceIdentity nativeTextureIdentity,
+        ResourceIdentity catalogIdentity, NativeContainerLease companion, int maximumPreviewDimension, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(nativeTextureIdentity);
         ArgumentNullException.ThrowIfNull(catalogIdentity);
@@ -28,7 +32,7 @@ public sealed partial class NativeTextureSession
                 .ConfigureAwait(false);
             if (metadata is null)
                 throw new ArchiveException("TextureMetadataUnavailable", "Texture metadata is unavailable.");
-            var record = metadata.Value.Record;
+            var record = metadata.Record;
             if (record.References.Any(reference => reference.Resolution.Status != ReferenceStatus.Unique ||
                 reference.Resolution.Candidates.Count != 1))
                 throw new ArchiveException("AmbiguousNativeTextureReference", "Texture references are missing or ambiguous.");
@@ -46,8 +50,11 @@ public sealed partial class NativeTextureSession
             if (record.MipSizeCount > maximumMipCount)
                 throw new TextureFormatException("InvalidNativeTextureDimensions", "Texture dimensions or mip count are invalid.");
 
-            long retained = metadata.Value.Bytes.Length;
+            long retained = metadata.Bytes.Length;
             var identities = new HashSet<ResourceIdentity>();
+            var required = maximumPreviewDimension == int.MaxValue ? null
+                : NativeTextureDecoder.PlanPreview(CreateMetadataSource(nativeTextureIdentity, catalogIdentity, companion, metadata),
+                    maximumPreviewDimension, own.Token).RequiredPayloadIdentities;
             foreach (var reference in record.References)
             {
                 own.Token.ThrowIfCancellationRequested();
@@ -56,12 +63,12 @@ public sealed partial class NativeTextureSession
                     reference.Reference.Namespace != IdentifierNamespace.Archive ||
                     !uint.TryParse(reference.Reference.Id, NumberStyles.None, CultureInfo.InvariantCulture, out var nativeId))
                     throw new ArchiveException("TextureSourceMismatch", "The texture payload does not match its metadata.");
-                var rows = Snapshot.Records.Where(row => row.Ordinal == identity.Ordinal).Take(2).ToArray();
-                if (rows.Length != 1 || rows[0].Type != reference.Reference.ResourceType || rows[0].Id != nativeId)
+                var row = Snapshot.FindRecord(identity.Ordinal);
+                if (row is null || row.Type != reference.Reference.ResourceType || row.Id != nativeId)
                     throw new ArchiveException("TextureSourceMismatch", "The texture payload does not match its metadata.");
-                var row = rows[0];
                 if (row.Validity != ResourceValidity.Valid || row.StoredSize < 1 || row.StoredSize > MaximumResourceBytes)
                     throw new ArchiveException("TextureResourceLimit", "The texture source exceeds the supported resource limit.");
+                if (required is not null && !required.Contains(identity)) continue;
                 if (!identities.Add(identity)) continue;
                 if (row.StoredSize > MaximumRetainedSourceBytes - retained)
                     throw new ArchiveException("TextureSourceBudget", "The texture exceeds the source memory budget.");
@@ -69,7 +76,7 @@ public sealed partial class NativeTextureSession
             }
             companion.EnsureUnchanged(); own.Token.ThrowIfCancellationRequested();
             return new(retained, record.Mip0Width, record.Mip0Height, record.MipSizeCount,
-                record.PostSelectorBoolean, record.FirstByte, identities.Count, metadata.Value.Bytes.Length);
+                record.PostSelectorBoolean, record.FirstByte, identities.Count, metadata.Bytes.Length);
         }
         finally { readGate.Release(); }
     }

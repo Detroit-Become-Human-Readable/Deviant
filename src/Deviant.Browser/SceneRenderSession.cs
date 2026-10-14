@@ -1,6 +1,8 @@
 using System.Numerics;
 using Deviant.Assets;
 using Deviant.Core;
+using Deviant.Catalog;
+using System.Text.Json;
 using Deviant.Formats.Containers;
 using Deviant.Formats.Models;
 using Deviant.Formats.Scenes;
@@ -21,26 +23,37 @@ public sealed class SceneRenderSession : IAsyncDisposable
     private readonly LocalizationReferenceReader references = new();
     private readonly SemaphoreSlim loadGate = new(1, 1);
     private readonly CancellationTokenSource lifetime = new();
+    private readonly ArchiveSourceSession.Lease sourceSession;
+    private readonly CacheManager? preparedCache;
+    private readonly WorkspacePreparationScheduler? preparation;
+    private readonly bool ownsPreparation;
+    private readonly HashSet<string> preparedKeys = new(StringComparer.Ordinal);
     private bool disposed;
 
-    public SceneRenderSession(ArchiveSnapshot snapshot, NativeModelSession models, AssetMemoryBudget budget)
+    public SceneRenderSession(ArchiveSnapshot snapshot, NativeModelSession models, AssetMemoryBudget budget,
+        CacheManager? preparedCache = null, WorkspacePreparationScheduler? preparation = null)
     {
         this.snapshot = snapshot ?? throw new ArgumentNullException(nameof(snapshot));
         this.models = models ?? throw new ArgumentNullException(nameof(models));
         this.budget = budget ?? throw new ArgumentNullException(nameof(budget));
         if (models.Snapshot.IndexContentId != snapshot.IndexContentId) throw new ArchiveException("SourceChanged", "Model and scene sources differ.");
+        sourceSession = ArchiveSourceSession.Acquire(snapshot, (bytes, reason) => budget.Reserve(bytes, reason));
+        this.preparedCache = preparedCache;
+        this.preparation = preparation ?? (preparedCache is not null ? new WorkspacePreparationScheduler() : null);
+        ownsPreparation = preparation is null && this.preparation is not null;
     }
 
     public ArchiveSnapshot Snapshot => snapshot;
     public SourceRevision Revision => new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp);
 
     public async Task<RenderAssetSnapshot> LoadAsync(SceneRenderRequest request,
-        IProgress<RenderLoadProgress>? progress = null, CancellationToken token = default)
+        IProgress<RenderLoadProgress>? progress = null, CancellationToken token = default,
+        Func<RenderAssetSnapshot, CancellationToken, Task>? geometryReady = null)
     {
         ObjectDisposedException.ThrowIf(disposed, this);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
         await loadGate.WaitAsync(linked.Token).ConfigureAwait(false);
-        try { return await Task.Run(() => LoadCoreAsync(request, progress, linked.Token), linked.Token).ConfigureAwait(false); }
+        try { return await Task.Run(() => LoadCoreAsync(request, progress, linked.Token, geometryReady), linked.Token).ConfigureAwait(false); }
         finally { loadGate.Release(); }
     }
 
@@ -93,81 +106,244 @@ public sealed class SceneRenderSession : IAsyncDisposable
     }
 
     private async Task<RenderAssetSnapshot> LoadCoreAsync(SceneRenderRequest request,
-        IProgress<RenderLoadProgress>? progress, CancellationToken token)
+        IProgress<RenderLoadProgress>? progress, CancellationToken token,
+        Func<RenderAssetSnapshot, CancellationToken, Task>? geometryReady)
     {
-        if (request.MaximumPreviewDimension is < 1 or > 4096)
-            throw new ArgumentOutOfRangeException(nameof(request), "The preview dimension must be between 1 and 4096.");
-        var meshes = new Dictionary<string, RenderMesh>(StringComparer.Ordinal);
-        var materials = new Dictionary<ResourceIdentity, RenderMaterial>();
-        var resources = new List<IDisposable>();
-        if (request.AllowLargeData) resources.Add(budget.AllowLargeSceneLoad());
-        try
+        ValidateRequest(request);
+        using var foreground = preparation?.EnterForeground();
+        if (preparation is not null) await preparation.DrainAsync(token).ConfigureAwait(false);
+        var key = CreatePreparedKey(request, Revision);
+        if (preparedCache is not null)
         {
-            using var layout = await ReadLayoutAsync(request, progress, token).ConfigureAwait(false);
-            var issues = new List<RenderIssue>(layout.Issues);
-            var sourceExtents = new List<SourceExtent>(layout.SourceExtents);
-            resources.Add(layout.TakeReservation());
-            foreach (var itemGroup in layout.Work.GroupBy(item => (item.ContainerLeaseIdentity.Key, item.CatalogIdentity.Key)))
+            var cached = await preparedCache.TryAcquirePreparedAsync("scenes", key, ".scene",
+                (path, cancellation) => PreparedSceneCodec.ValidateAsync(path, key, Revision, cancellation, budget), token).ConfigureAwait(false);
+            if (cached is not null)
             {
-                token.ThrowIfCancellationRequested();
-                var item = itemGroup.First();
-                using var lease = await NativeContainerLease.OpenAsync(snapshot, item.ContainerLeaseIdentity, budget, token,
-                    allowLargeData: request.AllowLargeData).ConfigureAwait(false);
-                var selections = itemGroup.SelectMany(value => value.Selections)
-                    .DistinctBy(selection => $"{selection.MeshIdentity.Key}/{selection.GroupIndex}").ToArray();
-                var batch = await models.LoadAsync(lease, item.CatalogIdentity,
-                    selections.Select(selection => new NativeModelSelection(selection.MeshIdentity, selection.GroupIndex)).ToArray(),
-                    progress, token, maximumPreviewDimension: request.Scope == SceneRenderScope.Scene
-                        ? Math.Min(256, request.MaximumPreviewDimension) : request.MaximumPreviewDimension,
-                    maximumSelections: request.AllowLargeData ? NativeModelSession.MaximumLargeSelections
-                        : NativeModelSession.MaximumSelections).ConfigureAwait(false);
-                resources.Add(batch);
-                foreach (var mesh in batch.Meshes) meshes[mesh.Key] = mesh.Value;
-                foreach (var material in batch.Materials) materials[material.Key] = material.Value;
-                issues.AddRange(batch.Issues);
-                sourceExtents.AddRange(batch.SourceExtents);
+                try
+                {
+                    var result = await PreparedSceneCodec.ReadAsync(cached.Path, key, sourceSession.Session,
+                        snapshot, budget, request.AllowLargeData, token).ConfigureAwait(false);
+                    result.OwnPreparedResource(cached);
+                    AssetLoadDiagnostics.Cache("PreparedScene", key, true);
+                    return result;
+                }
+                catch { await cached.DisposeAsync().ConfigureAwait(false); throw; }
             }
-            var occurrences = layout.Occurrences.Select(item => new RenderOccurrence(item.Key, item.Entity, item.Node,
-                item.Label, $"{item.MeshIdentity.Key}/group/{item.GroupIndex}", item.World, item.Bounds, item.InstancePath)
-                { NativeFlags = item.NativeFlags, SourceVisible = (item.NativeFlags & 1) != 0 }).ToArray();
-            var renderedParts = layout.Occurrences.Sum(item => meshes.TryGetValue($"{item.MeshIdentity.Key}/group/{item.GroupIndex}", out var mesh)
-                ? mesh.Geometry.Primitives.Count : 0);
-            var distinctExtents = sourceExtents.DistinctBy(item =>
-                (item.RelativeSource, item.Offset, item.Length, item.PayloadSha256)).ToArray();
-            var verificationLimit = request.AllowLargeData ? MaximumLargeSourceVerificationBytes
-                : request.Scope == SceneRenderScope.Scene ? 2L * 1024 * 1024 * 1024
-                : SourceExtentVerifier.DefaultMaximumBytes;
-            var verificationExtentLimit = request.AllowLargeData ? SourceExtentVerifier.MaximumLargeExtentCount
-                : SourceExtentVerifier.MaximumExtentCount;
-            if (distinctExtents.Length > verificationExtentLimit)
-                throw new ArchiveException("SceneVerificationLimit", "Scene source verification exceeds its extent limit.");
-            long verificationBytes = 0;
-            foreach (var extent in distinctExtents)
-                verificationBytes = checked(verificationBytes + extent.Length);
-            if (verificationBytes > verificationLimit)
-                throw new ArchiveException("SceneVerificationLimit", "Scene source verification exceeds its byte limit.");
-            var finalVerification = await new SourceExtentVerifier().AcquireAsync(snapshot,
-                distinctExtents, token, maximumBytes: verificationLimit,
-                maximumExtentCount: verificationExtentLimit).ConfigureAwait(false);
-            resources.Add(finalVerification);
-            var region = request.Scope == SceneRenderScope.Region || occurrences.Length == 0
-                ? request.Region : BoundsOf(occurrences.Select(item => item.WorldBounds));
-            return new(Revision, meshes, occurrences, materials, region, issues, layout.Hierarchy,
-                layout.Coverage with { RenderedParts = renderedParts }, distinctExtents, budget, resources);
         }
-        catch { foreach (var resource in resources) resource.Dispose(); throw; }
+        AssetLoadDiagnostics.Cache("PreparedScene", key, false);
+        var fresh = await LoadUnpreparedAsync(request, progress, token, geometryReady).ConfigureAwait(false);
+        if (preparedCache is not null && preparation is not null)
+        {
+            preparedKeys.Add("scene/" + key);
+            preparation.Enqueue("scene/" + key, async cancellation =>
+            {
+                using var publication = await preparedCache.AcquirePreparedAsync("scenes", key, ".scene",
+                    async (path, jobToken) =>
+                    {
+                        await PreparedSceneCodec.WriteAsync(path, key, fresh, jobToken).ConfigureAwait(false);
+                        sourceSession.Session.EnsureCurrent();
+                    }, async (path, jobToken) =>
+                    {
+                        if (!await PreparedSceneCodec.ValidateAsync(path, key, Revision, jobToken).ConfigureAwait(false)) return false;
+                        await sourceSession.Session.VerifyAsync(fresh.SourceExtents, jobToken,
+                            SourceExtentVerifier.MaximumBytes, SourceExtentVerifier.MaximumLargeExtentCount).ConfigureAwait(false);
+                        sourceSession.Session.EnsureCurrent(); return true;
+                    }, cancellation).ConfigureAwait(false);
+                sourceSession.Session.EnsureCurrent();
+            }, fresh.AcquireLease());
+        }
+        return fresh;
     }
 
-    private async Task<SceneLayoutData> ReadLayoutAsync(SceneRenderRequest request,
-        IProgress<RenderLoadProgress>? progress, CancellationToken token, bool boundsOnly = false)
+    private async Task<RenderAssetSnapshot> LoadUnpreparedAsync(SceneRenderRequest request,
+        IProgress<RenderLoadProgress>? progress, CancellationToken token,
+        Func<RenderAssetSnapshot, CancellationToken, Task>? geometryReady)
     {
+        int dimension = MaterialPreviewDimension(request);
+        var meshes = new Dictionary<string, RenderMesh>(StringComparer.Ordinal);
+        var materials = new Dictionary<ResourceIdentity, RenderMaterial>();
+        var stagedOccurrences = new Dictionary<string, RenderOccurrence>(StringComparer.Ordinal);
+        var stagedHierarchy = new Dictionary<string, RenderHierarchyNode>(StringComparer.Ordinal);
+        var issues = new List<RenderIssue>();
+        var sourceExtents = new List<SourceExtent>();
+        var resources = new RenderResourceGroup();
+        var resultGate = new object();
+        using var publicationGate = new SemaphoreSlim(1, 1);
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var workToken = cancellation.Token;
+        var geometryQueue = System.Threading.Channels.Channel.CreateBounded<LayoutPublication>(4);
+        var materialQueue = System.Threading.Channels.Channel.CreateBounded<MaterialPreparation>(4);
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo? failure = null;
+        var scheduled = new Dictionary<(string Container, string Catalog), HashSet<MeshSelection>>();
+        long lastPublication = 0;
+        int selectionLimit = request.AllowLargeData ? NativeModelSession.MaximumLargeSelections : NativeModelSession.MaximumSelections;
+        if (request.AllowLargeData) resources.Add(budget.AllowLargeSceneLoad());
+        var geometryWorkers = Enumerable.Range(0, 2).Select(_ => Task.Run(() => GuardAsync(PrepareGeometryAsync))).ToArray();
+        var materialWorkers = Enumerable.Range(0, 6).Select(_ => Task.Run(() => GuardAsync(PrepareMaterialsAsync))).ToArray();
+        try
+        {
+            using var layout = await ReadLayoutAsync(request, progress, workToken, publishLayout: async (packet, jobToken) =>
+            {
+                var key = (packet.Metadata.ContainerLeaseIdentity.Key, packet.Metadata.CatalogIdentity.Key);
+                if (!scheduled.TryGetValue(key, out var seen)) scheduled.Add(key, seen = []);
+                var fresh = packet.Metadata.Selections.Where(selection => seen.Add(selection)).ToArray();
+                lock (resultGate)
+                {
+                    foreach (var row in packet.Occurrences)
+                        stagedOccurrences[row.Key] = new(row.Key, row.Entity, row.Node, row.Label,
+                            $"{row.MeshIdentity.Key}/group/{row.GroupIndex}", row.World, row.Bounds, row.InstancePath)
+                        { NativeFlags = row.NativeFlags, SourceVisible = (row.NativeFlags & 1) != 0 };
+                    foreach (var node in packet.Hierarchy) stagedHierarchy[node.Key] = node;
+                }
+                var queued = packet with
+                {
+                    Metadata = packet.Metadata with { Selections = fresh, NestedCatalogs = [] },
+                    Reservation = budget.Reserve(checked(4096L + packet.Occurrences.Count * 2048L +
+                        packet.Hierarchy.Count * 2048L + packet.Extents.Count * 256L), "queued scene layout")
+                };
+                try { await geometryQueue.Writer.WriteAsync(queued, jobToken).ConfigureAwait(false); }
+                catch { queued.Dispose(); throw; }
+            }).ConfigureAwait(false);
+            geometryQueue.Writer.TryComplete();
+            await Task.WhenAll(geometryWorkers).ConfigureAwait(false);
+            await PublishAsync(layout.SourceExtents, force: true).ConfigureAwait(false);
+            materialQueue.Writer.TryComplete();
+            await Task.WhenAll(materialWorkers).ConfigureAwait(false);
+            workToken.ThrowIfCancellationRequested();
+            resources.Add(layout.TakeReservation());
+            issues.AddRange(layout.Issues); sourceExtents.AddRange(layout.SourceExtents);
+            var occurrences = layout.Occurrences.Select(row => new RenderOccurrence(row.Key, row.Entity, row.Node, row.Label,
+                $"{row.MeshIdentity.Key}/group/{row.GroupIndex}", row.World, row.Bounds, row.InstancePath)
+                { NativeFlags = row.NativeFlags, SourceVisible = (row.NativeFlags & 1) != 0 }).ToArray();
+            var distinctExtents = sourceExtents.DistinctBy(row => (row.RelativeSource, row.Offset, row.Length, row.PayloadSha256)).ToArray();
+            long verificationLimit = request.AllowLargeData ? MaximumLargeSourceVerificationBytes :
+                request.Scope == SceneRenderScope.Scene ? 2L * 1024 * 1024 * 1024 : SourceExtentVerifier.DefaultMaximumBytes;
+            int extentLimit = request.AllowLargeData ? SourceExtentVerifier.MaximumLargeExtentCount : SourceExtentVerifier.MaximumExtentCount;
+            if (distinctExtents.Length > extentLimit || distinctExtents.Sum(row => row.Length) > verificationLimit)
+                throw new ArchiveException("SceneVerificationLimit", "Scene source verification exceeds its limit.");
+            resources.Add(await new SourceExtentVerifier().AcquireAsync(snapshot, distinctExtents, workToken,
+                maximumBytes: verificationLimit, maximumExtentCount: extentLimit).ConfigureAwait(false));
+            var region = request.Scope == SceneRenderScope.Region || occurrences.Length == 0 ? request.Region : BoundsOf(occurrences.Select(row => row.WorldBounds));
+            int renderedParts = occurrences.Sum(row => meshes.TryGetValue(row.GeometryKey, out var mesh) ? mesh.Geometry.Primitives.Count : 0);
+            return new(Revision, meshes, occurrences, materials, region, issues, layout.Hierarchy,
+                layout.Coverage with { RenderedParts = renderedParts }, distinctExtents, budget, [resources]);
+        }
+        catch
+        {
+            await cancellation.CancelAsync().ConfigureAwait(false);
+            geometryQueue.Writer.TryComplete(); materialQueue.Writer.TryComplete();
+            try { await Task.WhenAll(geometryWorkers.Concat(materialWorkers)).ConfigureAwait(false); } catch { }
+            while (geometryQueue.Reader.TryRead(out var packet)) packet.Dispose();
+            while (materialQueue.Reader.TryRead(out var job)) job.Dispose();
+            resources.Dispose(); failure?.Throw(); throw;
+        }
+
+        async Task GuardAsync(Func<Task> operation)
+        {
+            try { await operation().ConfigureAwait(false); }
+            catch (Exception error)
+            {
+                if (error is not OperationCanceledException)
+                    Interlocked.CompareExchange(ref failure, System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error), null);
+                await cancellation.CancelAsync().ConfigureAwait(false); throw;
+            }
+        }
+
+        async Task PrepareGeometryAsync()
+        {
+            await foreach (var packet in geometryQueue.Reader.ReadAllAsync(workToken).ConfigureAwait(false))
+            using (packet)
+            {
+                if (packet.Metadata.Selections.Count == 0) { await PublishAsync(packet.Extents).ConfigureAwait(false); continue; }
+                NativeContainerLease? container = null; NativeModelBatch? geometry = null;
+                try
+                {
+                    container = await NativeContainerLease.OpenMetadataAsync(snapshot, packet.Metadata.ContainerLeaseIdentity, budget,
+                        workToken, allowLargeData: request.AllowLargeData).ConfigureAwait(false);
+                    geometry = await models.LoadGeometryAsync(container, packet.Metadata.CatalogIdentity,
+                        packet.Metadata.Selections.Select(row => new NativeModelSelection(row.MeshIdentity, row.GroupIndex)).ToArray(),
+                        progress, workToken, dimension, selectionLimit).ConfigureAwait(false);
+                    resources.Add(geometry.AcquireLease());
+                    lock (resultGate) foreach (var mesh in geometry.Meshes) meshes[mesh.Key] = mesh.Value;
+                    await PublishAsync(packet.Extents).ConfigureAwait(false);
+                    await materialQueue.Writer.WriteAsync(new(container, geometry, packet.Metadata.CatalogIdentity), workToken).ConfigureAwait(false);
+                    container = null; geometry = null;
+                }
+                finally { geometry?.Dispose(); container?.Dispose(); }
+            }
+        }
+
+        async Task PrepareMaterialsAsync()
+        {
+            await foreach (var job in materialQueue.Reader.ReadAllAsync(workToken).ConfigureAwait(false))
+            using (job)
+            {
+                var batch = await models.LoadMaterialsAsync(job.Container, job.Catalog, job.Geometry,
+                    progress, workToken, dimension).ConfigureAwait(false);
+                resources.Add(batch);
+                lock (resultGate)
+                {
+                    foreach (var material in batch.Materials) materials[material.Key] = material.Value;
+                    issues.AddRange(batch.Issues); sourceExtents.AddRange(batch.SourceExtents);
+                }
+            }
+        }
+
+        async Task PublishAsync(IReadOnlyList<SourceExtent> extents, bool force = false)
+        {
+            if (geometryReady is null) return;
+            await publicationGate.WaitAsync(workToken).ConfigureAwait(false);
+            try
+            {
+                if (!force && lastPublication != 0 &&
+                    System.Diagnostics.Stopwatch.GetElapsedTime(lastPublication) < TimeSpan.FromMilliseconds(100)) return;
+                Dictionary<string, RenderMesh> published; RenderOccurrence[] occurrences; RenderHierarchyNode[] hierarchy;
+                lock (resultGate)
+                {
+                    published = new(meshes, StringComparer.Ordinal);
+                    occurrences = stagedOccurrences.Values.Where(row => published.ContainsKey(row.GeometryKey)).ToArray();
+                    hierarchy = stagedHierarchy.Values.ToArray();
+                }
+                if (occurrences.Length == 0) return;
+                var visible = occurrences.Where(row => row.SourceVisible).Select(row => row.WorldBounds).ToArray();
+                var region = BoundsOf(visible.Length > 0 ? visible : occurrences.Select(row => row.WorldBounds));
+                using var slice = new RenderAssetSnapshot(Revision, published, occurrences,
+                    new Dictionary<ResourceIdentity, RenderMaterial>(), region, [], hierarchy,
+                    new(occurrences.Length, occurrences.Length, 0, 0, 0, 0), extents, budget, [resources.AcquireLease()]);
+                sourceSession.Session.EnsureCurrent();
+                await geometryReady(slice, workToken).ConfigureAwait(false);
+                lastPublication = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
+            finally { publicationGate.Release(); }
+        }
+    }
+    private static int MaterialPreviewDimension(SceneRenderRequest request)
+    {
+        if (request.MaximumPreviewDimension is < 1 or > 4096)
+            throw new ArgumentOutOfRangeException(nameof(request));
+        // Geometry is published before material preparation finishes. The returned and
+        // cached materials must already have the requested detail for every scene scope.
+        return request.MaximumPreviewDimension;
+    }
+
+    private static string CreatePreparedKey(SceneRenderRequest request, SourceRevision revision) =>
+        CacheManager.PreparedKey("scenes", PreparedSceneCodec.Profile + "/" + NativeTextureDecoder.PreviewVersion,
+            revision.IndexContentId + "/" + revision.PhysicalSourceStamp,
+            JsonSerializer.Serialize(new { Section = request.Section.Descriptor.Identity.Key, Branch = request.BranchInstance.Key,
+                request.Scope, request.Region, request.MaximumPreviewDimension }, new JsonSerializerOptions { IncludeFields = true }));
+
+    private async Task<SceneLayoutData> ReadLayoutAsync(SceneRenderRequest request,
+        IProgress<RenderLoadProgress>? progress, CancellationToken token, bool boundsOnly = false,
+        Func<LayoutPublication, CancellationToken, Task>? publishLayout = null)
+    {
+        using var timing = AssetLoadDiagnostics.Measure("SceneLayout", request.Section.Descriptor.Identity.Key);
         ValidateRequest(request);
         var section = request.Section.Result.Value ?? throw new ArchiveException("SceneUnavailable", "The scene section is unavailable.");
         var graphLimit = boundsOnly ? request.AllowLargeData ? 512L * 1024 * 1024 : 32L * 1024 * 1024
             : request.AllowLargeData ? 512L * 1024 * 1024
             : request.Scope == SceneRenderScope.Scene ? 2 * MaximumGraphBytes : MaximumGraphBytes;
-        using var graphScratch = budget.Reserve(graphLimit, "scene graph and metadata");
-        long graphBytes = 1024 * 1024;
+        using var graphMemory = new SceneGraphMemory(budget, graphLimit);
+        graphMemory.Grow(1024 * 1024);
         TrackGraph(section.Objects.Sum(frame => (long)frame.RawPayload.Length + frame.RawHeader.Length + 1024));
         var issues = new List<RenderIssue>();
         var sourceExtents = new List<SourceExtent>(request.Section.Result.Extents);
@@ -178,8 +354,9 @@ public sealed class SceneRenderSession : IAsyncDisposable
         var catalogInstanceLimit = request.AllowLargeData ? MaximumLargeCatalogOccurrences : MaximumCatalogOccurrences;
         var pending = new Queue<CatalogWork>();
         var testedOccurrences = 0; var outsideOccurrences = 0;
+        TrackGraph(checked(section.CatalogInstances.Count * 32L + request.Section.Result.Extents.Count * 256L));
         var roots = request.Scope == SceneRenderScope.Scene
-            ? section.CatalogInstances.ToArray()
+            ? section.CatalogInstances.OrderByDescending(root => root.Identity == request.BranchInstance).ToArray()
             : [section.CatalogInstances.Single(instance => instance.Identity == request.BranchInstance)];
         foreach (var root in roots)
         {
@@ -191,18 +368,19 @@ public sealed class SceneRenderSession : IAsyncDisposable
                 var branchBinding = request.Section.ReferencesByNode.GetValueOrDefault(branchNode.Identity)?
                     .FirstOrDefault(item => item.Kind == AssetRelationshipKind.Container && item.NavigationTarget is not null);
                 if (branchBinding?.NavigationTarget is not { } firstContainer)
-                { issues.Add(new(root.Identity, "CatalogBindingMissing", "The selected branch has no verified catalog target.")); continue; }
+                { AddIssue(issues, new(root.Identity, "CatalogBindingMissing", "The selected branch has no verified catalog target.")); continue; }
                 var companion = await ResolveCompanionAsync(firstContainer, token).ConfigureAwait(false);
                 if (companion is null)
-                { issues.Add(new(firstContainer, "CatalogCompanionMissing", "The selected catalog has no unique type-29 companion.")); continue; }
+                { AddIssue(issues, new(firstContainer, "CatalogCompanionMissing", "The selected catalog has no unique type-29 companion.")); continue; }
                 catalogInstanceCount++;
                 if (catalogInstanceCount > catalogInstanceLimit)
                     throw new ArchiveException("SceneInstanceLimit", "The scene exceeds the catalog instance limit.");
+                TrackGraph(4096L + root.InstanceName.Length * 2L);
                 pending.Enqueue(new(companion, firstContainer, branchNode.Identity, branchWorld,
                     [root.Identity], [companion], 0, root.InstanceName));
             }
             catch (ArchiveException error) when (request.Scope == SceneRenderScope.Scene && !IsWorkloadLimit(error))
-            { issues.Add(new(root.Identity, error.Code, error.Message)); }
+            { AddIssue(issues, new(root.Identity, error.Code, error.Message)); }
         }
         while (pending.Count > 0)
         {
@@ -211,36 +389,49 @@ public sealed class SceneRenderSession : IAsyncDisposable
             if (item.ContainerPath.Count != item.ContainerPath.Distinct().Count()) continue;
             if (item.Depth > 64)
             {
-                issues.Add(new(item.Container, "CatalogDepthLimit", "Catalog traversal exceeded the depth limit."));
+                AddIssue(issues, new(item.Container, "CatalogDepthLimit", "Catalog traversal exceeded the depth limit."));
                 continue;
             }
             progress?.Report(new("Metadata", work.Count, work.Count + pending.Count + 1, budget.UsedBytes));
             NativeContainerLease lease;
-            try { lease = await NativeContainerLease.OpenAsync(snapshot, item.Container, budget, token,
+            try { lease = await NativeContainerLease.OpenMetadataAsync(snapshot, item.Container, budget, token,
                 allowLargeData: request.AllowLargeData).ConfigureAwait(false); }
             catch (ArchiveException error) when (IsWorkloadLimit(error)) { throw; }
             catch (Exception error) when (error is ArchiveException or IOException or InvalidDataException)
-            { issues.Add(new(item.Container, "ContainerUnavailable", error.Message)); continue; }
+            { AddIssue(issues, new(item.Container, "ContainerUnavailable", error.Message)); continue; }
             try
             {
                 traversedContainers++;
+                TrackGraph(checked(4096L + lease.SourceExtents.Count * 256L));
                 sourceExtents.AddRange(lease.SourceExtents);
+                int occurrenceStart = occurrenceRecords.Count;
+                int hierarchyStart = hierarchy.Count;
                 var metadata = ReadContainerMetadata(lease.Directory, lease.SourceExtents, item, request.Region, hierarchy, issues, token);
                 if (metadata.Selections.Count > 0) work.Add(metadata with { NestedCatalogs = [] });
+                if (publishLayout is not null && metadata.Selections.Count > 0)
+                {
+                    await publishLayout(new(metadata, occurrenceRecords.Skip(occurrenceStart).ToArray(),
+                        hierarchy.Values.Skip(hierarchyStart).ToArray(), lease.SourceExtents.ToArray()), token).ConfigureAwait(false);
+                }
+                TrackGraph(checked(metadata.SourceExtents.Count * 256L));
                 sourceExtents.AddRange(metadata.SourceExtents);
                 catalogInstanceCount += metadata.NestedCatalogs.Count;
                 if (catalogInstanceCount > catalogInstanceLimit)
                     throw new ArchiveException("SceneInstanceLimit", "The scene exceeds the catalog instance limit.");
+                using var referenceScratch = graphMemory.ReserveScratch(checked(64L * 1024 + lease.Directory.Objects.Count * 1024L));
+                var nativeResolver = new NativeReferenceResolver(lease.Directory);
                 foreach (var nested in metadata.NestedCatalogs)
                 {
-                    var binding = await bindings.ResolveAsync(snapshot, lease.Directory, nested.NodeIdentity, nested.Instance, token).ConfigureAwait(false);
+                    var binding = await bindings.ResolveAsync(snapshot, lease.Directory, nested.NodeIdentity, nested.Instance, token, nativeResolver).ConfigureAwait(false);
                     if (!binding.Relationship.Evidence.Verified || binding.CompanionIdentity is not { } child)
                     {
-                        issues.Add(new(nested.Instance.Identity, "CatalogBindingUnavailable", binding.Diagnostic ?? "Catalog binding failed."));
+                        AddIssue(issues, new(nested.Instance.Identity, "CatalogBindingUnavailable", binding.Diagnostic ?? "Catalog binding failed."));
                         continue;
                     }
+                    TrackGraph(256);
                     sourceExtents.Add(binding.CatalogExtent!);
                     if (item.ContainerPath.Contains(child)) continue;
+                    TrackGraph(checked(4096L + (item.InstancePath.Count + item.ContainerPath.Count + 2L) * 128L));
                     pending.Enqueue(new(child, binding.CatalogIdentity, nested.NodeIdentity,
                         nested.World, [.. item.InstancePath, nested.Instance.Identity], [.. item.ContainerPath, child], item.Depth + 1,
                         nested.Instance.InstanceName));
@@ -249,22 +440,35 @@ public sealed class SceneRenderSession : IAsyncDisposable
             finally { lease.Dispose(); }
         }
 
-        var retained = budget.Reserve(graphBytes, "scene layout");
-        return new(hierarchy.Values.ToArray(), work, occurrenceRecords, issues, sourceExtents,
+        TrackGraph(checked(hierarchy.Count * 16L + work.Count * 8L + occurrenceRecords.Count * 8L + sourceExtents.Count * 8L));
+        var finalHierarchy = hierarchy.Values.ToArray();
+        return new(finalHierarchy, work, occurrenceRecords, issues, sourceExtents,
             new(testedOccurrences, occurrenceRecords.Count, outsideOccurrences, 0, traversedContainers, catalogInstanceCount),
-            graphBytes, retained);
+            graphMemory.Bytes, graphMemory.Transfer());
 
         void TrackGraph(long bytes)
         {
-            if (bytes < 0 || bytes > graphLimit - graphBytes)
-                throw new ArchiveException("SceneGraphLimit", "The scene graph exceeds its memory limit.");
-            graphBytes += bytes;
+            graphMemory.Grow(bytes);
+        }
+
+        void AddIssue(List<RenderIssue> target, RenderIssue issue)
+        {
+            TrackGraph(checked(1024L + issue.Code.Length * 2L + issue.Message.Length * 2L));
+            target.Add(issue);
         }
 
         ContainerMetadata ReadContainerMetadata(NativeObjectDirectoryDocument directory, IReadOnlyList<SourceExtent> physicalExtents, CatalogWork owner,
             GeometryBounds region, Dictionary<string, RenderHierarchyNode> hierarchyNodes, List<RenderIssue> diagnostics,
             CancellationToken cancellation)
         {
+            // Raw directory and payload bytes belong to the container lease. These
+            // reservations cover parsed nodes, transform copies, hierarchy work maps,
+            // reference indexes and parser objects until this owner has been projected.
+            var nodeCount = directory.Objects.Count(frame => frame.NativeType == NodeRecordReader.NativeType);
+            using var ownerScratch = graphMemory.ReserveScratch(checked(1024L * 1024 +
+                directory.Objects.Count * 2048L + nodeCount * 8192L +
+                nodeCount * (long)physicalExtents.Count * 32L));
+            using var meshMetadataScratch = new RenderResourceGroup();
             var nodes = directory.Objects.Where(frame => frame.NativeType == 2002)
                 .Select(frame => new NodeRecordReader().Read(frame, directory.Revision, physicalExtents, token: cancellation).Value)
                 .Where(record => record is not null).Select(record => record!).ToArray();
@@ -274,17 +478,21 @@ public sealed class SceneRenderSession : IAsyncDisposable
             var nodeByIdentity = graph.Nodes.ToDictionary(node => node.Identity);
             var meshMetadata = new Dictionary<ResourceIdentity, NativeMeshDataDocument>();
             var entityReader = new SceneEntityReader(); var meshReader = new NativeMeshEntityReader();
+            var lodResolver = new NativeReferenceResolver(directory);
+            var framesByIdentity = directory.Objects.ToDictionary(frame => frame.Identity);
             var nestedCatalogs = new List<NestedCatalog>(); var selections = new List<MeshSelection>();
             var extents = new List<SourceExtent>();
             foreach (var frame in directory.Objects)
             {
                 cancellation.ThrowIfCancellationRequested();
+                using var entityScratch = frame.NativeType is 2009 || frame.NativeType == SceneCatalogInstanceReader.NativeType
+                    ? graphMemory.ReserveScratch(checked(4096L + frame.RawPayload.Length * 32L)) : null;
                 if (frame.NativeType == SceneCatalogInstanceReader.NativeType && entityReader.TryRead(frame, out var entity, out _) && entity is not null &&
                     new SceneCatalogInstanceReader().TryRead(frame, entity, out var instance, out _) && instance is not null &&
                     nodeById.TryGetValue(ParseNodeId(entity.Node), out var instanceNode))
                 {
                     if (instanceNode.TransformStatus != SceneTransformStatus.Available || instanceNode.WorldTransform is null)
-                        diagnostics.Add(new(instance.Identity, "InstanceTransformUnavailable", "The catalog instance transform is unavailable."));
+                        AddIssue(diagnostics, new(instance.Identity, "InstanceTransformUnavailable", "The catalog instance transform is unavailable."));
                     else
                     {
                         TrackGraph(4096L + instance.InstanceName.Length * 2L + instance.CatalogName.Length * 2L + owner.InstancePath.Count * 512L);
@@ -294,28 +502,41 @@ public sealed class SceneRenderSession : IAsyncDisposable
                 if (frame.NativeType != 2009) continue;
                 testedOccurrences++;
                 if (!entityReader.TryRead(frame, out var meshEntity, out var entityDiagnostic) || meshEntity is null)
-                { diagnostics.Add(new(frame.Identity, "EntityParseFailed", entityDiagnostic ?? "ENTITY v7 could not be read.")); continue; }
+                { AddIssue(diagnostics, new(frame.Identity, "EntityParseFailed", entityDiagnostic ?? "ENTITY v7 could not be read.")); continue; }
                 if (!meshReader.TryRead(frame, meshEntity, out var meshDocument, out var meshDiagnostic, cancellation) || meshDocument is null)
-                { diagnostics.Add(new(frame.Identity, "MeshEntityParseFailed", meshDiagnostic ?? "MESH____ v29 could not be read.")); continue; }
+                { AddIssue(diagnostics, new(frame.Identity, "MeshEntityParseFailed", meshDiagnostic ?? "MESH____ v29 could not be read.")); continue; }
                 var meshNodeId = ParseNodeId(meshEntity.Node);
                 if (meshNodeId == 0 || !nodeById.TryGetValue(meshNodeId, out var meshNode))
-                { diagnostics.Add(new(frame.Identity, "MeshNodeMissing", $"The mesh entity references NODE {meshNodeId}.")); continue; }
+                { AddIssue(diagnostics, new(frame.Identity, "MeshNodeMissing", $"The mesh entity references NODE {meshNodeId}.")); continue; }
                 if (meshNode.TransformStatus != SceneTransformStatus.Available || meshNode.WorldTransform is null)
-                { diagnostics.Add(new(frame.Identity, "MeshTransformUnavailable", "The mesh transform is unavailable.")); continue; }
+                { AddIssue(diagnostics, new(frame.Identity, "MeshTransformUnavailable", "The mesh transform is unavailable.")); continue; }
                 var world = Compose(meshNode.WorldTransform, owner.OwnerWorld);
-                var meshLod = meshDocument.Lods.FirstOrDefault();
-                if (meshLod is null) { diagnostics.Add(new(frame.Identity, "MeshLodMissing", "The MESH entity has no LOD records.")); continue; }
-                var meshIdentity = new NativeReferenceResolver(directory).Resolve(meshLod.MeshData) is { Status: ReferenceStatus.Unique, Candidates.Count: 1 } meshResolution
-                    ? meshResolution.Candidates[0] : null;
-                var meshFrame = meshIdentity is null ? null : directory.Objects.SingleOrDefault(candidate => candidate.Identity == meshIdentity);
-                if (meshFrame is null) { diagnostics.Add(new(frame.Identity, "MeshDataMissing", "The MESH LOD resource is missing.")); continue; }
-                if (!meshMetadata.TryGetValue(meshFrame.Identity, out var meshData))
+                NativeMeshLod? meshLod = null;
+                ResourceIdentity? meshIdentity = null;
+                NativeMeshDataDocument? meshData = null;
+                foreach (var candidate in meshDocument.Lods)
                 {
-                    if (!new NativeMeshDataReader().TryRead(meshFrame, out meshData, out var meshDataDiagnostic, cancellation) || meshData is null)
-                    { diagnostics.Add(new(meshFrame.Identity, "MeshMetadataUnsupported", meshDataDiagnostic ?? "Mesh metadata is unavailable.")); continue; }
-                    meshMetadata.Add(meshFrame.Identity, meshData);
+                    cancellation.ThrowIfCancellationRequested();
+                    if (lodResolver.Resolve(candidate.MeshData) is not { Status: ReferenceStatus.Unique, Candidates.Count: 1 } resolution) continue;
+                    var meshFrame = framesByIdentity.GetValueOrDefault(resolution.Candidates[0]);
+                    if (meshFrame is null) continue;
+                    if (!meshMetadata.TryGetValue(meshFrame.Identity, out var metadata))
+                    {
+                        var parserScratch = graphMemory.ReserveScratch(checked(4096L + meshFrame.RawPayload.Length * 32L));
+                        try
+                        {
+                            if (!new NativeMeshDataReader().TryRead(meshFrame, out metadata, out _, cancellation) || metadata is null)
+                            { parserScratch.Dispose(); continue; }
+                            meshMetadataScratch.Add(parserScratch);
+                        }
+                        catch { parserScratch.Dispose(); throw; }
+                        meshMetadata.Add(meshFrame.Identity, metadata);
+                    }
+                    if (meshDocument.GroupIndex >= metadata.Groups.Count || metadata.Groups[(int)meshDocument.GroupIndex].Parts.Count == 0) continue;
+                    meshLod = candidate; meshIdentity = meshFrame.Identity; meshData = metadata; break;
                 }
-                if (meshDocument.GroupIndex >= meshData.Groups.Count) { diagnostics.Add(new(frame.Identity, "MeshGroupMissing", "The selected group is outside the mesh metadata.")); continue; }
+                if (meshLod is null || meshData is null)
+                { AddIssue(diagnostics, new(frame.Identity, "MeshLodMissing", "No valid mesh detail is available.")); continue; }
                 var bounds = WorldBounds(meshData.Groups[(int)meshDocument.GroupIndex].Bounds, world);
                 if (boundsOnly)
                 {
@@ -332,6 +553,7 @@ public sealed class SceneRenderSession : IAsyncDisposable
                     .Concat(meshData.Groups[(int)meshDocument.GroupIndex].Parts.Select(part => part.Material)).ToArray();
                 AddHierarchy(meshNode, nodeByIdentity, owner.InstancePath, hierarchyNodes, owner.OwnerWorld, key,
                     label, owner.Label, leafReferences, TrackGraph);
+                TrackGraph(checked(256L + physicalExtents.Count * 256L));
                 selections.Add(new(meshIdentity!, (int)meshDocument.GroupIndex));
                 occurrenceRecords.Add(new(key, frame.Identity, meshNode.Identity,
                     label, meshIdentity!,
@@ -412,11 +634,84 @@ public sealed class SceneRenderSession : IAsyncDisposable
             parentKey = key;
         }
     }
+    private sealed class SceneGraphMemory(AssetMemoryBudget budget, long limit) : IDisposable
+    {
+        private RenderResourceGroup? retained = new();
+        private readonly List<Scratch> scratchReservations = [];
+        private long scratchBytes;
+        public long Bytes { get; private set; }
+
+        public void Grow(long bytes)
+        {
+            ObjectDisposedException.ThrowIf(retained is null, this);
+            Check(bytes);
+            var reservation = budget.Reserve(bytes, "scene graph and metadata");
+            retained.Add(reservation);
+            Bytes += bytes;
+        }
+
+        public IDisposable ReserveScratch(long bytes)
+        {
+            ObjectDisposedException.ThrowIf(retained is null, this);
+            Check(bytes);
+            var reservation = budget.Reserve(bytes, "scene graph parsing scratch");
+            scratchBytes += bytes;
+            var result = new Scratch(this, reservation);
+            scratchReservations.Add(result);
+            return result;
+        }
+
+        public IDisposable Transfer()
+        {
+            ObjectDisposedException.ThrowIf(retained is null, this);
+            if (scratchBytes != 0) throw new InvalidOperationException("Scene parsing scratch is still in use.");
+            var result = retained;
+            retained = null;
+            return result;
+        }
+
+        private void Check(long bytes)
+        {
+            if (bytes < 0 || bytes > limit - Bytes - scratchBytes)
+                throw new ArchiveException("SceneGraphLimit", "The scene graph exceeds its memory limit.");
+        }
+
+        public void Dispose()
+        {
+            foreach (var scratch in scratchReservations.ToArray()) scratch.Dispose();
+            Interlocked.Exchange(ref retained, null)?.Dispose();
+        }
+
+        private sealed class Scratch(SceneGraphMemory owner, AssetMemoryBudget.Reservation reservation) : IDisposable
+        {
+            private AssetMemoryBudget.Reservation? current = reservation;
+            public void Dispose()
+            {
+                var released = Interlocked.Exchange(ref current, null);
+                if (released is null) return;
+                owner.scratchBytes -= released.Bytes;
+                owner.scratchReservations.Remove(this);
+                released.Dispose();
+            }
+        }
+    }
+
     private sealed record CatalogWork(ResourceIdentity Container, ResourceIdentity CatalogIdentity, ResourceIdentity OwnerNode, Matrix4x4 OwnerWorld, IReadOnlyList<ResourceIdentity> InstancePath, IReadOnlyList<ResourceIdentity> ContainerPath, int Depth, string Label);
     private sealed record NestedCatalog(ResourceIdentity Identity, SceneCatalogInstance Instance, ResourceIdentity NodeIdentity, Matrix4x4 World);
     private sealed record MeshSelection(ResourceIdentity MeshIdentity, int GroupIndex);
     private sealed record RenderOccurrenceRecord(string Key, ResourceIdentity Entity, ResourceIdentity Node, string Label, ResourceIdentity MeshIdentity, int GroupIndex, Matrix4x4 World, GeometryBounds Bounds, IReadOnlyList<ResourceIdentity> InstancePath, uint NativeFlags);
     private sealed record ContainerMetadata(ResourceIdentity ContainerLeaseIdentity, ResourceIdentity CatalogIdentity, Matrix4x4 OwnerWorld, IReadOnlyList<MeshSelection> Selections, IReadOnlyList<NestedCatalog> NestedCatalogs, IReadOnlyList<SourceExtent> SourceExtents);
+    private sealed record LayoutPublication(ContainerMetadata Metadata, IReadOnlyList<RenderOccurrenceRecord> Occurrences,
+        IReadOnlyList<RenderHierarchyNode> Hierarchy, IReadOnlyList<SourceExtent> Extents) : IDisposable
+    {
+        public IDisposable? Reservation { get; init; }
+        public void Dispose() => Reservation?.Dispose();
+    }
+    private sealed record MaterialPreparation(NativeContainerLease Container, NativeModelBatch Geometry,
+        ResourceIdentity Catalog) : IDisposable
+    {
+        public void Dispose() { Geometry.Dispose(); Container.Dispose(); }
+    }
     private sealed record SceneLayoutData(IReadOnlyList<RenderHierarchyNode> Hierarchy,
         IReadOnlyList<ContainerMetadata> Work, IReadOnlyList<RenderOccurrenceRecord> Occurrences,
         IReadOnlyList<RenderIssue> Issues, IReadOnlyList<SourceExtent> SourceExtents, RenderCoverage Coverage,
@@ -450,5 +745,15 @@ public sealed class SceneRenderSession : IAsyncDisposable
         disposed = true; lifetime.Cancel();
         await loadGate.WaitAsync().ConfigureAwait(false);
         loadGate.Release(); lifetime.Dispose(); loadGate.Dispose();
+        if (preparation is not null)
+        {
+            using var foreground = preparation.EnterForeground();
+            foreach (var key in preparedKeys) preparation.Remove(key);
+            await preparation.DrainAsync().ConfigureAwait(false);
+            preparedKeys.Clear();
+        }
+        if (ownsPreparation && preparation is not null) await preparation.DisposeAsync().ConfigureAwait(false);
+        references.Dispose(); bindings.Dispose();
+        sourceSession.Dispose();
     }
 }

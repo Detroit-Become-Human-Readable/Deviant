@@ -14,6 +14,8 @@ public sealed record TextureContainerDirectoryDocument(ResourceIdentity Identity
     ReadOnlyMemory<byte> RawBody, IReadOnlyList<TextureContainerObjectFrame> Objects,
     DecodedExtent? RemainderExtent, ReadOnlyMemory<byte> RemainderBytes)
 {
+    public bool IsMetadataOnly { get; init; }
+    public DecodedExtent? DeclaredRemainderExtent { get; init; }
     public IReadOnlyList<TextureContainerObjectFrame> FindNative(uint nativeType, uint nativeId) =>
         Objects.Where(item => item.NativeType == nativeType && item.NativeId == nativeId).ToArray();
 }
@@ -42,11 +44,12 @@ public sealed class TextureContainerDirectoryReader
             parsed.UnresolvedReferences, parsed.UnknownFields);
     }
 
-    private static TextureContainerDirectoryDocument Convert(NativeObjectDirectoryDocument document)
+    public static TextureContainerDirectoryDocument Convert(NativeObjectDirectoryDocument document)
     {
         var objects = document.Objects.Select(Convert).ToList().AsReadOnly();
         return new(document.Identity, document.Revision, document.DirectoryExtent, document.BodyExtent,
-            document.RawDirectory, document.RawBody, objects, document.RemainderExtent, document.RemainderBytes);
+            document.RawDirectory, document.RawBody, objects, document.RemainderExtent, document.RemainderBytes)
+            { IsMetadataOnly = document.IsMetadataOnly, DeclaredRemainderExtent = document.DeclaredRemainderExtent };
     }
 
     private static TextureContainerObjectFrame Convert(NativeObjectFrame frame) =>

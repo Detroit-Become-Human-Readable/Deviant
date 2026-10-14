@@ -54,6 +54,7 @@ public sealed partial class SceneCatalogSession
 
     private async Task<SceneLoadedSection> EnrichAsync(AssetDescriptor descriptor, DecodedSection decoded, CancellationToken token)
     {
+        using var timing = AssetLoadDiagnostics.Measure("SceneEnrichment", descriptor.Identity.Key);
         var section = decoded.Result.Value!;
         var directory = decoded.Directory!;
         var resolver = new NativeReferenceResolver(directory);
@@ -62,6 +63,8 @@ public sealed partial class SceneCatalogSession
         var names = new Dictionary<ResourceIdentity, List<NameEvidence>>();
         var entities = new Dictionary<ResourceIdentity, List<SceneEntityRecord>>();
         var relationships = new Dictionary<ResourceIdentity, List<AssetRelationship>>();
+        var lights = new Dictionary<ResourceIdentity, SceneIblLight>();
+        var lightTextureResolutions = new Dictionary<(uint Type, uint Id), ReferenceResolution>();
         var extents = decoded.Result.Extents.ToList();
         foreach (var node in section.Hierarchy.Nodes)
         {
@@ -75,6 +78,39 @@ public sealed partial class SceneCatalogSession
         foreach (var entity in section.Entities)
         {
             token.ThrowIfCancellationRequested();
+            TextureContextString? lightName = null;
+            var frame = frames[entity.Identity];
+            if (frame.NativeType == 2211 && entity.ClassCount == 4 && entity.NextClassOffset < frame.RawPayload.Length)
+            {
+                var context = new TextureContextReader().ParseIblLightV13(frame.RawPayload.Span,
+                    entity.NextClassOffset, frame.RawPayload.Length, frame.Identity, Revision, frame.PayloadExtent,
+                    decoded.Result.Extents, token);
+                lightName = context.Value?.OwnerName;
+                var projected = context.Value is { } stored
+                    ? IblLightStoredFieldsProjection.Project(stored, token)
+                    : new DecodeResult<IblLightStoredFields>(null, context.Identity, context.Revision, context.Extents,
+                        context.Steps, context.Diagnostics, context.UnresolvedReferences, context.UnknownFields);
+                var resolutions = new List<ReferenceResolution>();
+                if (projected.Value is { } fields)
+                {
+                    for (var slot = 0; slot < fields.TextureReferences.Count; slot++)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        var storedReference = fields.TextureReferences[slot];
+                        var pair = (storedReference.Type, storedReference.Id);
+                        if (!lightTextureResolutions.TryGetValue(pair, out var resolution))
+                        {
+                            resolution = fields.GetTextureResourceReference(slot) is { } referenceToTexture
+                                ? resolver.Resolve(referenceToTexture)
+                                : new ReferenceResolution(ReferenceStatus.Unresolved, [], "Stored pair is unbound.");
+                            resolution = resolution with { Candidates = Array.AsReadOnly(resolution.Candidates.ToArray()) };
+                            lightTextureResolutions.Add(pair, resolution);
+                        }
+                        resolutions.Add(resolution);
+                    }
+                }
+                lights.Add(entity.Identity, new(projected, resolutions.AsReadOnly()));
+            }
             if (entity.Node is not { } reference || resolver.Resolve(reference) is not
                 { Status: ReferenceStatus.Unique, Candidates.Count: 1 } nodeResolution || !nodes.ContainsKey(nodeResolution.Candidates[0])) continue;
             var nodeId = nodeResolution.Candidates[0];
@@ -89,22 +125,18 @@ public sealed partial class SceneCatalogSession
                 AddRelationship(nodeId, binding.Relationship);
                 if (binding.Extent is not null) extents.Add(binding.Extent);
             }
-            var frame = frames[entity.Identity];
-            if (frame.NativeType == 2211 && entity.ClassCount == 4 && entity.NextClassOffset < frame.RawPayload.Length)
-            {
-                var context = new TextureContextReader().ParseIblLightV13(frame.RawPayload.Span,
-                    entity.NextClassOffset, frame.RawPayload.Length, frame.Identity, Revision, frame.PayloadExtent,
-                    decoded.Result.Extents, token);
-                if (context.Value is { } light && !string.IsNullOrWhiteSpace(light.OwnerName.Text))
-                    AddName(nodeId, new(light.OwnerName.Text, NameOrigin.Stored,
-                        $"{TextureContextReader.Version}: {light.OwnerName.ValueExtent.Offset}+{light.OwnerName.ValueExtent.Length}"));
-            }
+            if (lightName is not null && !string.IsNullOrWhiteSpace(lightName.Text))
+                AddName(nodeId, new(lightName.Text, NameOrigin.Stored,
+                    $"{TextureContextReader.Version}: {lightName.ValueExtent.Offset}+{lightName.ValueExtent.Length}"));
         }
         var result = decoded.Result with { Extents = extents.Distinct().ToArray() };
         return new(descriptor, result,
             names.ToDictionary(pair => pair.Key, pair => (IReadOnlyList<NameEvidence>)pair.Value.AsReadOnly()),
             entities.ToDictionary(pair => pair.Key, pair => (IReadOnlyList<SceneEntityRecord>)pair.Value.AsReadOnly()),
-            relationships.ToDictionary(pair => pair.Key, pair => (IReadOnlyList<AssetRelationship>)pair.Value.AsReadOnly()));
+            relationships.ToDictionary(pair => pair.Key, pair => (IReadOnlyList<AssetRelationship>)pair.Value.AsReadOnly()))
+        {
+            IblLightsByEntity = new System.Collections.ObjectModel.ReadOnlyDictionary<ResourceIdentity, SceneIblLight>(lights)
+        };
 
         void AddName(ResourceIdentity node, NameEvidence name)
         {

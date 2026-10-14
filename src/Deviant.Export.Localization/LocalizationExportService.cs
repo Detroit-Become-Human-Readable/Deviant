@@ -14,6 +14,7 @@ using Microsoft.Win32.SafeHandles;
 namespace Deviant.Export.Localization;
 
 public sealed class LocalizationExportService(ArchiveSnapshot snapshot, FeatureStore featureStore,
+    PublishedLocalizationGeneration<LocalizationGenerationHead> generation,
     ISourceRevisionProvider? revisionProvider = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -140,7 +141,9 @@ public sealed class LocalizationExportService(ArchiveSnapshot snapshot, FeatureS
     private async Task<long> CountAsync(LocalizationQuery query, CancellationToken token)
     {
         var assetQuery = ToAssetQuery(query with { Offset = 0, Limit = 10_000 });
-        return await Task.Run(() => featureStore.Count(assetQuery, token), token).ConfigureAwait(false);
+        var page = await Task.Run(() => featureStore.QueryLocalizationPage<LocalizationGenerationHead, LocalizationRecord>(
+            generation, assetQuery with { Limit = 1 }, token), token).ConfigureAwait(false);
+        return page.Total;
     }
 
     private async Task VerifyUnreliableResourcesAsync(LocalizationExportSelection selection, long matchedCount,
@@ -167,8 +170,8 @@ public sealed class LocalizationExportService(ArchiveSnapshot snapshot, FeatureS
         {
             token.ThrowIfCancellationRequested();
             if (identity.IndexContentId != snapshot.IndexContentId) return;
-            var cached = await Task.Run(() => featureStore.LoadItem<LocalizationRecord>(LocalizationSchema.ItemCollection,
-                identity.Key, LocalizationSchema.CacheVersion, token), token).ConfigureAwait(false);
+            var cached = await Task.Run(() => featureStore.LoadLocalizationRecord<LocalizationGenerationHead, LocalizationRecord>(
+                generation, identity.Key, token), token).ConfigureAwait(false);
             if (cached is null) return;
             if (cached.ResourceOrdinal != resource.Ordinal ||
                 !currentRecords.TryGetValue(identity.Key, out var fresh) || !RecordsSemanticallyEqual(cached, fresh))
@@ -202,7 +205,9 @@ public sealed class LocalizationExportService(ArchiveSnapshot snapshot, FeatureS
             if (query.Source is { } selectedSource && selectedSource.Key != owner.Key) continue;
             if (!volumes.TryGetValue(resource.Package, out var volume) || volume.Stamp.Reliable) continue;
             var resourceQuery = baseQuery with { GroupKey = owner.Key };
-            var resourceCount = await Task.Run(() => featureStore.Count(resourceQuery, token), token).ConfigureAwait(false);
+            var countPage = await Task.Run(() => featureStore.QueryLocalizationPage<LocalizationGenerationHead, LocalizationRecord>(
+                generation, resourceQuery with { Limit = 1 }, token), token).ConfigureAwait(false);
+            var resourceCount = countPage.Total;
             if (resourceCount == 0) continue;
             expectedUnreliableRows = checked(expectedUnreliableRows + resourceCount);
 
@@ -212,13 +217,13 @@ public sealed class LocalizationExportService(ArchiveSnapshot snapshot, FeatureS
             {
                 token.ThrowIfCancellationRequested();
                 var pageLimit = (int)Math.Min(10_000, resourceCount - offset);
-                var descriptors = await Task.Run(() => featureStore.Query(resourceQuery with { Offset = offset, Limit = pageLimit }, token), token)
-                    .ConfigureAwait(false);
-                if (descriptors.Count == 0) break;
-                foreach (var descriptor in descriptors)
+                var page = await Task.Run(() => featureStore.QueryLocalizationPage<LocalizationGenerationHead, LocalizationRecord>(
+                    generation, resourceQuery with { Offset = offset, Limit = pageLimit }, token), token).ConfigureAwait(false);
+                if (page.Records.Count == 0) break;
+                foreach (var record in page.Records)
                 {
                     token.ThrowIfCancellationRequested();
-                    await VerifyAsync(descriptor.Identity, resource, currentRecords).ConfigureAwait(false);
+                    await VerifyAsync(record.Identity, resource, currentRecords).ConfigureAwait(false);
                     offset++;
                 }
             }
@@ -311,8 +316,8 @@ public sealed class LocalizationExportService(ArchiveSnapshot snapshot, FeatureS
                 {
                     try
                     {
-                        var record = await Task.Run(() => featureStore.LoadItem<LocalizationRecord>(LocalizationSchema.ItemCollection,
-                            identity.Key, LocalizationSchema.CacheVersion, token), token).ConfigureAwait(false);
+                        var record = await Task.Run(() => featureStore.LoadLocalizationRecord<LocalizationGenerationHead, LocalizationRecord>(
+                            generation, identity.Key, token), token).ConfigureAwait(false);
                         entry = record is null
                             ? new(null, LocalizationExportStatus.Failed, "MissingCachedRecord", "The selected localization record is not in the current catalog.") { Identity = identity }
                             : new(record, LocalizationExportStatus.Completed);
@@ -333,23 +338,13 @@ public sealed class LocalizationExportService(ArchiveSnapshot snapshot, FeatureS
         {
             token.ThrowIfCancellationRequested();
             var pageLimit = (int)Math.Min(10_000, matchedCount - offset);
-            var descriptors = await Task.Run(() => featureStore.Query(assetQuery with { Offset = offset, Limit = pageLimit }, token), token).ConfigureAwait(false);
-            if (descriptors.Count == 0) break;
-            foreach (var descriptor in descriptors)
+            var page = await Task.Run(() => featureStore.QueryLocalizationPage<LocalizationGenerationHead, LocalizationRecord>(
+                generation, assetQuery with { Offset = offset, Limit = pageLimit }, token), token).ConfigureAwait(false);
+            if (page.Records.Count == 0) break;
+            foreach (var record in page.Records)
             {
                 token.ThrowIfCancellationRequested();
-                LocalizationExportEntry entry;
-                try
-                {
-                    var record = await Task.Run(() => featureStore.LoadItem<LocalizationRecord>(LocalizationSchema.ItemCollection,
-                        descriptor.Identity.Key, LocalizationSchema.CacheVersion, token), token).ConfigureAwait(false);
-                    entry = record is null
-                        ? new LocalizationExportEntry(null, LocalizationExportStatus.Failed, "MissingCachedRecord", "The indexed localization record is missing from the feature store.") { Identity = descriptor.Identity }
-                        : new LocalizationExportEntry(record, LocalizationExportStatus.Completed);
-                }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
-                { entry = new(null, LocalizationExportStatus.Failed, ex.GetType().Name, SanitizeDiagnostic(ex.Message, snapshot, snapshot.IndexPath)) { Identity = descriptor.Identity }; }
+                var entry = new LocalizationExportEntry(record, LocalizationExportStatus.Completed);
                 offset++;
                 visit(entry, offset, matchedCount);
             }

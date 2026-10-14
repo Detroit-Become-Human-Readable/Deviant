@@ -13,6 +13,20 @@ public sealed class NativeMeshGeometryDecoder
 
     public GeometryAsset Decode(NativeMeshDataDocument document, ReadOnlyMemory<byte> gpuBytes,
         int groupIndex, CancellationToken token = default, DecodedExtent? gpuExtent = null)
+        => DecodeCore(document, gpuBytes, groupIndex, null, token, gpuExtent);
+
+    /// <summary>Decodes source vertex streams for a skinning-aware caller without applying a pose.</summary>
+    public GeometryAsset DecodeSkinSource(NativeMeshDataDocument document, ReadOnlyMemory<byte> gpuBytes,
+        int groupIndex, NativeSkinningAttributeDocument attributes, CancellationToken token = default,
+        DecodedExtent? gpuExtent = null)
+    {
+        ArgumentNullException.ThrowIfNull(attributes);
+        return DecodeCore(document, gpuBytes, groupIndex, attributes, token, gpuExtent);
+    }
+
+    private GeometryAsset DecodeCore(NativeMeshDataDocument document, ReadOnlyMemory<byte> gpuBytes,
+        int groupIndex, NativeSkinningAttributeDocument? skinningAttributes, CancellationToken token,
+        DecodedExtent? gpuExtent)
     {
         ArgumentNullException.ThrowIfNull(document); token.ThrowIfCancellationRequested();
         if (groupIndex < 0 || groupIndex >= document.Groups.Count) throw new InvalidDataException("NativeMeshGroupInvalid");
@@ -21,7 +35,9 @@ public sealed class NativeMeshGeometryDecoder
             { MemberPath = (document.Identity.MemberPath ?? "native-mesh") + "/gpu" }, 0, gpuBytes.Length);
         if (gpuSource.Offset < 0 || gpuSource.Length != gpuBytes.Length || gpuSource.Offset > long.MaxValue - gpuBytes.Length)
             throw new InvalidDataException("NativeMeshGpuSourceMismatch");
-        var layout = BuildLayout(document, gpuBytes.Length, token);
+        if (skinningAttributes is not null)
+            ValidateSkinSource(document, groupIndex, gpuSource, skinningAttributes, token);
+        var layout = BuildLayout(document, groupIndex, gpuBytes.Length, token);
         var group = document.Groups[groupIndex];
         if (group.Parts.Count > NativeMeshDataReader.MaximumParts) throw new InvalidDataException("NativeMeshPartLimit");
         long totalVertices = 0, totalIndices = 0;
@@ -31,7 +47,7 @@ public sealed class NativeMeshGeometryDecoder
             totalVertices += part.VertexCount; totalIndices += part.IndexCount;
             if (totalVertices > MaximumOutputVertices || totalIndices > MaximumOutputIndices)
                 throw new InvalidDataException("NativeMeshOutputLimit");
-            if (part.TopologySelector != 0 || part.Palette.Count != 0)
+            if (skinningAttributes is null && (part.TopologySelector != 0 || part.Palette.Count != 0))
                 throw new InvalidDataException("NativeMeshPartProfileUnsupported");
         }
         var primitives = new MeshPrimitive[group.Parts.Count];
@@ -57,11 +73,17 @@ public sealed class NativeMeshGeometryDecoder
             var tangentDescriptor = Find(buffer, 10);
             var colorDescriptor = Find(buffer, 2);
             var uvDescriptor = Find(buffer, 4);
+            var secondaryUvCandidate = Find(buffer, 5);
+            var secondaryUvDescriptor = uvDescriptor?.Format == 6 && secondaryUvCandidate?.Format is 5 or 6
+                ? secondaryUvCandidate : null;
             var positions = new Vector3[part.VertexCount];
             var normals = normalDescriptor is null ? null : new Vector3[part.VertexCount];
             var tangents = tangentDescriptor is null ? null : new Vector4[part.VertexCount];
             var colors = colorDescriptor is null ? null : new Vector4[part.VertexCount];
             var uv = uvDescriptor is null ? null : new Vector2[part.VertexCount];
+            var uv1 = uvDescriptor?.Format == 6 ? new Vector2[part.VertexCount] : null;
+            var uv2 = secondaryUvDescriptor is null ? null : new Vector2[part.VertexCount];
+            var uv3 = secondaryUvDescriptor?.Format == 6 ? new Vector2[part.VertexCount] : null;
             var minimum = new Vector3(float.PositiveInfinity); var maximum = new Vector3(float.NegativeInfinity);
             for (var v = 0; v < positions.Length; v++)
             {
@@ -77,7 +99,16 @@ public sealed class NativeMeshGeometryDecoder
                     tangents[v] = new(t.X, t.Y, t.Z, tangentDescriptor!.Format == 13 ? (t.W != 0 ? -1 : 1) : t.W);
                 }
                 if (colors is not null) colors[v] = Read(colorDescriptor!, vertex);
-                if (uv is not null) { var t = Read(uvDescriptor!, vertex); uv[v] = new(t.X, t.Y); }
+                if (uv is not null)
+                {
+                    var t = Read(uvDescriptor!, vertex); uv[v] = new(t.X, t.Y);
+                    if (uv1 is not null) uv1[v] = new(t.Z, t.W);
+                }
+                if (uv2 is not null)
+                {
+                    var t = Read(secondaryUvDescriptor!, vertex); uv2[v] = new(t.X, t.Y);
+                    if (uv3 is not null) uv3[v] = new(t.Z, t.W);
+                }
             }
             var decodedIndices = new uint[part.IndexCount];
             var indexStart = checked(layout.IndexStarts[(int)part.IndexBufferIndex] + (int)part.FirstIndex * 2);
@@ -98,10 +129,15 @@ public sealed class NativeMeshGeometryDecoder
             if (normalDescriptor is not null) extents["Normals"] = AttributeExtent(normalDescriptor);
             if (tangentDescriptor is not null) extents["Tangents"] = AttributeExtent(tangentDescriptor);
             if (uvDescriptor is not null) extents["TextureCoordinates0"] = AttributeExtent(uvDescriptor);
+            if (uv1 is not null) extents["TextureCoordinates1"] = AttributeExtent(uvDescriptor!);
+            if (uv2 is not null) extents["TextureCoordinates2"] = AttributeExtent(secondaryUvDescriptor!);
+            if (uv3 is not null) extents["TextureCoordinates3"] = AttributeExtent(secondaryUvDescriptor!);
             if (colorDescriptor is not null) extents["Colors"] = AttributeExtent(colorDescriptor);
             primitives[p] = new(key, PrimitiveTopology.Triangles, positions, decodedIndices,
                 IndexElementFormat.UInt16, [new(key + "/submesh", 0, decodedIndices.Length, [part.Material])],
-                normals, tangents, uv is null ? null : [uv], new(minimum, maximum), FieldExtents: extents, Colors: colors);
+                normals, tangents, uv is null ? null : uv3 is not null ? [uv, uv1!, uv2!, uv3]
+                    : uv2 is not null ? [uv, uv1!, uv2] : uv1 is not null ? [uv, uv1] : [uv],
+                new(minimum, maximum), FieldExtents: extents, Colors: colors);
             unknown[key + "/Descriptors"] = string.Join(",", buffer.Descriptors.Select(d => d.Word.ToString("X8", CultureInfo.InvariantCulture)));
 
             Vector4 Read(NativeVertexDescriptor descriptor, uint vertex)
@@ -140,6 +176,86 @@ public sealed class NativeMeshGeometryDecoder
         catch (OverflowException) { diagnostic = "NativeMeshSizeOverflow"; return false; }
     }
 
+    private static void ValidateSkinSource(NativeMeshDataDocument document, int groupIndex,
+        DecodedExtent gpuSource, NativeSkinningAttributeDocument attributes, CancellationToken token)
+    {
+        if (attributes.Identity != document.Identity || attributes.GroupIndex != groupIndex ||
+            attributes.GpuExtent != gpuSource || attributes.Buffers is null)
+            throw new InvalidDataException("NativeSkinningAttributeSourceMismatch");
+        if (document.Groups.Count > NativeMeshDataReader.MaximumGroups ||
+            document.VertexBuffers.Count > NativeMeshDataReader.MaximumBuffers ||
+            document.IndexCounts.Count > NativeMeshDataReader.MaximumBuffers ||
+            attributes.Buffers.Count > NativeMeshDataReader.MaximumBuffers)
+            throw new InvalidDataException("NativeSkinningBufferLimit");
+        foreach (var attributeBuffer in attributes.Buffers)
+        {
+            token.ThrowIfCancellationRequested();
+            if (attributeBuffer is null)
+                throw new InvalidDataException("NativeSkinningAttributeBufferInvalid");
+        }
+
+        var group = document.Groups[groupIndex];
+        if (group.Parts.Count > NativeMeshDataReader.MaximumParts)
+            throw new InvalidDataException("NativeMeshPartLimit");
+        long totalVertices = 0, totalIndices = 0;
+        foreach (var part in group.Parts)
+        {
+            token.ThrowIfCancellationRequested();
+            if (part.TopologySelector is not (0 or 1 or 4 or 8))
+                throw new InvalidDataException("NativeSkinningModeUnsupported");
+            if (part.Palette.Count != 0)
+                throw new InvalidDataException("NativeMeshPartPaletteUnsupported");
+            if (part.VertexBufferIndex >= document.VertexBuffers.Count || part.IndexBufferIndex >= document.IndexCounts.Count)
+                throw new InvalidDataException("NativeMeshBufferIndexInvalid");
+
+            var bufferIndex = (int)part.VertexBufferIndex;
+            var buffer = document.VertexBuffers[bufferIndex];
+            if (buffer.ElementCount > NativeMeshDataReader.MaximumVertices || buffer.Streams.Count != 4 ||
+                buffer.Descriptors.Count > 256)
+                throw new InvalidDataException("NativeVertexBufferUnsupported");
+            if (buffer.Flag != 0) throw new InvalidDataException("NativeVertexInlineStreamUnsupported");
+            if (document.IndexCounts[(int)part.IndexBufferIndex] > NativeMeshDataReader.MaximumIndices)
+                throw new InvalidDataException("NativeMeshIndexLimit");
+            if (part.BaseVertex > buffer.ElementCount || part.VertexCount > buffer.ElementCount - part.BaseVertex ||
+                part.FirstIndex > document.IndexCounts[(int)part.IndexBufferIndex] ||
+                part.IndexCount > document.IndexCounts[(int)part.IndexBufferIndex] - part.FirstIndex ||
+                part.IndexCount % 3 != 0 || part.VertexCount == 0 || part.IndexCount == 0)
+                throw new InvalidDataException("NativeMeshWindowInvalid");
+
+            totalVertices += part.VertexCount;
+            totalIndices += part.IndexCount;
+            if (totalVertices > MaximumOutputVertices || totalIndices > MaximumOutputIndices)
+                throw new InvalidDataException("NativeMeshOutputLimit");
+
+            var position = Find(buffer, 0, required: true)!;
+            if (position.Format != 2) throw new InvalidDataException("NativeMeshPositionFormatUnsupported");
+            var normal = Find(buffer, 1);
+            var tangent = Find(buffer, 10);
+            var color = Find(buffer, 2);
+            var uv = Find(buffer, 4);
+            _ = FormatSize(position.Format);
+            if (normal is not null) _ = FormatSize(normal.Format);
+            if (tangent is not null) _ = FormatSize(tangent.Format);
+            if (color is not null) _ = FormatSize(color.Format);
+            if (uv is not null) _ = FormatSize(uv.Format);
+
+            if (part.TopologySelector == 0) continue;
+            NativeSkinningBufferAttributes? match = null;
+            var matchCount = 0;
+            foreach (var candidate in attributes.Buffers)
+            {
+                token.ThrowIfCancellationRequested();
+                if (candidate is null) throw new InvalidDataException("NativeSkinningAttributeBufferInvalid");
+                if (candidate.BufferIndex != bufferIndex) continue;
+                match = candidate;
+                matchCount++;
+            }
+            if (matchCount != 1 || match is null || match.StoredMode != part.TopologySelector ||
+                match.VertexCount != buffer.ElementCount)
+                throw new InvalidDataException("NativeSkinningAttributeBufferMismatch");
+        }
+    }
+
     private static NativeVertexDescriptor? Find(NativeVertexBuffer buffer, byte semantic, bool required = false)
     {
         NativeVertexDescriptor? result = null;
@@ -153,8 +269,8 @@ public sealed class NativeMeshGeometryDecoder
         return result;
     }
 
-    private static (int[] IndexStarts, int[][] VertexStarts) BuildLayout(NativeMeshDataDocument document,
-        int byteCount, CancellationToken token)
+    internal static (int[] IndexStarts, int[][] VertexStarts) BuildLayout(NativeMeshDataDocument document,
+        int groupIndex, int byteCount, CancellationToken token)
     {
         if (document.IndexCounts.Count > NativeMeshDataReader.MaximumBuffers ||
             document.VertexBuffers.Count > NativeMeshDataReader.MaximumBuffers)
@@ -169,6 +285,7 @@ public sealed class NativeMeshGeometryDecoder
             if (cursor > byteCount) throw new InvalidDataException("NativeMeshGpuTruncated");
         }
         var vertices = new int[document.VertexBuffers.Count][];
+        var usedBuffers = document.Groups[groupIndex].Parts.Select(part => part.VertexBufferIndex).ToHashSet();
         for (var i = 0; i < vertices.Length; i++)
         {
             token.ThrowIfCancellationRequested();
@@ -187,7 +304,12 @@ public sealed class NativeMeshGeometryDecoder
             if (cursor > byteCount) throw new InvalidDataException("NativeMeshGpuTruncated");
             foreach (var descriptor in buffer.Descriptors)
             {
-                if (descriptor.Stream > 3 || descriptor.Offset + FormatSize(descriptor.Format) > buffer.Streams[descriptor.Stream].Stride)
+                if (descriptor.Stream > 3) throw new InvalidDataException("NativeVertexDescriptorRangeInvalid");
+                var size = KnownFormatSize(descriptor.Format);
+                if (size is null && usedBuffers.Contains((uint)i) && descriptor.Semantic is 0 or 1 or 2 or 4 or 10)
+                    throw new InvalidDataException("NativeVertexFormatUnsupported");
+                // Unread attributes retain their descriptors; only their starting offset is needed.
+                if (descriptor.Offset + (size ?? 1) > buffer.Streams[descriptor.Stream].Stride)
                     throw new InvalidDataException("NativeVertexDescriptorRangeInvalid");
             }
         }
@@ -195,11 +317,13 @@ public sealed class NativeMeshGeometryDecoder
         return (indices, vertices);
     }
     private static long Align(long value) => checked((value + 15) & ~15L);
-    private static int FormatSize(byte format) => format switch
+    private static int? KnownFormatSize(byte format) => format switch
     {
         2 => 12, 4 or 5 or 13 => 4, 6 => 8,
-        _ => throw new InvalidDataException("NativeVertexFormatUnsupported")
+        _ => null
     };
+    private static int FormatSize(byte format) => KnownFormatSize(format)
+        ?? throw new InvalidDataException("NativeVertexFormatUnsupported");
     private static Vector4 ReadVector(ReadOnlySpan<byte> bytes, byte format)
     {
         switch (format)
@@ -208,13 +332,19 @@ public sealed class NativeMeshGeometryDecoder
             case 4: return new(bytes[0] / 255f, bytes[1] / 255f, bytes[2] / 255f, bytes[3] / 255f);
             case 5: return new(Half(bytes), Half(bytes[2..]), 0, 0);
             case 6: return new(Half(bytes), Half(bytes[2..]), Half(bytes[4..]), Half(bytes[6..]));
-            case 13:
-                var word = BinaryPrimitives.ReadUInt32LittleEndian(bytes);
-                return new(Component(word), Component(word >> 10), Component(word >> 20), word >> 30);
+            case 13: return ReadPackedVector(BinaryPrimitives.ReadUInt32LittleEndian(bytes));
             default: throw new InvalidDataException("NativeVertexFormatUnsupported");
         }
         static float Float(ReadOnlySpan<byte> b) => BitConverter.UInt32BitsToSingle(BinaryPrimitives.ReadUInt32LittleEndian(b));
         static float Half(ReadOnlySpan<byte> b) => (float)BitConverter.UInt16BitsToHalf(BinaryPrimitives.ReadUInt16LittleEndian(b));
-        static float Component(uint word) { var value = (int)(word & 1023); return (value > 512 ? value - 1024 : value) / 511f; }
+    }
+
+    internal static Vector4 ReadPackedVector(uint word) =>
+        new(PackedComponent(word), PackedComponent(word >> 10), PackedComponent(word >> 20), word >> 30);
+
+    private static float PackedComponent(uint word)
+    {
+        var value = (int)(word & 1023);
+        return (value > 512 ? value - 1024 : value) / 511f;
     }
 }

@@ -324,6 +324,19 @@
             </Setter.Value>
         </Setter>
     </Style>
+    <Style TargetType="GridSplitter">
+        <Setter Property="Background" Value="{DynamicResource ControlBorder}"/>
+        <Setter Property="HorizontalAlignment" Value="Stretch"/>
+        <Setter Property="VerticalAlignment" Value="Stretch"/>
+        <Setter Property="ResizeBehavior" Value="PreviousAndNext"/>
+        <Setter Property="ShowsPreview" Value="True"/>
+        <Setter Property="Focusable" Value="True"/>
+        <Setter Property="KeyboardIncrement" Value="10"/>
+        <Style.Triggers>
+            <Trigger Property="ResizeDirection" Value="Columns"><Setter Property="Cursor" Value="SizeWE"/></Trigger>
+            <Trigger Property="ResizeDirection" Value="Rows"><Setter Property="Cursor" Value="SizeNS"/></Trigger>
+        </Style.Triggers>
+    </Style>
     <Style TargetType="GridViewColumnHeader">
         <Setter Property="Background" Value="{DynamicResource SurfaceAlternateBackground}" />
         <Setter Property="Foreground" Value="{DynamicResource WindowForeground}" />
@@ -335,11 +348,18 @@
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="GridViewColumnHeader">
+                    <Grid>
                     <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
                             BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}">
                         <ContentPresenter VerticalAlignment="Center" RecognizesAccessKey="True" />
                     </Border>
+                    <Thumb x:Name="PART_HeaderGripper" Width="8" HorizontalAlignment="Right" VerticalAlignment="Stretch"
+                           Cursor="SizeWE" Focusable="False">
+                        <Thumb.Template><ControlTemplate TargetType="Thumb"><Border Background="Transparent"/></ControlTemplate></Thumb.Template>
+                    </Thumb>
+                    </Grid>
                     <ControlTemplate.Triggers>
+                        <Trigger Property="Role" Value="Padding"><Setter TargetName="PART_HeaderGripper" Property="Visibility" Value="Collapsed"/></Trigger>
                         <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="{DynamicResource ControlHoverBackground}" /></Trigger>
                     </ControlTemplate.Triggers>
                 </ControlTemplate>

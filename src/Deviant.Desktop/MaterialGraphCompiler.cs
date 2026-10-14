@@ -8,7 +8,10 @@ namespace Deviant.Desktop;
 
 public sealed record CompiledMaterialGraph(string Declarations, string Body, string Signature,
     IReadOnlyList<int> TextureSlots, IReadOnlyList<string> Diagnostics,
-    bool HasBaseColor, bool HasOpacity, bool HasAlphaCutoff);
+    bool HasBaseColor, bool HasOpacity, bool HasAlphaCutoff)
+{
+    public bool RequiresSceneDepth { get; init; }
+}
 
 /// <summary>Emits shader expressions from bounded, typed material data.</summary>
 public static class MaterialGraphCompiler
@@ -19,36 +22,53 @@ public static class MaterialGraphCompiler
     public const int MaximumSourceCharacters = 128 * 1024;
 
     public static CompiledMaterialGraph Compile(MaterialSurfaceGraph graph,
-        IReadOnlySet<MaterialInput>? availableInputs = null, CancellationToken token = default)
+        IReadOnlySet<MaterialInput>? availableInputs = null, CancellationToken token = default,
+        IReadOnlyDictionary<int, int>? samplerGroups = null)
     {
         ArgumentNullException.ThrowIfNull(graph);
         availableInputs ??= new HashSet<MaterialInput>
-        { MaterialInput.Uv0, MaterialInput.WorldPosition, MaterialInput.VertexColor, MaterialInput.WorldNormal, MaterialInput.ViewDirection };
+        { MaterialInput.Uv0, MaterialInput.Uv1, MaterialInput.Uv2, MaterialInput.Uv3,
+            MaterialInput.WorldPosition, MaterialInput.VertexColor, MaterialInput.WorldNormal, MaterialInput.ViewDirection, MaterialInput.ViewNormal, MaterialInput.ViewDepth, MaterialInput.SceneViewDepth };
         var diagnostics = new List<string>();
         var slots = new SortedSet<int>();
+        var requiredInputs = new HashSet<MaterialInput>();
         var output = new StringBuilder();
         var declaredSlots = graph.TextureSlots.ToHashSet();
         string? color = EmitRole("BaseColor", graph.BaseColor, [MaterialValueType.Scalar, MaterialValueType.Vector3, MaterialValueType.Vector4]);
         string? opacity = EmitRole("Opacity", graph.Opacity, [MaterialValueType.Scalar]);
         string? cutoff = EmitRole("AlphaCutoff", graph.AlphaCutoff, [MaterialValueType.Scalar]);
+        if (graph.Opacity is not null && opacity is null || graph.AlphaCutoff is not null && cutoff is null)
+            throw new InvalidDataException("The material coverage inputs are unavailable: " + string.Join("; ", diagnostics));
         if (slots.Count > MaximumTextureSlots)
             throw new InvalidDataException("The material uses too many textures.");
         var slotArray = slots.ToArray();
         for (int index = 0; index < slotArray.Length; index++)
+        {
             output.Replace($"$texture{slotArray[index]}$", $"surfaceTexture{index}");
+            if (samplerGroups is not null)
+            {
+                if (!samplerGroups.TryGetValue(slotArray[index], out int sampler) || sampler is < 0 or >= 15)
+                    throw new InvalidDataException("The material sampler assignment is invalid.");
+                output.Replace($"$sampler{slotArray[index]}$", $"surfaceSampler{sampler}");
+            }
+        }
         var declarations = new StringBuilder();
         for (int index = 0; index < slotArray.Length; index++)
             declarations.Append(CultureInfo.InvariantCulture, $"Texture2D<float4> surfaceTexture{index} : register(t{64 + index});\n");
-        declarations.AppendLine("SamplerState surfaceGraphSampler : register(s10);");
+        if (samplerGroups is null) declarations.AppendLine("SamplerState surfaceGraphSampler : register(s10);");
+        else foreach (int sampler in slotArray.Select(slot => samplerGroups[slot]).Distinct().Order())
+            declarations.Append(CultureInfo.InvariantCulture, $"SamplerState surfaceSampler{sampler} : register(s{1 + sampler});\n");
         output.AppendLine($"float3 surfaceColor = {(color is null ? "input.cDiffuse.rgb" : color)};");
         output.AppendLine($"float surfaceOpacity = saturate({opacity ?? "input.cDiffuse.a"});");
+        output.AppendLine($"bool surfaceUnlit = {(graph.IsUnlit ? "true" : "false")};");
         if (cutoff is not null) output.AppendLine($"clip(surfaceOpacity - ({cutoff}));");
         string body = output.ToString();
         if (body.Length + declarations.Length > MaximumSourceCharacters)
             throw new InvalidDataException("The material program exceeds the renderer limit.");
         string signature = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(declarations + body)));
         return new(declarations.ToString(), body, signature, slotArray, diagnostics,
-            color is not null, opacity is not null, cutoff is not null);
+            color is not null, opacity is not null, cutoff is not null)
+        { RequiresSceneDepth = requiredInputs.Contains(MaterialInput.SceneViewDepth) };
 
         string? EmitRole(string role, MaterialExpression? expression, MaterialValueType[] outputTypes)
         {
@@ -57,7 +77,7 @@ public static class MaterialGraphCompiler
             try
             {
                 if (!outputTypes.Contains(expression.ValueType)) throw new InvalidDataException("Invalid output type.");
-                var emitter = new Emitter(role, declaredSlots, availableInputs, token);
+                var emitter = new Emitter(role, declaredSlots, availableInputs, token, samplerGroups is not null);
                 string result = emitter.Emit(expression, 0);
                 if (slots.Concat(emitter.TextureSlots).Distinct().Count() > MaximumTextureSlots)
                     throw new InvalidDataException("The role exceeds the texture limit.");
@@ -65,6 +85,7 @@ public static class MaterialGraphCompiler
                     throw new InvalidDataException("The role exceeds the material program limit.");
                 output.Append(emitter.Statements);
                 slots.UnionWith(emitter.TextureSlots);
+                requiredInputs.UnionWith(emitter.Inputs);
                 if (role == "BaseColor") result = expression.ValueType switch
                 {
                     MaterialValueType.Scalar => $"float3({result}, {result}, {result})",
@@ -82,12 +103,13 @@ public static class MaterialGraphCompiler
     }
 
     private sealed class Emitter(string prefix, IReadOnlySet<int> declaredSlots,
-        IReadOnlySet<MaterialInput> availableInputs, CancellationToken token)
+        IReadOnlySet<MaterialInput> availableInputs, CancellationToken token, bool sourceSamplers)
     {
         private readonly Dictionary<MaterialExpression, string> emitted = new(ReferenceEqualityComparer.Instance);
         private readonly HashSet<MaterialExpression> visiting = new(ReferenceEqualityComparer.Instance);
         public StringBuilder Statements { get; } = new();
         public HashSet<int> TextureSlots { get; } = [];
+        public HashSet<MaterialInput> Inputs { get; } = [];
 
         public string Emit(MaterialExpression expression, int depth)
         {
@@ -158,13 +180,20 @@ public static class MaterialGraphCompiler
                     Count(0);
                     if (expression.Input is not { } input) throw new InvalidDataException("The vertex input is missing.");
                     if (!availableInputs.Contains(input)) throw new InvalidDataException($"The {input} vertex input is unavailable.");
+                    Inputs.Add(input);
                     var (expected, value) = input switch
                     {
                         MaterialInput.Uv0 => (MaterialValueType.Vector2, "input.t"),
+                        MaterialInput.Uv1 => (MaterialValueType.Vector2, "input.uv1"),
+                        MaterialInput.Uv2 => (MaterialValueType.Vector2, "input.uv2"),
+                        MaterialInput.Uv3 => (MaterialValueType.Vector2, "input.uv3"),
                         MaterialInput.WorldPosition => (MaterialValueType.Vector3, "input.wp.xyz"),
                         MaterialInput.VertexColor => (MaterialValueType.Vector4, "input.c"),
                         MaterialInput.WorldNormal => (MaterialValueType.Vector3, "normalize(input.n)"),
+                        MaterialInput.ViewNormal => (MaterialValueType.Vector3, "normalize(mul(normalize(input.n), (float3x3)mView))"),
                         MaterialInput.ViewDirection => (MaterialValueType.Vector3, "normalize(input.vEye.xyz)"),
+                        MaterialInput.ViewDepth => (MaterialValueType.Scalar, "-input.sp.z"),
+                        MaterialInput.SceneViewDepth => (MaterialValueType.Scalar, "ReadSceneViewDepth(input.p.xy)"),
                         _ => throw new InvalidDataException($"The {input} vertex input is unsupported.")
                     };
                     if (expression.ValueType != expected) throw new InvalidDataException("Invalid vertex input type.");
@@ -177,7 +206,7 @@ public static class MaterialGraphCompiler
                         expression.TextureSlot is not { } slot || slot < 0 || slot > 4095 || !declaredSlots.Contains(slot))
                         throw new InvalidDataException("Invalid texture sample.");
                     TextureSlots.Add(slot);
-                    return $"$texture{slot}$.Sample(surfaceGraphSampler, {args[0]})";
+                    return $"$texture{slot}$.Sample({(!sourceSamplers ? "surfaceGraphSampler" : $"$sampler{slot}$")}, {args[0]})";
                 }
                 string Swizzle()
                 {

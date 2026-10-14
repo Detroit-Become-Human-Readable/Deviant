@@ -1,6 +1,7 @@
 using System.Numerics;
 using Deviant.Assets;
 using Deviant.Formats.Textures;
+using Deviant.Formats.Models;
 
 namespace Deviant.Browser;
 
@@ -8,12 +9,32 @@ public sealed record RenderMesh(ResourceIdentity Identity, int GroupIndex, Geome
     IReadOnlyDictionary<string, ResourceIdentity>? MaterialsByPrimitive = null)
 {
     public string Key => $"{Identity.Key}/group/{GroupIndex}";
+    public RenderPoseIdentity? Pose { get; init; }
+    public GeometryAsset? SkinSourceGeometry { get; init; }
+    public NativeMeshDataDocument? SkinSourceMetadata { get; init; }
+    public NativeSkinningAttributeDocument? SkinAttributes { get; init; }
+    public ResourceIdentity? CatalogIdentity { get; init; }
 }
+
+public sealed record RenderPoseIdentity(ResourceIdentity RigIdentity, ulong Sequence,
+    string MatrixRowsSha256, string CaptureEvidenceSha256, int? SerializedLodOrdinal = null);
+
+public enum RenderPlacementOrigin { SceneOccurrence, ModelLocal }
+
+public sealed record ModelLocalPlacement(ResourceIdentity MeshIdentity, int GroupIndex);
+public sealed record RenderMeshSelection(string OccurrenceKey, string? PrimitiveKey = null);
 
 public sealed record RenderOccurrence(string Key, ResourceIdentity Entity, ResourceIdentity Node,
     string Label, string GeometryKey, Matrix4x4 World, GeometryBounds WorldBounds,
     IReadOnlyList<ResourceIdentity> InstancePath)
 {
+    public RenderPlacementOrigin PlacementOrigin { get; init; } = RenderPlacementOrigin.SceneOccurrence;
+    public ModelLocalPlacement? ModelPlacement { get; init; }
+    public ResourceIdentity? ModelAnchorIdentity => PlacementOrigin == RenderPlacementOrigin.ModelLocal
+        ? ModelPlacement?.MeshIdentity : null;
+    public ResourceIdentity? SceneEntityIdentity => PlacementOrigin == RenderPlacementOrigin.SceneOccurrence ? Entity : null;
+    public ResourceIdentity? SceneNodeIdentity => PlacementOrigin == RenderPlacementOrigin.SceneOccurrence ? Node : null;
+    public bool SourceVisibilityKnown { get; init; } = true;
     public bool SourceVisible { get; init; } = true;
     public uint? NativeFlags { get; init; }
 }
@@ -26,6 +47,7 @@ public sealed record RenderTexture(ResourceIdentity NativeIdentity, TextureSurfa
     ResourceIdentity? SourceIdentity = null, ResourceIdentity? CatalogIdentity = null)
 {
     public bool PreviewWasResized { get; init; }
+    public NativeTextureSamplingProfile? Sampling { get; init; }
 }
 
 public sealed record RenderMaterial(MaterialAsset Asset, IReadOnlyDictionary<int, RenderTexture> TexturesBySlot);
@@ -101,6 +123,15 @@ public sealed class RenderAssetSnapshot : IDisposable
             ObjectDisposedException.ThrowIf(resources is null, this);
             checked { references++; }
             return new SnapshotLease(this);
+        }
+    }
+
+    internal void OwnPreparedResource(IDisposable resource)
+    {
+        lock (sync)
+        {
+            if (resources is null) { resource.Dispose(); throw new ObjectDisposedException(nameof(RenderAssetSnapshot)); }
+            resources.Add(resource);
         }
     }
 

@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Deviant.Export.Models/Deviant.Export.Models.csproj" />
     <ProjectReference Include="../../src/Deviant.Formats.Models/Deviant.Formats.Models.csproj" />
+    <ProjectReference Include="../../src/Deviant.Formats.Scenes/Deviant.Formats.Scenes.csproj" />
     <ProjectReference Include="../../src/Deviant.Assets/Deviant.Assets.csproj" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.1" />
     <PackageReference Include="xunit" Version="2.9.3" />

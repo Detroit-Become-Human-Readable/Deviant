@@ -26,6 +26,8 @@ public partial class AudioWindow : Window, IAssetNavigator
     private readonly DispatcherTimer playbackTimer = new() { Interval = TimeSpan.FromMilliseconds(120) };
     private readonly DispatcherTimer seekTimer = new() { Interval = TimeSpan.FromMilliseconds(150) };
     private readonly HashSet<string> selectedIdentities = new(StringComparer.Ordinal);
+    private ResourceIdentity? focusedIdentity;
+    private string? focusedSourceStamp;
     private AudioExplorerSession? session;
     private AudioExplorerSession? observedAudioEnrichment;
     private PreviewSession? activePreview;
@@ -48,6 +50,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     private Task? activeJob;
     private Task? activeOpen;
     private readonly SemaphoreSlim workspaceCommit = new(1,1);
+    private int workspaceTransitionDepth;
     private readonly HashSet<Task> pendingOpens = [];
     private bool tickingPlayback;
     private readonly List<(MainWindow Window, IBrowserController Controller)> advancedWindows = [];
@@ -56,6 +59,8 @@ public partial class AudioWindow : Window, IAssetNavigator
     private readonly AliasDraftStore aliasDrafts=new();
     private PlaybackContext? playing;
     private long playbackGeneration;
+    private long previewRequestVersion;
+    private CancellationTokenSource? previewCancellation;
     private ResourceIdentity? aliasEditorIdentity;
     private bool updatingAlias,updatingDevices;
     private readonly StringsView stringsView=new();
@@ -86,13 +91,16 @@ public partial class AudioWindow : Window, IAssetNavigator
         stringsView.RelatedNavigator=NavigateStringRelatedAsync;stringsView.RelatedLabelResolver=StringRelatedLabel;
         DdsHost.Content=ddsView;
         AnimationHost.Content=animationView;ShaderHost.Content=shaderView;
+        InitializePhysics();
+        InitializeAudioDialogue();
+        InitializeCharacters();
         ReferencesHost.Content=referencesView;
         ScenesHost.Content = sceneView;
         sceneView.AssetNavigator = this;
         sceneView.TextureOwnerQueryProvider = QueryTexturesByOwnerAsync;
         InitializeSceneRendering();
         InitializeTextureExplorer();
-        BufferHost.Content=bufferView;
+        InitializeCommonGroups();
         familyView.PreviewUnavailableReason="";
         player.PlaybackStopped+=Player_PlaybackStopped;
         filterTimer.Tick += async (_, _) => { filterTimer.Stop(); await QueryAsync(resetOffset: true); };
@@ -121,9 +129,12 @@ public partial class AudioWindow : Window, IAssetNavigator
         NavigateAssetAsync(identity, revision, token);
     public async Task ShowScenesAsync(CancellationToken token = default)
     {
+        if (!RequireWorkspaceNavigation()) return;
         var current = session;
         if (current is null) return;
         var navigation = navigationGeneration;
+        await sceneNavigationDrain.WaitAsync(token);
+        if (navigation != navigationGeneration || !ReferenceEquals(current, session) || closingInProgress) return;
         await modelView.UnloadAsync();
         ShowBrowse("scenes");
         ScenesHost.Content = sceneView;
@@ -135,23 +146,27 @@ public partial class AudioWindow : Window, IAssetNavigator
             var created = factory is null
                 ? await OpenDefaultSceneSessionAsync(current.Snapshot, SceneOptions, token)
                 : await factory(current.Snapshot, cache, aliases, SceneOptions, token);
-            if (navigation != navigationGeneration || !ReferenceEquals(current, session) || closingInProgress)
+            if (token.IsCancellationRequested || navigation != navigationGeneration || !ReferenceEquals(current, session) || closingInProgress)
             {
                 await created.DisposeAsync();
+                token.ThrowIfCancellationRequested();
                 return;
             }
             sceneSession = created;
         }
         await sceneView.LoadAsync(sceneSession, token);
         if (navigation != navigationGeneration || !ReferenceEquals(current, session) || closingInProgress) return;
+        await RestoreSceneReturnStateAsync(navigation, current, token);
         if (sceneSession.Progress.HasMore || sceneSession.Progress.Candidates == 0)
             await sceneView.DiscoverAllAsync(token);
     }
     public async Task ShowStringsAsync(CancellationToken token=default)
     {
+        if (!RequireWorkspaceNavigation()) return;
         ShowBrowse("strings");
         if(session is not null&&(stringsView.CurrentSession?.Snapshot.PhysicalSourceStamp!=session.Snapshot.PhysicalSourceStamp||stringsView.CurrentSession?.Snapshot.IndexContentId!=session.Snapshot.IndexContentId))
             await stringsView.LoadAsync(session.Snapshot,cache.Location,token);
+        else await stringsView.RetryIndexingAsync(token);
     }
     public Task StopPreviewAudioAsync() => StopPlaybackAsync();
     public IReadOnlyList<AudioExplorerRow> CurrentRows => MediaList.ItemsSource is IEnumerable<AudioExplorerRow> rows ? rows.ToArray() : Array.Empty<AudioExplorerRow>();
@@ -205,30 +220,43 @@ public partial class AudioWindow : Window, IAssetNavigator
         try
         {
             opened = await AudioExplorerSession.OpenStagedAsync(path, cache, aliases, tools, progress, token, startEnrichment: false);
+            ValidateWorkspace(opened.Snapshot);
             await workspaceCommit.WaitAsync(token);entered=true;
+            ++workspaceTransitionDepth;
             if (generation != openGeneration || token.IsCancellationRequested || closingInProgress) return;
             await CancelQueryAsync();
             await StopPlaybackAsync();
+            await ClearPhysicsAsync();
+            await ClearAudioDialogueAsync();
+            await ClearCharactersAsync();
             await stringsView.DisposeAsync();
             await ClearSceneSessionAsync();
             await animationView.ClearAsync();await shaderView.ClearAsync();
             await referencesView.ClearAsync();
             await ClearTextureCatalogsAsync();
+            await ClearSharedCatalogReferencesAsync();
             await familyView.ClearAsync();
             await ClearBufferAsync();
             if (generation != openGeneration || token.IsCancellationRequested || closingInProgress) return;
             var old=session;
             var sameSource=old is not null&&old.Snapshot.IndexContentId==opened.Snapshot.IndexContentId&&old.Snapshot.PhysicalSourceStamp==opened.Snapshot.PhysicalSourceStamp;
-            var previousFocus=sameSource?CurrentRow?.Identity:null;
+            var previousFocus=sameSource?focusedIdentity??CurrentRow?.Identity:null;
             var previousSelection=sameSource?selectedIdentities.ToArray():Array.Empty<string>();
             if(old is not null)old.Updated-=Session_Updated;
             session = opened;
+            admittedWorkspace = opened.Snapshot;
             workspace=null;
             committed=true;
             if(!sameSource)aliasDrafts.Clear();aliasEditorIdentity=null;
             inputPath = path; SourceLabel.Text = System.IO.Path.GetFileName(path);
             selectedIdentities.Clear();
             selectedIdentities.UnionWith(previousSelection);
+            if (sameSource && previousFocus is { } retainedFocus)
+            {
+                focusedIdentity = retainedFocus;
+                focusedSourceStamp = opened.Snapshot.PhysicalSourceStamp;
+            }
+            else ClearFocusedIdentity();
             suppressSelectionTracking=true;try{MediaList.ItemsSource=Array.Empty<AudioExplorerRow>();}finally{suppressSelectionTracking=false;}
             SelectionText.Text="0 selected";PageText.Text="";AudioPrevious.IsEnabled=AudioNext.IsEnabled=false;UpdateSelectedDetails();
             opened.Updated += Session_Updated;
@@ -249,14 +277,15 @@ public partial class AudioWindow : Window, IAssetNavigator
         catch (Exception ex) { if (generation == openGeneration) SetBusy(false, ex.Message); }
         finally
         {
-            if (generation == openGeneration) { indexOpeningActive = false; RefreshActivity(); }
-            if(entered)workspaceCommit.Release();
+            if (generation == openGeneration) { indexOpeningActive = false; RefreshActivity(); RefreshWorkspaceNavigation(); }
+            if(entered) { --workspaceTransitionDepth; workspaceCommit.Release(); RefreshWorkspaceNavigation(); }
             if(opened is not null&&!committed)await opened.DisposeAsync();
         }
     }
 
     private void EnsureAudioEnrichment()
     {
+        if (currentView != "audio") return;
         if (session is not { } current || current.IsEnrichmentComplete || ReferenceEquals(observedAudioEnrichment, current)) return;
         observedAudioEnrichment = current;
         _ = TrackLibraryTask(ObserveEnrichmentAsync(current, openGeneration, CancellationToken.None));
@@ -289,7 +318,8 @@ public partial class AudioWindow : Window, IAssetNavigator
         var generation = Interlocked.Increment(ref queryGeneration);
         var offset = resetOffset ? 0 : currentQuery.Offset;
         currentQuery = ReadQuery(offset, 100);
-        StatusText.Text = current.IsEnrichmentComplete ? "Searching…" : "Searching current audio snapshot…";
+        if (currentView == "audio" && !foregroundBusy)
+            StatusText.Text = current.IsEnrichmentComplete ? "Searching…" : "Searching current audio snapshot…";
         try
         {
             var page = await current.QueryAsync(currentQuery, token);
@@ -302,7 +332,7 @@ public partial class AudioWindow : Window, IAssetNavigator
                 if (generation != queryGeneration || token.IsCancellationRequested || !ReferenceEquals(current, session)) return;
             }
             var selection = selectedIdentities.ToArray();
-            var focusIdentity = CurrentRow?.Identity.Key;
+            var focusIdentity = IsFocusedInCurrentSource ? focusedIdentity?.Key : null;
             suppressSelectionTracking = true;
             try
             {
@@ -314,15 +344,16 @@ public partial class AudioWindow : Window, IAssetNavigator
             finally { suppressSelectionTracking = false; }
             selectedIdentities.Clear(); selectedIdentities.UnionWith(selection);
             PageText.Text = $"{(page.Total == 0 ? 0 : offset + 1):N0}–{Math.Min(offset + page.Rows.Count, page.Total):N0} of {page.Total:N0}";
+            audioResultStatus = $"{page.Total:N0} audio resources";
             AudioPrevious.IsEnabled = offset > 0;
             AudioNext.IsEnabled = offset + page.Rows.Count < page.Total;
             SelectionText.Text = $"{selectedIdentities.Count:N0} selected";
-            if (currentView == "audio" && !foregroundBusy) StatusText.Text = $"{page.Total:N0} audio resources";
+            if (currentView == "audio" && !foregroundBusy) StatusText.Text = audioResultStatus;
             RefreshActivity();
             UpdateSelectedDetails();
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { if (generation == queryGeneration) StatusText.Text = ex.Message; }
+        catch (Exception ex) { if (generation == queryGeneration && currentView == "audio" && !foregroundBusy) StatusText.Text = ex.Message; }
     }
 
     private AudioExplorerQuery ReadQuery(long offset, int limit)
@@ -380,30 +411,52 @@ public partial class AudioWindow : Window, IAssetNavigator
     private void MediaList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (suppressSelectionTracking) return;
-        foreach (AudioExplorerRow row in e.RemovedItems) selectedIdentities.Remove(row.Identity.Key);
-        foreach (AudioExplorerRow row in e.AddedItems) selectedIdentities.Add(row.Identity.Key);
+        foreach (AudioExplorerRow row in e.RemovedItems)
+        {
+            selectedIdentities.Remove(row.Identity.Key);
+            if (focusedIdentity == row.Identity) ClearFocusedIdentity();
+        }
+        foreach (AudioExplorerRow row in e.AddedItems)
+        {
+            selectedIdentities.Add(row.Identity.Key);
+            focusedIdentity = row.Identity;
+            focusedSourceStamp = session?.Snapshot.PhysicalSourceStamp;
+        }
         SelectionText.Text = $"{selectedIdentities.Count:N0} selected";
         UpdateSelectedDetails();
         SelectionForLibraryChanged();
     }
 
-    private AudioExplorerRow? CurrentRow => MediaList.SelectedItem as AudioExplorerRow;
-    private void MediaList_SizeChanged(object sender,SizeChangedEventArgs e)
+    private bool IsFocusedInCurrentSource => focusedIdentity is { } identity && session is { } current &&
+        identity.IndexContentId == current.Snapshot.IndexContentId &&
+        focusedSourceStamp == current.Snapshot.PhysicalSourceStamp && selectedIdentities.Contains(identity.Key);
+
+    private void ClearFocusedIdentity()
     {
-        if(MediaList.View is not GridView view||view.Columns.Count<6)return;
-        var compact=e.NewSize.Width<720;
-        view.Columns[1].Width=compact?0:115;view.Columns[2].Width=compact?0:70;view.Columns[5].Width=compact?0:35;
-        view.Columns[0].Width=Math.Max(130,e.NewSize.Width-(compact?75+65:115+70+75+65+35)-28);
+        focusedIdentity = null;
+        focusedSourceStamp = null;
+    }
+
+    private AudioExplorerRow? CurrentRow
+    {
+        get
+        {
+            if (MediaList.SelectedItem is AudioExplorerRow visible) return visible;
+            if (!IsFocusedInCurrentSource || focusedIdentity is not { } identity || session is not { } current) return null;
+            return current.ResolveSelection([identity]).SingleOrDefault(row => row.Identity == identity);
+        }
     }
     private void UpdateSelectedDetails()
     {
-        var selected = session?.ResolveSelectionKeys(selectedIdentities) ?? Array.Empty<AudioExplorerRow>();
+        UpdateAudioDialogueSelection(CurrentRow);
+        var selected = selectedIdentities.Count == 0 ? Array.Empty<AudioExplorerRow>() :
+            session?.ResolveSelectionKeys(selectedIdentities) ?? Array.Empty<AudioExplorerRow>();
         var statuses = selected.Select(item => item.CompletenessBadge).Where(text => text.Length > 0).Distinct().ToArray();
         SelectionBadge.Text = string.Join(" · ", statuses);
         SelectionBadge.Visibility = statuses.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
         var row = CurrentRow;
         DetailName.Text = row?.Label ?? "Select a clip";
-        DetailMetadata.Text = row is null ? "" : $"{row.Bank} · {row.Media.Language} · {row.Media.Codec} · {row.Media.Duration?.ToString("F2", CultureInfo.InvariantCulture) ?? "—"} s · {row.Media.Channels} ch\n{row.CompletenessBadge}";
+        DetailMetadata.Text = row is null ? "" : AudioMediaPresentation.Details(row);
         DetailDiagnostic.Text = row?.UnavailableReason ?? "";
         updatingAlias=true;
         try { aliasEditorIdentity=row?.Identity; AliasBox.Text=row is null?"":aliasDrafts.Read(row.Identity,row.UserAlias); }
@@ -435,49 +488,72 @@ public partial class AudioWindow : Window, IAssetNavigator
     private async void Play_Click(object sender, RoutedEventArgs e) { if (CurrentRow is { } row) await StartPreviewAsync(row, false); }
     private async void Partial_Click(object sender, RoutedEventArgs e) { if (CurrentRow is { CanPreviewPartial: true } row) await StartPreviewAsync(row, true); }
     private Task StartPreviewAsync(AudioExplorerRow row, bool partial) => StartPreviewAudioAsync(row, partial);
-    public Task StartPreviewAudioAsync(AudioExplorerRow row, bool partial = false, CancellationToken cancellationToken = default) =>
-        TrackJobAsync(() => StartPreviewCoreAsync(row, partial, cancellationToken));
+    public async Task StartPreviewAudioAsync(AudioExplorerRow row, bool partial = false, CancellationToken cancellationToken = default)
+    {
+        if (closingInProgress || workspaceTransitionDepth != 0) return;
+        var request = ++previewRequestVersion;
+        if (activeJob is { IsCompleted: false } pending)
+        {
+            if (previewCancellation is null) return;
+            previewCancellation.Cancel();
+            try { await pending; } catch { }
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        if (request != previewRequestVersion || closingInProgress || workspaceTransitionDepth != 0) return;
+        await TrackJobAsync(() => StartPreviewCoreAsync(row, partial, cancellationToken, request));
+    }
 
-    private async Task StartPreviewCoreAsync(AudioExplorerRow row, bool partial, CancellationToken externalCancellation)
+    private async Task StartPreviewCoreAsync(AudioExplorerRow row, bool partial, CancellationToken externalCancellation, long request)
     {
         var current = session; if (current is null) return;
-        jobCancellation?.Cancel(); jobCancellation?.Dispose(); jobCancellation = new CancellationTokenSource();
-        var ownCancellation = jobCancellation;
-        if (externalCancellation.CanBeCanceled)
-        {
-            ownCancellation = CancellationTokenSource.CreateLinkedTokenSource(externalCancellation);
-            jobCancellation = ownCancellation;
-        }
-        var token = ownCancellation.Token; await StopPlaybackAsync();
-        SetBusy(true, partial ? "Preparing partial preview…" : "Preparing preview…");
+        jobCancellation?.Cancel(); jobCancellation?.Dispose();
+        var ownCancellation = externalCancellation.CanBeCanceled
+            ? CancellationTokenSource.CreateLinkedTokenSource(externalCancellation) : new CancellationTokenSource();
+        jobCancellation = ownCancellation;
+        previewCancellation = ownCancellation;
+        var token = ownCancellation.Token;
         PreviewSession? pendingPreview = null;
         var volume = (float)VolumeSlider.Value;
         try
         {
+            await StopPlaybackAsync(cancelPendingPreview: false);
+            token.ThrowIfCancellationRequested();
+            if (request != previewRequestVersion || !ReferenceEquals(current, session)) return;
+            SetBusy(true, partial ? "Preparing partial preview…" : "Preparing preview…");
             pendingPreview = await Task.Run(async () => await current.PreviewAsync(row.Identity, partial, cancellationToken: token).ConfigureAwait(false), token);
-            if (token.IsCancellationRequested || !ReferenceEquals(current, session)) return;
+            if (token.IsCancellationRequested || request != previewRequestVersion || !ReferenceEquals(current, session)) return;
             await Task.Run(async () => await player.LoadAsync(pendingPreview.Path, volume, cancellationToken: token), token);
-            if (token.IsCancellationRequested || !ReferenceEquals(current, session)) { await Task.Run(player.Stop); return; }
+            if (token.IsCancellationRequested || request != previewRequestVersion || !ReferenceEquals(current, session)) { await Task.Run(player.Stop); return; }
             if(player.State==NAudio.Wave.PlaybackState.Stopped) throw new AudioToolException("Playback stopped before the preview was ready.");
             activePreview = pendingPreview; pendingPreview = null;
             playing=new(row.Identity,row.Label,row.Media.Completeness,++playbackGeneration);
             UpdatePlaybackPresentation();
             playbackTimer.Start(); SetBusy(false, partial ? "Partial preview · original fragment" : "Preview ready");
         }
-        catch (OperationCanceledException) { SetBusy(false, "Preview cancelled."); }
-        catch (Exception ex) { SetBusy(false, ex.Message); }
+        catch (OperationCanceledException) { if (request == previewRequestVersion && ReferenceEquals(current, session) && !indexOpeningActive && !closingInProgress) SetBusy(false, "Preview cancelled"); }
+        catch (Exception ex) { if (request == previewRequestVersion && ReferenceEquals(current, session) && !indexOpeningActive && !closingInProgress) SetBusy(false, ex.Message); }
         finally
         {
             if (pendingPreview is not null) await pendingPreview.DisposeAsync();
             if (ReferenceEquals(jobCancellation, ownCancellation)) jobCancellation = null;
+            if (ReferenceEquals(previewCancellation, ownCancellation)) previewCancellation = null;
             ownCancellation.Dispose();
         }
     }
 
     private async void Pause_Click(object sender, RoutedEventArgs e) { try { await Task.Run(player.Toggle); PauseButton.Content = player.State == NAudio.Wave.PlaybackState.Paused ? "Resume" : "Pause"; } catch (Exception ex) { StatusText.Text = ex.Message; } }
     private async void Stop_Click(object sender, RoutedEventArgs e) => await StopPlaybackAsync();
-    private async Task StopPlaybackAsync()
+    private async Task StopPlaybackAsync(bool cancelPendingPreview = true)
     {
+        if (cancelPendingPreview)
+        {
+            ++previewRequestVersion;
+            if (previewCancellation is {} pending)
+            {
+                pending.Cancel();
+                if (!indexOpeningActive && !closingInProgress && ReferenceEquals(jobCancellation, pending)) SetBusy(false, "Stopped");
+            }
+        }
         playing=null; ++playbackGeneration; UpdatePlaybackPresentation();
         playbackTimer.Stop();
         seekTimer.Stop(); seeking = false;
@@ -643,6 +719,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     }
     private void Advanced_Click(object sender, RoutedEventArgs e)
     {
+        if (!RequireWorkspaceNavigation()) return;
         var app = (App)Application.Current; var ui = new WpfUiDispatcher(Dispatcher);
         var controller = app.ControllerFactory?.Invoke(ui) ?? new BrowserController(ui,cache.Location);
         var window = new MainWindow(controller);
@@ -661,6 +738,12 @@ public partial class AudioWindow : Window, IAssetNavigator
 
     private async Task DrainCacheUsersAsync(CancellationToken token)
     {
+        ++workspaceTransitionDepth;
+        try
+        {
+        await ClearPhysicsAsync();
+        await ClearAudioDialogueAsync();
+        await ClearCharactersAsync();
         jobCancellation?.Cancel(); queryCancellation?.Cancel(); openCancellation?.Cancel();
         if (activeJob is not null) try { await activeJob; } catch { }
         try{await Task.WhenAll(pendingOpens.ToArray());}catch{}
@@ -669,13 +752,17 @@ public partial class AudioWindow : Window, IAssetNavigator
         await animationView.ClearAsync();await shaderView.ClearAsync();
         await referencesView.ClearAsync();
         await ClearTextureCatalogsAsync();
+        await ClearSharedCatalogReferencesAsync();
         await familyView.ClearAsync();
         await ClearBufferAsync();
         foreach (var item in advancedWindows.ToArray()) { await item.Controller.CloseAsync(true); item.Window.Close(); }
         await StopPlaybackAsync();
         var current = session; session = null;
+        admittedWorkspace = null;
         if (current is not null) await current.DisposeAsync();
         token.ThrowIfCancellationRequested();
+        }
+        finally { --workspaceTransitionDepth; RefreshWorkspaceNavigation(); }
     }
     private async Task ReopenAfterCacheChangeAsync(CancellationToken token)
     { if (inputPath is not null) await OpenAsync(inputPath, token); }
@@ -698,13 +785,14 @@ public partial class AudioWindow : Window, IAssetNavigator
     }));
     private async Task TrackJobAsync(Func<Task> start)
     {
-        if (activeJob is { IsCompleted: false } || closingInProgress) return;
+        if (activeJob is { IsCompleted: false } || closingInProgress || workspaceTransitionDepth != 0) return;
         var task = start(); activeJob = task;
         try { await task; }
         finally { if (ReferenceEquals(activeJob, task)) activeJob = null; }
     }
     private async void Cancel_Click(object sender, RoutedEventArgs e)
     {
+        CancelPhysics();
         jobCancellation?.Cancel(); openCancellation?.Cancel(); queryCancellation?.Cancel();
         var metadata = session;
         var metadataCancelled = metadata?.CancelEnrichment() == true;
@@ -724,6 +812,7 @@ public partial class AudioWindow : Window, IAssetNavigator
         else if (e.Key == Key.Left && player.State != NAudio.Wave.PlaybackState.Stopped) { e.Handled = true; _=PlayerShortcutAsync(()=>Task.Run(() => player.Position = Math.Max(0, player.Position - 5))); }
         else if (e.Key == Key.Right && player.State != NAudio.Wave.PlaybackState.Stopped) { e.Handled = true; _=PlayerShortcutAsync(()=>Task.Run(() => player.Position = Math.Min(player.Length, player.Position + 5))); }
     }
+    internal string CloseStage { get; private set; } = "Ready";
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
         if (closeApproved) return;
@@ -732,28 +821,50 @@ public partial class AudioWindow : Window, IAssetNavigator
         closingInProgress = true;
         DisposeActivity();
         navigationCancellation.Cancel();
+        using var closeForeground = workspacePreparation?.EnterForeground();
+        session?.CancelEnrichment();
+        CancelTextureCatalogWork();
+        sceneView.CancelActivity();
+        CloseStage = "Characters";
+        await ClearCharactersAsync();
+        CloseStage = "Dialogue";
+        await ClearAudioDialogueAsync();
+        CloseStage = "Physics";
+        await ClearPhysicsAsync();
         relatedCancellation?.Cancel();
         filterTimer.Stop(); playbackTimer.Stop(); seekTimer.Stop(); openCancellation?.Cancel(); queryCancellation?.Cancel(); jobCancellation?.Cancel();
+        CloseStage = "Jobs";
         if (activeJob is not null) try { await activeJob; } catch { }
         try{await Task.WhenAll(pendingOpens.ToArray());}catch{}
         await StopPlaybackAsync();
+        CloseStage = "Scenes";
         await ClearSceneSessionAsync();
-        if (session is not null) await session.DisposeAsync();
+        CloseStage = "Inspectors";
         await stringsView.DisposeAsync();
         await ddsView.DisposeAsync();
         await animationView.DisposeAsync();await shaderView.DisposeAsync();
         await referencesView.DisposeAsync();
+        CloseStage = "Rendering";
         await DisposeSceneRenderingAsync();
+        CloseStage = "Textures";
         await ClearTextureCatalogsAsync();
+        await ClearSharedCatalogReferencesAsync();
+        var closedSession = session; session = null; admittedWorkspace = null;
+        CloseStage = "Archive";
+        if (closedSession is not null) await closedSession.DisposeAsync();
         await textureExplorer.DisposeAsync();await familyView.DisposeAsync();await ClearBufferAsync();await bufferView.DisposeAsync();audioRelationships?.ClearBankGraphCache();
+        CloseStage = "Library";
         await DrainLibraryTasksAsync();
         player.PlaybackStopped-=Player_PlaybackStopped; player.Dispose();
         WindowProcessing.Dispose();
         closeApproved = true;
+        CloseStage = "Closed";
         Close();
     }
     private async Task ClearSceneSessionAsync()
     {
+        await sceneNavigationDrain;
+        ClearSceneReturnState();
         await modelView.UnloadAsync();
         await sceneView.UnloadAsync();
         await ClearSceneRenderingAsync();
@@ -771,6 +882,8 @@ public partial class AudioWindow : Window, IAssetNavigator
     private sealed class InlineProgress<T>(Action<T> report) : IProgress<T> { public void Report(T value) => report(value); }
     private void UpdatePlaybackPresentation()
     {
+        PauseButton.IsEnabled = playing is not null;
+        SeekSlider.IsEnabled = playing is not null;
         PlayingLabel.Text=playing?.Label??""; ActionBadge.Text=playing?.Badge??"";
         ActionBadge.Visibility=ActionBadge.Text.Length==0?Visibility.Collapsed:Visibility.Visible;
         StringsPlayingLabel.Text=playing is null?"":$"{playing.Label}  {playing.Badge}";
@@ -805,3 +918,4 @@ public partial class AudioWindow : Window, IAssetNavigator
         return false;
     }
 }
+

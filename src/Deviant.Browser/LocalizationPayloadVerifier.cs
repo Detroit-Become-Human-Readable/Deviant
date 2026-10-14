@@ -11,18 +11,19 @@ public sealed class LocalizationPayloadVerifier
 
     public Task<LocalizationPayloadVerificationLease> VerifyAsync(ArchiveSnapshot snapshot,
         IReadOnlyDictionary<long, string> expectedDigests, IReadOnlyList<ResourceRecord> eligibleResourceRows,
-        ISourceRevisionProvider? revisionProvider = null, CancellationToken cancellationToken = default)
+        ISourceRevisionProvider? revisionProvider = null, CancellationToken cancellationToken = default,
+        LocalizationPayloadVerificationLease? verifiedIndexLease = null)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentNullException.ThrowIfNull(expectedDigests);
         ArgumentNullException.ThrowIfNull(eligibleResourceRows);
         return Task.Run(() => VerifyCoreAsync(snapshot, expectedDigests, eligibleResourceRows,
-            revisionProvider ?? new FileRevisionProvider(), cancellationToken), cancellationToken);
+            revisionProvider ?? new FileRevisionProvider(), cancellationToken, verifiedIndexLease), cancellationToken);
     }
 
     private static async Task<LocalizationPayloadVerificationLease> VerifyCoreAsync(ArchiveSnapshot snapshot,
         IReadOnlyDictionary<long, string> expectedDigests, IReadOnlyList<ResourceRecord> eligibleResourceRows,
-        ISourceRevisionProvider revisions, CancellationToken token)
+        ISourceRevisionProvider revisions, CancellationToken token, LocalizationPayloadVerificationLease? verifiedIndexLease)
     {
         SafeFileHandle? indexHandle = null;
         var volumeHandles = new Dictionary<uint, (VolumeSource Source, SafeFileHandle Handle)>();
@@ -31,10 +32,14 @@ public sealed class LocalizationPayloadVerifier
         {
             indexHandle = SourceIdentity.OpenPinned(snapshot.IndexPath);
             SourceIdentity.EnsureUnchanged(revisions, indexHandle, snapshot.IndexPath, snapshot.IndexStamp);
-            var beforeIndexHash = await SourceIdentity.HashAsync(indexHandle, snapshot.IndexStamp.Length, token,
-                phase: "Validating localization index").ConfigureAwait(false);
-            if (!string.Equals(beforeIndexHash, snapshot.IndexContentId, StringComparison.Ordinal))
-                throw new ArchiveException("SourceChanged", "The archive index contents differ from the selected localization snapshot.");
+            verifiedIndexLease?.EnsureProtectsIndex(snapshot);
+            if (verifiedIndexLease is null)
+            {
+                var beforeIndexHash = await SourceIdentity.HashAsync(indexHandle, snapshot.IndexStamp.Length, token,
+                    phase: "Validating localization index").ConfigureAwait(false);
+                if (!string.Equals(beforeIndexHash, snapshot.IndexContentId, StringComparison.Ordinal))
+                    throw new ArchiveException("SourceChanged", "The archive index contents differ from the selected localization snapshot.");
+            }
 
             var validatedRows = new List<(ResourceRecord Row, VolumeSource Volume)>(eligibleResourceRows.Count);
             var seenOrdinals = new HashSet<long>();
@@ -82,15 +87,19 @@ public sealed class LocalizationPayloadVerifier
             SourceIdentity.EnsureUnchanged(revisions, indexHandle, snapshot.IndexPath, snapshot.IndexStamp);
             foreach (var (source, sourceHandle) in volumeHandles.Values)
                 SourceIdentity.EnsureUnchanged(revisions, sourceHandle, source.FilePath, source.Stamp);
-            var afterIndexHash = await SourceIdentity.HashAsync(indexHandle, snapshot.IndexStamp.Length, token,
-                phase: "Revalidating localization index").ConfigureAwait(false);
-            if (!string.Equals(afterIndexHash, snapshot.IndexContentId, StringComparison.Ordinal))
-                throw new ArchiveException("SourceChanged", "The archive index contents changed during localization verification.");
+            if (verifiedIndexLease is null)
+            {
+                var afterIndexHash = await SourceIdentity.HashAsync(indexHandle, snapshot.IndexStamp.Length, token,
+                    phase: "Revalidating localization index").ConfigureAwait(false);
+                if (!string.Equals(afterIndexHash, snapshot.IndexContentId, StringComparison.Ordinal))
+                    throw new ArchiveException("SourceChanged", "The archive index contents changed during localization verification.");
+            }
+            else verifiedIndexLease.EnsureProtectsIndex(snapshot);
             SourceIdentity.EnsureUnchanged(revisions, indexHandle, snapshot.IndexPath, snapshot.IndexStamp);
 
             var lease = new LocalizationPayloadVerificationLease(snapshot.IndexPath, snapshot.IndexStamp, indexHandle,
                 volumeHandles.Values.Select(item => (item.Source.FilePath, item.Source.Stamp, item.Handle)).ToArray(), revisions,
-                digestsMatch);
+                digestsMatch, snapshot.IndexContentId);
             transferred = true;
             return lease;
         }
@@ -146,11 +155,12 @@ public sealed class LocalizationPayloadVerificationLease : IAsyncDisposable
     private readonly SafeFileHandle indexHandle;
     private readonly (string Path, FileStamp Stamp, SafeFileHandle Handle)[] volumes;
     private readonly ISourceRevisionProvider revisions;
+    private readonly string indexContentId;
     private int disposed;
 
     internal LocalizationPayloadVerificationLease(string indexPath, FileStamp indexStamp, SafeFileHandle indexHandle,
         (string Path, FileStamp Stamp, SafeFileHandle Handle)[] volumes, ISourceRevisionProvider revisions,
-        bool digestsMatch)
+        bool digestsMatch, string indexContentId)
     {
         this.indexPath = indexPath;
         this.indexStamp = indexStamp;
@@ -158,9 +168,17 @@ public sealed class LocalizationPayloadVerificationLease : IAsyncDisposable
         this.volumes = volumes;
         this.revisions = revisions;
         DigestsMatch = digestsMatch;
+        this.indexContentId = indexContentId;
     }
 
     public bool DigestsMatch { get; }
+
+    internal void EnsureProtectsIndex(ArchiveSnapshot snapshot)
+    {
+        EnsureUnchanged();
+        if (indexContentId != snapshot.IndexContentId || indexPath != snapshot.IndexPath || indexStamp != snapshot.IndexStamp)
+            throw new ArchiveException("InvalidVerificationLease", "The verification lease belongs to another archive index.");
+    }
 
     public void EnsureUnchanged()
     {

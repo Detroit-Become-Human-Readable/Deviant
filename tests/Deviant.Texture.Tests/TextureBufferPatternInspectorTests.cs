@@ -37,6 +37,35 @@ public sealed class TextureBufferPatternInspectorTests
         Assert.Equal("Inspected", result.UnknownFields["status"]);
     }
 
+    [Fact]
+    public void RangeReadReturnsSelectedBytesAndStillRejectsOverlappingOmittedChunk()
+    {
+        var decoded = Enumerable.Range(0, 180_000).Select(index => (byte)(index % 239)).ToArray();
+        var stored = NativeMipFixture.WrapLargeRaw(decoded);
+        var (identity, revision, extent) = Source(stored);
+        SegsDecodedByteRange[] ranges = [new(0, 100), new(96_000, 4096)];
+
+        var result = new TextureBufferPatternInspector().ParseDecodedRanges(stored, identity, revision,
+            extent, 2229, Profile, ranges, checked((uint)decoded.Length));
+
+        var inspection = Assert.IsType<TextureBufferPatternRangeInspection>(result.Value);
+        Assert.Equal(checked((uint)decoded.Length), inspection.DeclaredDecodedLength);
+        Assert.Equal(decoded.AsSpan(0, 100).ToArray(), inspection.DecodedRanges[0]);
+        Assert.Equal(decoded.AsSpan(96_000, 4096).ToArray(), inspection.DecodedRanges[1]);
+
+        var overlap = stored.ToArray();
+        var segsOffset = 32;
+        var segmentCount = BinaryPrimitives.ReadUInt16LittleEndian(overlap.AsSpan(segsOffset + 6, 2));
+        var omittedEntryOffset = segsOffset + 16 + (segmentCount - 1) * 8;
+        BinaryPrimitives.WriteUInt32LittleEndian(overlap.AsSpan(omittedEntryOffset + 4, 4), 1);
+        var (changedIdentity, changedRevision, changedExtent) = Source(overlap);
+        var invalid = new TextureBufferPatternInspector().ParseDecodedRanges(overlap, changedIdentity,
+            changedRevision, changedExtent, 2229, Profile, [new(0, 100)], checked((uint)decoded.Length));
+
+        Assert.Null(invalid.Value);
+        Assert.Contains(invalid.Diagnostics, message => message.Contains("SegmentExtentOverlap", StringComparison.Ordinal));
+    }
+
     [Theory]
     [InlineData("tag")]
     [InlineData("type")]
@@ -155,6 +184,11 @@ public sealed class TextureBufferPatternInspectorTests
             var changed = await File.ReadAllBytesAsync(fixture.VolumePath);
             changed[5] ^= 1;
             await File.WriteAllBytesAsync(fixture.VolumePath, changed);
+            // Advance the revision independently of filesystem timestamp coalescing.
+            var ownerStamp = Assert.Single(snapshot.Volumes).Stamp;
+            File.SetLastWriteTimeUtc(fixture.VolumePath,
+                new DateTime(ownerStamp.LastWriteUtcTicks, DateTimeKind.Utc).AddSeconds(4));
+            Assert.NotEqual(ownerStamp, new FileRevisionProvider().Capture(fixture.VolumePath));
 
             var error = await Assert.ThrowsAsync<ArchiveException>(() => new TextureBufferPatternInspector()
                 .ReadAsync(snapshot, Assert.Single(snapshot.Records), Profile));

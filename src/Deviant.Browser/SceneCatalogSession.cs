@@ -32,6 +32,7 @@ public sealed partial class SceneCatalogSession : ISceneCatalogSession
     private int nextCandidate;
     private long? nextDependencyOwner = 0;
     private bool running, stopped;
+    private int cachedAvailable;
     private string? message;
 
     private SceneCatalogSession(ArchiveSnapshot snapshot, FeatureStore store, SerializedWorker worker,
@@ -47,7 +48,7 @@ public sealed partial class SceneCatalogSession : ISceneCatalogSession
     public event EventHandler? Updated;
     public SceneDiscoveryProgress Progress
     {
-        get { lock (gate) return new(running, nextCandidate, candidates.Count, verified.Count,
+        get { lock (gate) return new(running, nextCandidate, candidates.Count, Math.Max(verified.Count, cachedAvailable),
             nextCandidate < candidates.Count || nextDependencyOwner is not null, message); }
     }
 
@@ -173,29 +174,34 @@ public sealed partial class SceneCatalogSession : ISceneCatalogSession
         return Track(async linked =>
         {
             EnsureSourceStamps();
-            Dictionary<string, AssetDescriptor> accepted;
-            lock (gate) accepted = new(verified, StringComparer.Ordinal);
-            return await worker.InvokeAsync(() =>
+            var query = new AssetQuery(Search: search, Family: AssetFamily, Offset: offset, Limit: limit)
+            { CachedPayloadFilter = new(Revision, "scene.reader", SceneSectionReader.Version, SceneSectionReader.MemberPath, Snapshot.Records.Count) };
+            var page = await worker.InvokeAsync(() =>
             {
-                var query = new AssetQuery(Search: search, Family: AssetFamily, Limit: 256);
-                var total = store.Count(query, linked); long acceptedCount = 0;
-                var result = new List<AssetDescriptor>(limit);
-                for (long cursor = 0; cursor < total; cursor += 256)
-                {
-                    linked.ThrowIfCancellationRequested();
-                    foreach (var entry in store.Query(query with { Offset = cursor }, linked))
-                    {
-                        if (!accepted.TryGetValue(entry.Identity.Key, out var expected) || expected.Revision != entry.Revision) continue;
-                        if (acceptedCount++ >= offset && result.Count < limit) result.Add(entry);
-                    }
-                }
-                return new SceneCatalogPage(result, acceptedCount, offset);
+                var total = store.Count(query, linked);
+                var result = store.Query(query, linked).Select(ApplyAlias).ToArray();
+                return new SceneCatalogPage(result, total, offset);
             }, linked).ConfigureAwait(false);
+            if (!Snapshot.IndexStamp.Reliable || Snapshot.Volumes.Any(volume => !volume.Stamp.Reliable))
+            {
+                using var validation = ArchiveSourceSession.Acquire(Snapshot);
+                await validation.Session.ValidateIndexAsync(linked).ConfigureAwait(false);
+                var extents = page.Entries.SelectMany(entry => entry.Extents).Distinct().ToArray();
+                if (extents.Length > 0)
+                    await validation.Session.VerifyAsync(extents, linked, SourceExtentVerifier.MaximumBytes,
+                        SourceExtentVerifier.MaximumLargeExtentCount).ConfigureAwait(false);
+                else if (page.Entries.Count > 0)
+                    throw new ArchiveException("SourceChanged", "The cached scene has no source receipts for this archive.");
+            }
+            linked.ThrowIfCancellationRequested(); EnsureSourceStamps();
+            if (string.IsNullOrWhiteSpace(search)) lock (gate) cachedAvailable = checked((int)Math.Min(int.MaxValue, page.Total));
+            return page;
         }, token);
     }
 
     public Task<SceneLoadedSection> LoadAsync(ResourceIdentity identity, CancellationToken token = default) => Track(async linked =>
     {
+        using var timing = AssetLoadDiagnostics.Measure("SceneSection", identity.Key);
         if (identity.IndexContentId != Snapshot.IndexContentId || identity.Ordinal < 0 || identity.Ordinal >= Snapshot.Records.Count ||
             identity.MemberPath is not (null or SceneSectionReader.MemberPath))
             throw new ArchiveException("InvalidSceneIdentity", "The scene belongs to another source.");

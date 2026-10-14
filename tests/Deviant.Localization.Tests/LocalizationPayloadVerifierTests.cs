@@ -87,6 +87,50 @@ public sealed class LocalizationPayloadVerifierTests
         retry.EnsureUnchanged();
     }
 
+    [Fact]
+    public async Task PinnedIndexCanBeReusedWhilePayloadDigestsRemainVerified()
+    {
+        using var fixture = new LocalizationFixture();
+        fixture.AddResource(LocalizationFixture.Wrap(LocalizationFixture.MakeLocalization(6,
+            ("ENG", [LocalizationFixture.DirectText("SAMPLE_KEY", "A source line")]))));
+        var snapshot = await fixture.BuildAsync();
+        var row = Assert.Single(snapshot.Records);
+        var bytes = await File.ReadAllBytesAsync(fixture.VolumePath);
+        var digest = Convert.ToHexString(SHA256.HashData(bytes.AsSpan(checked((int)row.Offset), checked((int)row.StoredSize)))).ToLowerInvariant();
+        var verifier = new LocalizationPayloadVerifier();
+        await using var index = await verifier.VerifyAsync(snapshot, new Dictionary<long, string>(), []);
+        await using var correct = await verifier.VerifyAsync(snapshot, new Dictionary<long, string> { [row.Ordinal] = digest },
+            [row], verifiedIndexLease: index);
+        Assert.True(correct.DigestsMatch);
+        await using var mismatch = await verifier.VerifyAsync(snapshot,
+            new Dictionary<long, string> { [row.Ordinal] = new string('0', 64) }, [row], verifiedIndexLease: index);
+        Assert.False(mismatch.DigestsMatch);
+        correct.EnsureUnchanged();
+    }
+
+    [Fact]
+    public async Task PinnedIndexReuseRejectsDifferentSnapshotAndDisposedLease()
+    {
+        using var fixture = new LocalizationFixture();
+        fixture.AddResource(LocalizationFixture.Wrap(LocalizationFixture.MakeLocalization(6,
+            ("ENG", [LocalizationFixture.DirectText("SAMPLE_KEY", "A source line")]))));
+        var snapshot = await fixture.BuildAsync();
+        var verifier = new LocalizationPayloadVerifier();
+        var index = await verifier.VerifyAsync(snapshot, new Dictionary<long, string>(), []);
+        try
+        {
+            var other = snapshot with { IndexContentId = new string('0', 64) };
+            var failure = await Assert.ThrowsAsync<ArchiveException>(() => verifier.VerifyAsync(other,
+                new Dictionary<long, string>(), [], verifiedIndexLease: index));
+            Assert.Equal("InvalidVerificationLease", failure.Code);
+        }
+        finally { await index.DisposeAsync(); }
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => verifier.VerifyAsync(snapshot,
+            new Dictionary<long, string>(), [], verifiedIndexLease: index));
+        await using var retry = await verifier.VerifyAsync(snapshot, new Dictionary<long, string>(), []);
+        Assert.True(retry.DigestsMatch);
+    }
+
     private sealed class FrozenRevisionProvider(ArchiveSnapshot snapshot) : ISourceRevisionProvider
     {
         private readonly Dictionary<string, FileStamp> stamps = CreateStamps(snapshot);

@@ -15,6 +15,43 @@ namespace Deviant.Desktop.Tests;
 [Collection("WPF")]
 public sealed class AudioPresentationTests
 {
+    [Fact] public void MidiMetadataAppearsInNormalDetails()
+    {
+        Exception? error = null;
+        var thread = new Thread(() =>
+        {
+            SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext());
+            var root = Path.Combine(Path.GetTempPath(), "deviant-ui-" + Guid.NewGuid().ToString("N"));
+            AudioWindow? window = null;
+            try
+            {
+                window = new AudioWindow(new CacheManager(Path.Combine(root, "settings"), new(Path.Combine(root, "cache"))),
+                    new AliasStore(Path.Combine(root, "library")), playbackPlayer: new Player(new Factory(new Backend())),
+                    outputDeviceProvider: new Devices()) { Left = -10000, Top = -10000, ShowActivated = false, ShowInTaskbar = false };
+                WindowTestLifetime.Observe(window); window.Show(); Pump(window.DevicesReady);
+                var row = Row(1, "Generated MIDI", MediaCompleteness.Complete);
+                row.Media.Codec = "MIDI"; row.Media.Midi = new(1, 3, 480);
+                var list = (ListView)window.FindName("MediaList");
+                list.ItemsSource = new[] { row }; list.SelectedItem = row;
+
+                Assert.Equal("Standalone · SFX · MIDI\nFormat 1 · 3 tracks · 480 PPQN",
+                    ((TextBlock)window.FindName("DetailMetadata")).Text);
+            }
+            catch (Exception failure) { error = failure; }
+            finally
+            {
+                try
+                {
+                    if (window is not null) Pump(WindowTestLifetime.CloseAsync(window));
+                    if (Directory.Exists(root)) Directory.Delete(root, true);
+                }
+                catch (Exception cleanupError) { error = error is null ? cleanupError : new AggregateException(error, cleanupError); }
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA); thread.Start();
+        Assert.True(thread.Join(TimeSpan.FromSeconds(15)), "MIDI details check timed out");
+        if (error is not null) throw new InvalidOperationException("MIDI details check failed", error);
+    }
     [Fact] public void AliasDraftsStayPerIdentityUntilExplicitSave()
     {
         var drafts=new AliasDraftStore(); var a=new ResourceIdentity("index",1); var b=new ResourceIdentity("index",2);

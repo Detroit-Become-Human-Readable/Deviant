@@ -13,7 +13,7 @@ public sealed class AudioExplorerQueryTests
     [Fact]
     public async Task UnnamedBankMediaUsesBankAndMediaIdInsteadOfGenericOrdinal()
     {
-        using var fixture = FormatsFixtureBuilder.CreateAudioCatalog();
+        using var fixture = FormatsFixtureBuilder.CreateAudioCatalog(includeSoundEventName: false);
         var workRoot = Path.Combine(Path.GetTempPath(), "deviant-audio-labels-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(workRoot);
         try

@@ -14,9 +14,16 @@ public enum EventBehavior { Unknown, Playback, StateChange, Control, Mixed }
 public enum EventLinkStatus { Resolved, Empty, Missing, Ambiguous }
 public enum EventLinkKind { Direct, StateBranch }
 public sealed record DataSlice(string FilePath, long Offset, long Length);
+public sealed record MidiMetadata(ushort Format, ushort TrackCount, ushort Division);
 public sealed record AudioMetadataReadDigest(DataSlice Slice, string Sha256, string? Role = null, ResourceIdentity? Owner = null);
+public sealed record DialogueHeaderAssociation(ResourceIdentity HeaderIdentity, ReferenceResolution AudioResolution,
+    ReferenceResolution EventResolution, IReadOnlyList<AudioMetadataReadDigest> ReadDigests, bool EvidenceCoverageComplete);
 public sealed record ResourceReference(uint Type, uint Id);
-public sealed record AudioReadProgress(string Phase, int Completed, int Total, string? Detail = null, AudioCatalog? Snapshot = null);
+public sealed record AudioReadProgress(string Phase, int Completed, int Total, string? Detail = null, AudioCatalog? Snapshot = null)
+{
+    public IReadOnlyList<ResourceIdentity>? ChangedMediaIdentities { get; init; }
+    public IReadOnlyList<MediaEntry>? ChangedMedia { get; init; }
+}
 public sealed record Diagnostic(string Code, string Message, string? EntryKey = null);
 public sealed record NameEvidence(string Text, string Namespace, uint Id, NameKind Kind, string Source, long Offset = 0, string Confidence = "High", string? HashMethod = null, string? CollisionGroup = null, string? InputSha256 = null);
 public sealed record BankChunk(string Tag, DataSlice Slice);
@@ -116,6 +123,7 @@ public sealed class MediaEntry
     public uint? RawLanguageId { get; set; }
     public string Category { get; set; } = "Unknown";
     public string Codec { get; set; } = "Unknown";
+    public MidiMetadata? Midi { get; set; }
     public int SampleRate { get; set; }
     public int Channels { get; set; }
     public double? Duration { get; set; }
@@ -125,6 +133,7 @@ public sealed class MediaEntry
     public DataSlice? DidxExtent { get; set; }
     public MediaState State { get; set; }
     public MediaCompleteness Completeness { get; set; }
+    public bool SourceDeclarationProcessingComplete { get; set; }
     public ContainerValidity ContainerValidity { get; set; }
     public SourceAvailability Availability { get; set; }
     public List<MediaSourceEvidence> SourceEvidence { get; set; } = [];
@@ -172,6 +181,9 @@ public sealed class AudioEvent
 
 public sealed class AudioCatalog
 {
+    public int EventMediaVersion { get; set; }
+    public int DialogueHeaderVersion { get; set; }
+    public List<DialogueHeaderAssociation> DialogueHeaderAssociations { get; set; } = [];
     public string SourcePath { get; set; } = "";
     public string Fingerprint { get; set; } = "";
     public string IndexContentId { get; set; } = "";

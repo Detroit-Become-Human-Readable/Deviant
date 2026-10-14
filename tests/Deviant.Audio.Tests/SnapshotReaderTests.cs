@@ -56,6 +56,35 @@ public sealed class SnapshotReaderTests
     }
 
     [Fact]
+    public async Task DialogueProgressReportsOnlyNewOrChangedMediaIdentities()
+    {
+        const int mediaCount = 8193;
+        using var fixture = FormatsFixtureBuilder.CreateDialogueMediaCatalog(mediaCount);
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.IndexPath);
+        var progress = new InlineProgress<AudioReadProgress>();
+
+        var result = await new DetroitAudioSnapshotReader().ReadSnapshotAsync(snapshot, progress);
+
+        var changedProperty = typeof(AudioReadProgress).GetProperty("ChangedMediaIdentities");
+        Assert.NotNull(changedProperty);
+        var reports = progress.Items.Where(item => item.Snapshot is not null).ToArray();
+        Assert.True(reports.Length >= 3);
+        var deltas = reports.Select(item => Assert.IsAssignableFrom<IReadOnlyList<ResourceIdentity>>(
+            changedProperty!.GetValue(item))).ToArray();
+        var changedIdentities = deltas.SelectMany(delta => delta).ToArray();
+        Assert.Equal(mediaCount, result.Catalog.Media.Count);
+        Assert.Equal(mediaCount, changedIdentities.Distinct().Count());
+        Assert.InRange(changedIdentities.Length, mediaCount, mediaCount * 2);
+        foreach (var report in reports)
+        {
+            var visible = report.Snapshot!.Media.Select(media => media.Identity).Where(identity => identity is not null)
+                .ToHashSet();
+            Assert.All(Assert.IsAssignableFrom<IReadOnlyList<ResourceIdentity>>(
+                changedProperty!.GetValue(report)), identity => Assert.Contains(identity, visible));
+        }
+    }
+
+    [Fact]
     public async Task AmbiguousBankContainerReferenceDoesNotSelectFirstDuplicate()
     {
         using var fixture = FormatsFixtureBuilder.CreateAudioCatalog(duplicateContainer: true);

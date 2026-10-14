@@ -16,16 +16,25 @@ namespace Deviant.Desktop.Tests;
 [Collection("WPF")]
 public sealed class NavigationTests
 {
+    [Fact]
+    public void HomeOpeningDoesNotRestoreUnrelatedAudioMetadata() => WorkspaceCommitTests.Run((window, fixture) =>
+    {
+        DiscoveryFixture.WriteIndex(fixture.Index, [(999u, new byte[] { 1, 2, 3 })]);
+        Pump(window.OpenArchiveAsync(fixture.Index));
+        var initialization = (Lazy<Task>)typeof(AudioExplorerSession).GetField("audioInitialization", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window.CurrentSession!)!;
+        Assert.False(initialization.IsValueCreated);
+    });
+
     [Theory]
     [InlineData(1280)]
     [InlineData(1600)]
-    public void FooterStaysVisibleAndCenteredAcrossViews(double width)
+    public void FooterStatusAndEarlyBuildDisclaimerStayVisibleAcrossViews(double width)
     {
         WorkspaceCommitTests.Run((window, _) =>
         {
             window.Width = width;
             var footer = (FrameworkElement)window.FindName("ApplicationStatusBar");
-            var notice = (FrameworkElement)window.FindName("PrereleaseNotice");
+            var notice = (TextBlock)window.FindName("PrereleaseNotice");
             var status = (FrameworkElement)window.FindName("StatusText");
             CheckLayout();
             Invoke(window, "ShowBrowse", "dds");
@@ -38,10 +47,9 @@ public sealed class NavigationTests
                 window.UpdateLayout();
                 Assert.True(footer.IsVisible);
                 Assert.True(notice.IsVisible);
-                var noticeBounds = notice.TransformToAncestor(footer).TransformBounds(new Rect(notice.RenderSize));
+                Assert.Equal("This is an early build. Bugs are expected.", notice.Text);
                 var statusBounds = status.TransformToAncestor(footer).TransformBounds(new Rect(status.RenderSize));
-                Assert.InRange(Math.Abs(noticeBounds.Left + noticeBounds.Width / 2 - footer.ActualWidth / 2), 0, 1);
-                Assert.True(statusBounds.Left >= noticeBounds.Right, "The operation status overlaps the centered notice.");
+                Assert.True(statusBounds.Left >= 0, "The operation status extends outside the footer.");
                 Assert.True(statusBounds.Right <= footer.ActualWidth, "The operation status extends outside the footer.");
             }
         });

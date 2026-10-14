@@ -14,6 +14,7 @@ using Deviant.Browser;
 using Deviant.Core;
 using Deviant.Catalog;
 using Deviant.Export;
+using Deviant.Export.Textures;
 using Deviant.Formats.Textures;
 using Xunit;
 using Microsoft.Win32.SafeHandles;
@@ -24,9 +25,44 @@ namespace Deviant.Desktop.Tests;
 public sealed class NativeTextureWorkflowTests
 {
     [Fact]
+    public async Task SelectivePreviewReadsLegacyFileTextBodyWithoutNativeDirectoryFrames()
+    {
+        using var fixture = new DiscoveryFixture(1);
+        NativeTextureFixture.WriteArchive(fixture.Index);
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        await catalogs.EnrichmentTask;
+        await using var session = new NativeTextureSession(catalogs);
+
+        var result = await session.ReadPreviewAsync(new(snapshot.IndexContentId, 2), new AssetMemoryBudget(), 4);
+
+        var source = Assert.IsType<NativeTextureSource>(result.Source);
+        using var companion = Assert.IsType<NativeContainerLease>(source.CompanionLease);
+        Assert.True(companion.IsMetadataOnly);
+        Assert.Equal("filetext/40", source.Metadata.Identity.MemberPath);
+        Assert.Equal(new[] { new ResourceIdentity(snapshot.IndexContentId, 3) },
+            source.Payloads.Select(payload => payload.Identity));
+        var document = new NativeTextureDecoder().ReadPreview(source, 4).Document;
+        Assert.Equal(4, document.Info.Width);
+        Assert.Equal(2, document.Info.Height);
+        await session.RevalidateAsync(source);
+
+        var full = await session.ReadFullResolutionAsync(source, new AssetMemoryBudget());
+        var fullSource = Assert.IsType<NativeTextureSource>(full.Source);
+        using var fullCompanion = Assert.IsType<NativeContainerLease>(fullSource.CompanionLease);
+        Assert.True(fullCompanion.IsMetadataOnly);
+        Assert.Null(fullSource.PreviewDimension);
+        Assert.Equal(3, fullSource.Payloads.Count);
+        var fullDocument = new NativeTextureDecoder().Read(fullSource);
+        Assert.Equal(3, fullDocument.Info.MipCount);
+        await session.RevalidateAsync(fullSource);
+    }
+
+    [Fact]
     public void ZeroAlphaNativeColorsUseRgbPreviewAndThumbnailsWhilePngRetainsAlpha() => WorkspaceCommitTests.Run((window, fixture) =>
     {
         NativeTextureFixture.WriteArchive(fixture.Index, zeroAlpha: true); Pump(window.OpenArchiveAsync(fixture.Index)); Pump(window.ShowTexturesAsync());
+        window.TextureBrowser.ThumbnailsEnabled = true;
         Pump(Field<TextureCatalogSession>(window, "textureCatalogs").EnrichmentTask);
         var identity = new ResourceIdentity(window.CurrentSession!.Snapshot.IndexContentId, 2);
         Pump(window.TextureBrowser.SelectResourceAsync(identity));
@@ -52,33 +88,35 @@ public sealed class NativeTextureWorkflowTests
     public void HostCreatesNativePreviewExportsFullMipAndWaitsForNavigationDrain() => WorkspaceCommitTests.Run((window, fixture) =>
     {
         NativeTextureFixture.WriteArchive(fixture.Index); Pump(window.OpenArchiveAsync(fixture.Index));
-        var audio = window.CurrentSession!; Assert.True(audio.IsEnrichmentStarted || audio.IsEnrichmentComplete);
+        var audio = window.CurrentSession!; Assert.False(audio.IsEnrichmentStarted);
         Pump(window.ShowTexturesAsync());
         var catalogs = Field<TextureCatalogSession>(window, "textureCatalogs"); Pump(catalogs.EnrichmentTask);
         var identity = new ResourceIdentity(window.CurrentSession!.Snapshot.IndexContentId, 2);
         Pump(window.TextureBrowser.SelectResourceAsync(identity));
-        Pump(WaitUntilAsync(() => window.TextureBrowser.NativeImageBrowser?.CurrentSource?.SelectedIdentity == identity));
+        try { Pump(WaitUntilAsync(() => window.TextureBrowser.NativeImageBrowser?.CurrentSource?.SelectedIdentity == identity)); }
+        catch (OperationCanceledException error)
+        { throw new InvalidOperationException("Texture preview: " + ((TextBlock)window.TextureBrowser.FindName("PreviewStatus")).Text, error); }
         var owner = window.TextureBrowser.NativeSession!; var pane = window.TextureBrowser.NativeImageBrowser!;
-        Assert.Equal(2, pane.ImageBrowser.CurrentDocument!.Info.MipCount);
+        Assert.Equal(1, pane.ImageBrowser.CurrentDocument!.Info.MipCount);
         Assert.Equal(NativeTextureFixture.RgbaPixels(0), pane.ImageBrowser.CurrentDisplaySurface!.Rgba8.ToArray());
-        Assert.True(audio.IsEnrichmentStarted || audio.IsEnrichmentComplete);
-        Assert.Contains("2/3 mips", ((TextBlock)pane.ImageBrowser.FindName("Metadata")).Text);
+        Assert.False(audio.IsEnrichmentStarted);
+        Assert.Contains("1/3 mips", ((TextBlock)pane.ImageBrowser.FindName("Metadata")).Text);
         ((ComboBox)pane.ImageBrowser.FindName("Channels")).SelectedIndex = 5;
         var output = Path.Combine(fixture.Root, "exports", "native.png"); var exported = Pump(pane.ExportPngToAsync(output));
         Assert.Null(exported.ReportError);
         using (var report = JsonDocument.Parse(File.ReadAllText(output + ".json")))
         {
             Assert.Equal(3, report.RootElement.GetProperty("TotalNativeMipCount").GetInt32());
-            Assert.Equal(new[] { 0, 1 }, report.RootElement.GetProperty("SupportedMipIndices").EnumerateArray().Select(value => value.GetInt32()));
-            Assert.Equal(new[] { 2 }, report.RootElement.GetProperty("OmittedMipIndices").EnumerateArray().Select(value => value.GetInt32()));
+            Assert.Equal(new[] { 0, 1, 2 }, report.RootElement.GetProperty("SupportedMipIndices").EnumerateArray().Select(value => value.GetInt32()));
+            Assert.Empty(report.RootElement.GetProperty("OmittedMipIndices").EnumerateArray());
         }
         var bitmap = new BitmapImage(); bitmap.BeginInit(); bitmap.CacheOption = BitmapCacheOption.OnLoad; bitmap.UriSource = new Uri(output); bitmap.EndInit();
         var pixels = new byte[32]; new FormatConvertedBitmap(bitmap, System.Windows.Media.PixelFormats.Bgra32, null, 0).CopyPixels(pixels, 16, 0);
         Assert.Equal(NativeTextureFixture.BgraPixels(0), pixels);
-        Assert.True(audio.IsEnrichmentStarted || audio.IsEnrichmentComplete);
+        Assert.False(audio.IsEnrichmentStarted);
         Pump((Task)Invoke(window, "RefreshTextureCatalogsAsync")!);
         var group = Assert.Single(catalogs.Groups);
-        Pump(window.TextureBrowser.ApplyFilterAsync(new Dictionary<string, string> { ["group"] = group.CatalogIdentity.Key }));
+        Pump(window.TextureBrowser.ApplyFilterAsync(new Dictionary<string, string> { ["group"] = group.CatalogIdentity.Key, ["kind"] = "2" }));
         var rows = (ListBox)window.TextureBrowser.FindName("Rows");
         rows.SelectedItem = window.TextureBrowser.CurrentResources.Single(choice => choice.Identity == identity);
         Pump(WaitUntilAsync(() => pane.CurrentSource?.SelectedIdentity == identity));
@@ -104,16 +142,16 @@ public sealed class NativeTextureWorkflowTests
         var beforeRefresh = window.CurrentSession!;
         Invoke(window, "Refresh_Click", window, new RoutedEventArgs());
         Pump(WaitUntilAsync(() => window.CurrentSession is { } refreshed && refreshed != beforeRefresh && ((Button)window.FindName("RefreshButton")).IsEnabled));
-        Assert.Equal("textures", Field<string>(window, "currentView")); Assert.True(window.CurrentSession!.IsEnrichmentStarted || window.CurrentSession.IsEnrichmentComplete);
+        Assert.Equal("textures", Field<string>(window, "currentView")); Assert.False(window.CurrentSession!.IsEnrichmentStarted);
         Pump(window.ShowTexturesAsync()); Pump(window.TextureBrowser.SelectResourceAsync(identity));
         Pump(WaitUntilAsync(() => window.TextureBrowser.NativeImageBrowser?.CurrentSource?.SelectedIdentity == identity));
         var cache = Field<CacheManager>(window, "cache");
         Pump(cache.ClearAsync(token => (Task)Invoke(window, "DrainCacheUsersAsync", token)!));
         Pump((Task)Invoke(window, "ReopenAfterCacheChangeAsync", CancellationToken.None)!);
-        Assert.Equal("textures", Field<string>(window, "currentView")); Assert.True(window.CurrentSession!.IsEnrichmentStarted || window.CurrentSession.IsEnrichmentComplete);
+        Assert.Equal("textures", Field<string>(window, "currentView")); Assert.False(window.CurrentSession!.IsEnrichmentStarted);
         Pump(window.ShowTexturesAsync()); Pump(window.TextureBrowser.SelectResourceAsync(identity));
         Pump(WaitUntilAsync(() => window.TextureBrowser.NativeImageBrowser?.CurrentSource?.SelectedIdentity == identity));
-        Assert.True(window.CurrentSession!.IsEnrichmentStarted || window.CurrentSession.IsEnrichmentComplete);
+        Assert.False(window.CurrentSession!.IsEnrichmentStarted);
         var second = Path.Combine(fixture.Root, "other", "archive.idx"); DiscoveryFixture.WriteIndex(second, [(999, new byte[] { 1 })]);
         Pump(window.OpenArchiveAsync(second)); Assert.Null(window.TextureBrowser.NativeSession);
         Pump(Assert.ThrowsAsync<ObjectDisposedException>(() => owner.ReadAsync(identity)));
@@ -302,10 +340,21 @@ public sealed class NativeTextureWorkflowTests
         await native.RevalidateAsync(source);
         var volume = Path.ChangeExtension(fixture.Index, ".dat");
         var timestamp = File.GetLastWriteTimeUtc(volume);
-        var bytes = File.ReadAllBytes(volume); bytes[^1] ^= 1;
+        var original = File.ReadAllBytes(volume); var bytes = original.ToArray(); bytes[^1] ^= 1;
+        var group = Assert.Single(catalogs.Groups);
+        await VerifyTextureSourceAsync(snapshot, source, group);
+        Assert.Throws<IOException>(() => File.WriteAllBytes(volume, bytes));
+        Assert.Equal(original, File.ReadAllBytes(volume));
+        await native.DisposeAsync(); await catalogs.DisposeAsync();
         File.WriteAllBytes(volume, bytes); File.SetLastWriteTimeUtc(volume, timestamp);
-        var error = await Assert.ThrowsAsync<ArchiveException>(() => native.RevalidateAsync(source));
+        Assert.Equal(bytes, File.ReadAllBytes(volume));
+        var error = await Assert.ThrowsAsync<ArchiveException>(() => VerifyTextureSourceAsync(snapshot, source, group));
         Assert.Equal("SourceChanged", error.Code);
+        var reopened = await new ArchiveReader().OpenAsync(fixture.Index);
+        Assert.Equal(snapshot.IndexContentId, reopened.IndexContentId);
+        Assert.NotEqual(source.Revision.PhysicalSourceStamp, reopened.PhysicalSourceStamp);
+        var changedHash = await Assert.ThrowsAsync<ArchiveException>(() => VerifyTextureSourceAsync(reopened, source, group));
+        Assert.Equal("SourceChanged", changedHash.Code);
     }
 
     [Fact]
@@ -339,9 +388,23 @@ public sealed class NativeTextureWorkflowTests
         await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
         await catalogs.EnrichmentTask; await using var native = new NativeTextureSession(catalogs);
         var source = (await native.ReadAsync(new(snapshot.IndexContentId, 2))).Source!;
+        var group = Assert.Single(catalogs.Groups); var original = File.ReadAllBytes(catalogPath);
+        var replacement = original.ToArray(); replacement[^1] ^= 1;
+        await VerifyTextureSourceAsync(snapshot, source, group);
         using (native.PinSource(source))
             Assert.Throws<IOException>(() => { using var writer = File.OpenHandle(catalogPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite); });
-        using var released = File.OpenHandle(catalogPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+        Assert.Throws<IOException>(() => File.WriteAllBytes(catalogPath, replacement));
+        Assert.Equal(original, File.ReadAllBytes(catalogPath));
+        await native.DisposeAsync(); await catalogs.DisposeAsync();
+        File.WriteAllBytes(catalogPath, replacement);
+        Assert.Equal(replacement, File.ReadAllBytes(catalogPath));
+        var error = await Assert.ThrowsAsync<ArchiveException>(() => VerifyTextureSourceAsync(snapshot, source, group));
+        Assert.Equal("SourceChanged", error.Code);
+        var reopened = await new ArchiveReader().OpenAsync(fixture.Index);
+        Assert.Equal(snapshot.IndexContentId, reopened.IndexContentId);
+        Assert.NotEqual(source.Revision.PhysicalSourceStamp, reopened.PhysicalSourceStamp);
+        var changedHash = await Assert.ThrowsAsync<ArchiveException>(() => VerifyTextureSourceAsync(reopened, source, group));
+        Assert.Equal("SourceChanged", changedHash.Code);
     }
 
     [Theory]
@@ -369,6 +432,8 @@ public sealed class NativeTextureWorkflowTests
             WriteNativeArchive(fixture.Index);
             SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
             var view = new NativeTextureView();
+            var activityUpdates = new List<WorkspaceActivityProgress>();
+            view.ActivityProgressChanged += (_, update) => activityUpdates.Add(update);
             var window = new Window { Content = view, Width = 800, Height = 600, ShowInTaskbar = false, ShowActivated = false, Left = -10000, Top = -10000 };
             TextureCatalogSession? catalogs = null; NativeTextureSession? native = null;
             try
@@ -379,9 +444,19 @@ public sealed class NativeTextureWorkflowTests
                 var source = Pump(native.ReadAsync(new(snapshot.IndexContentId, 2))).Source!;
                 var document = new DdsTextureReader().Read(BgraDds(), source.Metadata.Identity, source.Revision);
                 window.Show(); Pump(view.LoadAsync(native, source, document, "Texture"));
+                Assert.Contains(activityUpdates, update => update.IsActive && update.Stage == "Rendering image");
+                Assert.False(view.ActivityProgress.IsActive);
+                Assert.Equal("Ready", view.ActivityProgress.Stage);
+                var beforeChannelChange = activityUpdates.Count;
                 ((ComboBox)view.ImageBrowser.FindName("Channels")).SelectedIndex = 3;
+                Pump(view.ImageBrowser.WaitForRenderAsync());
+                Assert.Contains(activityUpdates.Skip(beforeChannelChange), update => update.IsActive && update.Stage == "Rendering image");
+                Assert.False(view.ActivityProgress.IsActive);
                 var destination = Path.Combine(fixture.Root, "exports", "texture.png");
                 var exported = Pump(view.ExportPngToAsync(destination));
+                Assert.Contains(activityUpdates, update => update.IsActive && update.Stage == "Exporting PNG");
+                Assert.False(view.ActivityProgress.IsActive);
+                Assert.Equal("Ready", view.ActivityProgress.Stage);
                 Assert.Null(exported.ReportError);
                 Assert.Equal("texture.png.json", exported.ReportRelativePath);
                 using (var report = JsonDocument.Parse(File.ReadAllText(destination + ".json")))
@@ -400,10 +475,39 @@ public sealed class NativeTextureWorkflowTests
                 var partial = Pump(view.ExportPngToAsync(reportBlocked));
                 Assert.NotNull(partial.ReportError); Assert.True(File.Exists(reportBlocked));
                 var previous = File.ReadAllBytes(destination);
-                var volume = Path.ChangeExtension(fixture.Index, ".dat"); var bytes = File.ReadAllBytes(volume); bytes[^1] ^= 1; File.WriteAllBytes(volume, bytes);
-                Assert.Throws<ArchiveException>(() => Pump(view.ExportPngToAsync(destination, true)));
-                Assert.Equal(previous, File.ReadAllBytes(destination));
+                var previousReport = File.ReadAllBytes(destination + ".json");
+                var exportSurface = view.ImageBrowser.CurrentDisplaySurface!;
+                var group = Assert.Single(catalogs.Groups);
+                Pump(VerifyTextureSourceAsync(snapshot, source, group));
+                var volume = Path.ChangeExtension(fixture.Index, ".dat");
+                var original = File.ReadAllBytes(volume); var bytes = original.ToArray(); bytes[^1] ^= 1;
+                Assert.Throws<IOException>(() => File.WriteAllBytes(volume, bytes));
+                Assert.Equal(original, File.ReadAllBytes(volume));
+                using var cancelledSelection = new CancellationTokenSource();
+                cancelledSelection.Cancel();
+                var cancelledLoad = view.LoadAsync(native, source, document, "Texture", cancelledSelection.Token);
+                view.CancelActivity();
+                Assert.ThrowsAny<OperationCanceledException>(() => Pump(cancelledLoad));
+                Assert.False(view.ActivityProgress.IsActive);
+                Assert.Equal("Cancelled", view.ActivityProgress.Stage);
                 Pump(view.ClearAsync()); Assert.Null(view.CurrentSource); Assert.Null(view.ImageBrowser.CurrentDocument);
+                Pump(native.DisposeAsync().AsTask()); native = null;
+                Pump(catalogs.DisposeAsync().AsTask()); catalogs = null;
+                File.WriteAllBytes(volume, bytes);
+                Assert.Equal(bytes, File.ReadAllBytes(volume));
+                var reopened = Pump(new ArchiveReader().OpenAsync(fixture.Index));
+                Assert.Equal(snapshot.IndexContentId, reopened.IndexContentId);
+                Assert.NotEqual(source.Revision.PhysicalSourceStamp, reopened.PhysicalSourceStamp);
+                var changedHash = Assert.Throws<ArchiveException>(() => Pump(VerifyTextureSourceAsync(reopened, source, group)));
+                Assert.Equal("SourceChanged", changedHash.Code);
+                var rejected = Assert.Throws<ArchiveException>(() => Pump(new TextureExportService().ExportAsync(document, exportSurface,
+                    AssetExportFormat.Png, snapshot.SourceRoot, Path.GetDirectoryName(destination)!, Path.GetFileName(destination),
+                    overwrite: true, expectedRevision: source.Revision,
+                    preCommitValidation: token => VerifyTextureSourceAsync(snapshot, source, group, token))));
+                Assert.Equal("SourceChanged", rejected.Code);
+                Assert.Equal(previous, File.ReadAllBytes(destination));
+                Assert.Equal(previousReport, File.ReadAllBytes(destination + ".json"));
+                Assert.Empty(Directory.EnumerateFiles(Path.GetDirectoryName(destination)!, "*.tmp"));
             }
             catch (Exception error) { failure = error; }
             finally
@@ -416,6 +520,15 @@ public sealed class NativeTextureWorkflowTests
         thread.SetApartmentState(ApartmentState.STA); thread.Start();
         Assert.True(thread.Join(TimeSpan.FromSeconds(25)), "Native texture view check timed out.");
         if (failure is not null) throw new InvalidOperationException("Native texture view check failed.", failure);
+    }
+
+    private static async Task VerifyTextureSourceAsync(ArchiveSnapshot snapshot, NativeTextureSource source,
+        TextureCatalogGroup catalog, CancellationToken token = default)
+    {
+        var extents = source.Payloads.Prepend(source.Container).Select(payload => payload.Extent)
+            .Append(catalog.CatalogExtent with { PayloadSha256 = source.CatalogSha256 }).Distinct().ToArray();
+        await using var verification = await new SourceExtentVerifier().AcquireAsync(snapshot, extents, token);
+        verification.EnsureUnchanged();
     }
 
     private static void WriteNativeArchive(string path, bool invalidBoundary = false, bool duplicateReferences = false, bool duplicateMetadata = false)

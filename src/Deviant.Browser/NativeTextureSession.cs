@@ -17,12 +17,16 @@ public sealed record NativeTextureSource(ResourceIdentity SelectedIdentity, Sour
     NativeContainerLease? CompanionLease = null)
 {
     public ResourceIdentity? NativeTextureIdentity { get; init; }
+    public int? PreviewDimension { get; init; }
     public long RetainedSourceBytes => (CompanionLease is null ? Container.OriginalBytes.Length : 0L) + MetadataBytes.Length +
         Payloads.Sum(payload => (long)payload.OriginalBytes.Length);
 }
 
 public sealed record NativeTextureReadResult(NativeTextureSource? Source, string? Reason, bool Pending = false,
-    IReadOnlyList<ResourceIdentity>? CandidateIdentities = null);
+    IReadOnlyList<ResourceIdentity>? CandidateIdentities = null)
+{
+    public string FailureCode { get; init; } = Pending ? "TextureMetadataPending" : "TextureMetadataUnavailable";
+}
 
 /// <summary>Resolves a selected native texture through its verified catalog and companion metadata.</summary>
 public sealed partial class NativeTextureSession : IAsyncDisposable
@@ -33,7 +37,8 @@ public sealed partial class NativeTextureSession : IAsyncDisposable
     public const long MaximumMetadataScratchBytes = 96L * 1024 * 1024;
     private readonly TextureCatalogSession catalogs;
     private readonly LocalizationReferenceReader references = new();
-    private readonly SemaphoreSlim readGate = new(1, 1);
+    private const int ReadWorkers = 4;
+    private readonly SemaphoreSlim readGate = new(ReadWorkers, ReadWorkers);
     private readonly CancellationTokenSource lifetime = new();
     private bool disposed;
 
@@ -43,7 +48,19 @@ public sealed partial class NativeTextureSession : IAsyncDisposable
     }
     public ArchiveSnapshot Snapshot => catalogs.Snapshot;
     public SourceRevision Revision => catalogs.Revision;
+    public AssetMemoryBudget MemoryBudget => catalogs.ReferenceProvider.SharedMemoryBudget;
     public int KnownCatalogCount(ResourceIdentity identity) => catalogs.FindGroupsForTexture(identity).Count;
+    public string BindingVersion(ResourceIdentity identity) => Hash(System.Text.Encoding.UTF8.GetBytes(
+        Revision.IndexContentId + ":" + Revision.PhysicalSourceStamp + "\n" + string.Join("\n",
+            catalogs.FindGroupsForTexture(identity).Select(group => group.CatalogIdentity.Key + ":" + group.ReferenceTableSha256)
+                .Order(StringComparer.Ordinal))));
+
+    public static string SourceVersion(NativeTextureSource source) => Hash(System.Text.Encoding.UTF8.GetBytes(
+        source.Revision.IndexContentId + ":" + source.Revision.PhysicalSourceStamp + "\n" + source.SelectedIdentity.Key + "\n" +
+        source.NativeTextureIdentity?.Key + "\n" + source.Metadata.Identity.Key + ":" + source.MetadataSha256 + "\n" +
+        source.CatalogIdentity.Key + ":" + source.CatalogSha256 + "\n" +
+        source.PreviewDimension + "\n" +
+        string.Join("\n", source.Payloads.Select(payload => payload.Identity.Key + ":" + payload.Sha256).Order(StringComparer.Ordinal))));
 
     public async Task RevalidateCatalogAsync(ResourceIdentity identity, CancellationToken token = default)
     {
@@ -72,8 +89,9 @@ public sealed partial class NativeTextureSession : IAsyncDisposable
             }
             var index = SourceIdentity.OpenPinned(Snapshot.IndexPath); handles.Add(index);
             SourceIdentity.EnsureUnchanged(revisions, index, Snapshot.IndexPath, Snapshot.IndexStamp);
-            var packages = source.Payloads.Prepend(source.Container).Select(item => item.Identity).Append(source.CatalogIdentity)
-                .Select(identity => Snapshot.Records.Single(row => row.Ordinal == identity.Ordinal).Package).Distinct();
+            var packages = source.Payloads.Prepend(source.Container).Select(item => item.Identity)
+                .Append(source.SelectedIdentity).Append(source.CatalogIdentity)
+                .Select(identity => Snapshot.RequireRecord(identity.Ordinal).Package).Distinct();
             foreach (var package in packages)
             {
                 var volume = Snapshot.Volumes.Single(item => item.Package == package);
@@ -94,7 +112,7 @@ public sealed partial class NativeTextureSession : IAsyncDisposable
         if (reservedSourceBytes < 0 || reservedSourceBytes > MaximumRetainedSourceBytes)
             throw new ArgumentOutOfRangeException(nameof(reservedSourceBytes));
         if (selected.IndexContentId != Snapshot.IndexContentId || selected.MemberPath is not null ||
-            Snapshot.Records.SingleOrDefault(row => row.Ordinal == selected.Ordinal)?.Type is not (2229 or 2230))
+            Snapshot.FindRecord(selected.Ordinal)?.Type is not (2229 or 2230))
             throw new ArgumentException("Select a texture from this archive.", nameof(selected));
         using var own = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
         await readGate.WaitAsync(own.Token).ConfigureAwait(false);
@@ -102,15 +120,17 @@ public sealed partial class NativeTextureSession : IAsyncDisposable
         {
             var discovery = await DiscoverAsync(selected, own.Token).ConfigureAwait(false);
             if (discovery.Candidate is not { } candidate)
-                return new(null, discovery.Reason, discovery.Pending, discovery.Identities);
+                return new(null, discovery.Reason, discovery.Pending, discovery.Identities)
+                { FailureCode = discovery.Code };
             var identities = candidate.Metadata.References.Select(item => item.Resolution.Candidates[0]).Distinct().ToArray();
             var retainedBytes = candidate.MetadataBytes.Length +
-                Snapshot.Records.Single(item => item.Ordinal == candidate.ContainerIdentity.Ordinal).StoredSize;
+                Snapshot.RequireRecord(candidate.ContainerIdentity.Ordinal).StoredSize;
             foreach (var identity in identities)
             {
-                var size = Snapshot.Records.Single(item => item.Ordinal == identity.Ordinal).StoredSize;
+                var size = Snapshot.RequireRecord(identity.Ordinal).StoredSize;
                 if (size < 0 || size > MaximumRetainedSourceBytes - reservedSourceBytes - retainedBytes)
-                    return new(null, "The texture exceeds the source memory budget.", CandidateIdentities: [candidate.Metadata.Identity]);
+                    return new(null, "The texture exceeds the source memory budget.", CandidateIdentities: [candidate.Metadata.Identity])
+                    { FailureCode = "TextureSourceBudget" };
                 retainedBytes += size;
             }
             var container = await ReadPayloadAsync(candidate.ContainerIdentity, own.Token).ConfigureAwait(false);
@@ -129,7 +149,10 @@ public sealed partial class NativeTextureSession : IAsyncDisposable
         ResourceIdentity ContainerIdentity, string ContainerSha256, TextureFileTextV24Document Metadata,
         byte[] MetadataBytes, string MetadataSha256);
     private sealed record MetadataDiscovery(MetadataCandidate? Candidate, string? Reason,
-        bool Pending, IReadOnlyList<ResourceIdentity>? Identities, int BindingCount);
+        bool Pending, IReadOnlyList<ResourceIdentity>? Identities, int BindingCount)
+    {
+        public string Code { get; init; } = Pending ? "TextureMetadataPending" : "TextureMetadataUnavailable";
+    }
 
     private async Task<MetadataDiscovery> DiscoverAsync(ResourceIdentity selected, CancellationToken token)
     {
@@ -156,13 +179,15 @@ public sealed partial class NativeTextureSession : IAsyncDisposable
                         reference.Resolution.Candidates.Count == 1 && reference.Resolution.Candidates[0] == selected)) continue;
                     if (record.References.Any(reference => reference.Resolution.Status != ReferenceStatus.Unique ||
                         reference.Resolution.Candidates.Count != 1))
-                        return new(null, "Texture references are missing or ambiguous.", false, [record.Identity], groups.Count);
+                        return new(null, "Texture references are missing or ambiguous.", false, [record.Identity], groups.Count)
+                        { Code = "TextureReferenceUnavailable" };
                     var offset = checked((int)(record.ExactConsumedDecodedExtent.Offset - bodyExtent!.Offset));
                     var bytes = body.AsMemory(offset, checked((int)record.ExactConsumedDecodedExtent.Length));
                     var hash = Hash(bytes.Span);
                     if (candidate is not null && (candidate.Metadata.Identity != record.Identity || candidate.MetadataSha256 != hash))
                         return new(null, "Multiple texture records reference this resource.", false,
-                            [candidate.Metadata.Identity, record.Identity], groups.Count);
+                            [candidate.Metadata.Identity, record.Identity], groups.Count)
+                        { Code = "TextureMetadataAmbiguous" };
                     candidate ??= new(group.CatalogIdentity, group.ReferenceTableSha256, companion, container.Sha256,
                         record, bytes.ToArray(), hash);
                 }
@@ -176,6 +201,11 @@ public sealed partial class NativeTextureSession : IAsyncDisposable
     public async Task RevalidateAsync(NativeTextureSource source, CancellationToken token = default)
     {
         ObjectDisposedException.ThrowIf(disposed, this);
+        if (source.CompanionLease is not null && source.NativeTextureIdentity is null)
+        {
+            await RevalidateLegacyPreviewSourceAsync(source, token).ConfigureAwait(false);
+            return;
+        }
         await readGate.WaitAsync(token).ConfigureAwait(false);
         try
         {
@@ -213,7 +243,7 @@ public sealed partial class NativeTextureSession : IAsyncDisposable
 
     private async Task<NativeTexturePayload> ReadPayloadAsync(ResourceIdentity identity, CancellationToken token)
     {
-        var row = Snapshot.Records.Single(item => item.Ordinal == identity.Ordinal);
+        var row = Snapshot.RequireRecord(identity.Ordinal);
         if (row.Validity != ResourceValidity.Valid || row.StoredSize < 1 || row.StoredSize > MaximumResourceBytes)
             throw new ArchiveException("TextureResourceLimit", "The texture source exceeds the supported resource limit.");
         var bytes = await new ArchiveResourceResolver(Snapshot).ReadAsync(identity, 0, checked((int)row.StoredSize), token).ConfigureAwait(false);
@@ -283,7 +313,9 @@ public sealed partial class NativeTextureSession : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (disposed) return; disposed = true; lifetime.Cancel();
-        await readGate.WaitAsync().ConfigureAwait(false); readGate.Release();
+        for (var worker = 0; worker < ReadWorkers; worker++) await readGate.WaitAsync().ConfigureAwait(false);
+        readGate.Release(ReadWorkers);
+        references.Dispose();
         readGate.Dispose(); lifetime.Dispose();
     }
     private static string Hash(ReadOnlySpan<byte> bytes) => Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();

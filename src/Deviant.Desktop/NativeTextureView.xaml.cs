@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Controls;
 using Deviant.Assets;
 using Deviant.Browser;
+using Deviant.Core;
 using Deviant.Export.Textures;
 using Deviant.Export;
 using Deviant.Formats.Textures;
@@ -31,14 +32,21 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
     {
         InitializeComponent(); ImageHost.Content = images;
         ((FrameworkElement)images.FindName("ImageName")).Visibility = Visibility.Collapsed;
+        images.ActivityChanged += Images_ActivityChanged;
         images.SurfaceChanged += (_, _) => ExportPng.IsEnabled = source is not null &&
             images.CurrentDisplaySurface is not null && export.IsCompleted;
     }
+
+    private void Images_ActivityChanged(object? sender, EventArgs e) => UpdateImageActivity();
     public DdsImageView ImageBrowser => images;
     public NativeTextureSource? CurrentSource => source;
 
-    public async Task LoadAsync(NativeTextureSession owner, NativeTextureSource native,
-        DdsTextureDocument document, string label, CancellationToken token = default)
+    public Task LoadAsync(NativeTextureSession owner, NativeTextureSource native,
+        DdsTextureDocument document, string label, CancellationToken token = default, bool fullResolution = false)
+        => TrackActivity("Rendering image", 10, LoadCoreAsync(owner, native, document, label, token, fullResolution));
+
+    private async Task LoadCoreAsync(NativeTextureSession owner, NativeTextureSource native,
+        DdsTextureDocument document, string label, CancellationToken token, bool fullResolution)
     {
         if (document.Identity != native.Metadata.Identity || document.Revision != native.Revision || owner.Revision != native.Revision)
             throw new ArgumentException("The image document does not match the native texture source.", nameof(document));
@@ -48,17 +56,19 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
         selection.Cancel(); selection.Dispose(); selection = new();
         var previousPin = sourcePin; sourcePin = null;
         using var own = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token, selection.Token);
-        source = null; session = null; ExportPng.IsEnabled = false; Status.Text = "";
+        source = null; session = null; ExportPng.IsEnabled = FullResolution.IsEnabled = false; FullResolution.Visibility = Visibility.Collapsed; Status.Text = "";
         IDisposable? pendingPin = null;
         try
         {
         pendingPin = native.CompanionLease?.AcquireLease();
         previousPin?.Dispose(); previousPin = null;
-        await images.LoadDocumentAsync(document, label, own.Token);
+        var previewMip = fullResolution ? 0 : SelectPreviewMip(document);
+        await images.LoadDocumentAsync(document, label, own.Token, previewMip);
         own.Token.ThrowIfCancellationRequested();
         if (version != generation) return;
         if (images.CurrentDocument != document || images.CurrentDisplaySurface is null)
-            throw new InvalidOperationException("The texture pixels could not be decoded.");
+            throw new TextureFormatException(images.CurrentFailure?.Code ?? "TexturePixelDecodeFailed",
+                images.CurrentFailure?.Message ?? "The texture pixels could not be decoded.");
         var channels = (ComboBox)images.FindName("Channels");
         if (channels.SelectedIndex == 0 && images.CurrentSurface is { } current)
         {
@@ -71,8 +81,73 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
         if (version != generation) return;
         ((TextBlock)images.FindName("Metadata")).Text = $"{document.Info.Width:N0} × {document.Info.Height:N0} · {document.Info.Format} · {document.Info.MipCount}/{native.Metadata.MipSizeCount} mips";
         source = native; session = owner; sourcePin = pendingPin; pendingPin = null; ExportPng.IsEnabled = true;
+        FullResolution.Visibility = native.Metadata.Mip0Width > document.Info.Width || native.Metadata.Mip0Height > document.Info.Height
+            ? Visibility.Visible : Visibility.Collapsed;
+        FullResolution.IsEnabled = true;
         }
         finally { pendingPin?.Dispose(); previousPin?.Dispose(); }
+    }
+    public Task LoadFullResolutionAsync(CancellationToken token = default)
+        => TrackActivity("Rendering image", 10, LoadFullResolutionCoreAsync(token));
+    private async Task LoadFullResolutionCoreAsync(CancellationToken token)
+    {
+        var native = source ?? throw new InvalidOperationException("Select a texture first.");
+        var owner = session ?? throw new InvalidOperationException("Open textures first.");
+        var version = generation;
+        var label = ((TextBlock)images.FindName("ImageName")).Text;
+        using var own = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token, selection.Token);
+        await owner.RevalidateAsync(native, own.Token);
+        NativeContainerLease? acquired = null;
+        try
+        {
+        NativeTextureSource fullSource;
+        if (native.NativeTextureIdentity is { MemberPath: not null } nativeIdentity)
+        {
+            acquired = await NativeContainerLease.OpenMetadataAsync(owner.Snapshot,
+                nativeIdentity with { MemberPath = null }, native.CompanionLease?.MemoryBudget ?? new AssetMemoryBudget(), own.Token, allowLargeData: true);
+            var result = await owner.ReadForNativeAsync(nativeIdentity, native.CatalogIdentity, acquired, own.Token,
+                maximumPreviewDimension: int.MaxValue, reservePayloadMemory: true);
+            fullSource = result.Source ?? throw new ArchiveException(result.FailureCode,
+                result.Reason ?? "The full-resolution texture source is unavailable.");
+        }
+        else
+        {
+            var result = await owner.ReadFullResolutionAsync(native, native.CompanionLease?.MemoryBudget ?? new AssetMemoryBudget(), own.Token);
+            fullSource = result.Source ?? throw new ArchiveException(result.FailureCode,
+                result.Reason ?? "The full-resolution texture source is unavailable.");
+            acquired = fullSource.CompanionLease;
+        }
+        var document = await Task.Run(() => new NativeTextureDecoder(128L * 1024 * 1024).Read(fullSource, own.Token), own.Token);
+        await owner.RevalidateAsync(fullSource, own.Token);
+        own.Token.ThrowIfCancellationRequested();
+        if (version != generation || native != source) throw new OperationCanceledException(own.Token);
+        await LoadAsync(owner, fullSource, document, label, token, fullResolution: true);
+        }
+        finally { acquired?.Dispose(); }
+    }
+    private async void FullResolution_Click(object sender, RoutedEventArgs e)
+    {
+        var clickedSource = source;
+        FullResolution.IsEnabled = false;
+        try { await LoadFullResolutionAsync(); }
+        catch (OperationCanceledException) { if (ReferenceEquals(clickedSource, source)) Status.Text = "Cancelled"; }
+        catch (Exception error) { if (ReferenceEquals(clickedSource, source)) Status.Text = error.Message; }
+        finally { FullResolution.IsEnabled = source is not null; }
+    }
+    public static int SelectPreviewMip(DdsTextureDocument document, int maximumEdge = 1024,
+        long maximumWorkingBytes = 128L * 1024 * 1024)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        if (maximumEdge < 1 || maximumWorkingBytes < 1) throw new ArgumentOutOfRangeException(nameof(maximumEdge));
+        var decoder = new DdsTextureDecoder(maximumWorkingBytes);
+        foreach (var mip in document.MipLevels.OrderBy(level => level.Index))
+            if (mip.Width <= maximumEdge && mip.Height <= maximumEdge &&
+                decoder.EstimateWorkingSetBytes(document, document.DefaultSelection with { MipIndex = mip.Index }) <= maximumWorkingBytes)
+                return mip.Index;
+        var smallest = document.MipLevels.OrderBy(level => (long)level.Width * level.Height).First();
+        if (decoder.EstimateWorkingSetBytes(document, document.DefaultSelection with { MipIndex = smallest.Index }) > maximumWorkingBytes)
+            throw new TextureFormatException("TexturePreviewBudget", "No mip fits the preview budget.");
+        return smallest.Index;
     }
     private static bool HasOnlyZeroAlpha(TextureSurface surface, CancellationToken token)
     {
@@ -89,12 +164,15 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
         CancellationToken token = default)
     {
         if (!export.IsCompleted) throw new InvalidOperationException("An export is already running.");
-        var task = ExportPngCoreAsync(destination, overwrite, token); export = task; return task;
+        var task = TrackActivity("Exporting PNG", 20, ExportPngCoreAsync(destination, overwrite, token));
+        export = task;
+        return task;
     }
 
     private async Task<NativeTexturePngExportResult> ExportPngCoreAsync(string destination, bool overwrite,
         CancellationToken token)
     {
+        if (source is { PreviewDimension: not null }) await LoadFullResolutionAsync(token);
         var native = source ?? throw new InvalidOperationException("Select a texture first.");
         var owner = session ?? throw new InvalidOperationException("Open textures first.");
         var version = generation;
@@ -177,13 +255,16 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
 
     public async Task ClearAsync()
     {
-        ++generation; selection.Cancel(); source = null; session = null; ExportPng.IsEnabled = false; Status.Text = "";
+        CancelActivity();
+        ++generation; source = null; session = null; ExportPng.IsEnabled = FullResolution.IsEnabled = false; FullResolution.Visibility = Visibility.Collapsed; Status.Text = "";
         await images.ClearAsync();
         sourcePin?.Dispose(); sourcePin = null;
         try { await export; } catch { }
+        await DrainActivityAsync();
     }
     public async ValueTask DisposeAsync()
     {
-        lifetime.Cancel(); await ClearAsync(); await images.DisposeAsync(); selection.Dispose(); lifetime.Dispose();
+        lifetime.Cancel(); await ClearAsync(); images.ActivityChanged -= Images_ActivityChanged;
+        await images.DisposeAsync(); selection.Dispose(); lifetime.Dispose();
     }
 }

@@ -23,6 +23,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
 {
     private readonly SemaphoreSlim loadGate = new(1, 1);
     private readonly List<Part> parts = [];
+    private readonly HashSet<string> loadedGeometryKeys = new(StringComparer.Ordinal);
     private readonly List<IDisposable> leases = [];
     private readonly Dictionary<string, RenderOccurrence> occurrences = [];
     private readonly Dictionary<Guid, string> instanceKeys = [];
@@ -34,19 +35,31 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     private readonly DispatcherTimer hiddenTimer;
     private AssetViewportService? service;
     private RenderAssetSnapshot? snapshot;
+    private IDisposable? streamingSourceLease;
     private CancellationTokenSource? loadCancellation;
     private long generation;
+    private bool cameraEdited;
     private bool disposed;
     private WpfPoint pointerStart;
     private WpfPoint flyPointer;
     private bool flyDragging;
     private double lastFlyTime;
     private string? selection;
+    private readonly HashSet<RenderMeshSelection> meshSelections = [];
     private Exception? renderException;
+    private Func<CancellationToken, Task>? frameWaitAsyncOverride = null;
+    private MSAALevel? previousDepthMsaa;
 
     public AssetViewport()
     {
         InitializeComponent();
+        PreviewMouseDown += (_, _) => cameraEdited = true;
+        PreviewMouseWheel += (_, _) => cameraEdited = true;
+        PreviewKeyDown += (_, _) => cameraEdited = true;
+        foreach (var binding in RenderView.InputBindings.OfType<KeyBinding>().Where(binding =>
+            binding.Key == Key.D && binding.Modifiers == ModifierKeys.None &&
+            binding.Command == ViewportCommands.BottomView).ToArray())
+            RenderView.InputBindings.Remove(binding);
         flyTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(16), DispatcherPriority.Input, FlyTick, Dispatcher);
         flyTimer.Stop();
         hiddenTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(33), DispatcherPriority.Render, HiddenTick, Dispatcher);
@@ -73,6 +86,8 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     }
 
     public event EventHandler<string?>? SelectionChanged;
+    public event EventHandler<IReadOnlyList<RenderMeshSelection>>? MeshSelectionChanged;
+    public IReadOnlyList<RenderMeshSelection> SelectedMeshes => meshSelections.ToArray();
     public event EventHandler<RenderLoadProgress>? LoadProgressChanged;
     public event EventHandler<Exception>? RenderFailed;
     public Exception? LastRenderException => renderException;
@@ -81,6 +96,8 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     public int RenderedPartCount => parts.Sum(x => x.Occurrences.Count);
     public int VisibleOccurrenceCount => occurrences.Keys.Count(visibility.IsVisible);
     public int VisiblePartCount => parts.Sum(part => part.Occurrences.Count(row => visibility.IsVisible(row.Key)));
+    public int VisibleMeshCount => parts.Where(part => part.Occurrences.Any(row => visibility.IsVisible(row.Key)))
+        .Select(part => part.GeometryKey ?? part.PrimitiveKey).Distinct(StringComparer.Ordinal).Count();
     public bool IsHiddenAnimationRunning => hiddenTimer.IsEnabled;
     public bool ShowHidden
     {
@@ -108,7 +125,13 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
         RenderView.EffectsManager = sharedService.EffectsManager;
     }
 
-    public async Task LoadSnapshotAsync(RenderAssetSnapshot source, CancellationToken token = default)
+    public Task LoadSnapshotAsync(RenderAssetSnapshot source, CancellationToken token = default)
+        => LoadSnapshotCoreAsync(source, false, token);
+
+    public Task AppendSnapshotAsync(RenderAssetSnapshot source, CancellationToken token = default)
+        => LoadSnapshotCoreAsync(source, true, token);
+
+    private async Task LoadSnapshotCoreAsync(RenderAssetSnapshot source, bool append, CancellationToken token)
     {
         Dispatcher.VerifyAccess();
         ObjectDisposedException.ThrowIf(disposed, this);
@@ -119,30 +142,108 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
         loadCancellation = cancellation;
         bool entered = false;
+        var pendingGeometry = new List<PendingGeometry>();
         try
         {
             await loadGate.WaitAsync(cancellation.Token);
             entered = true;
-            ClearScene();
+            bool firstBatch = parts.Count == 0;
+            if (!append || firstBatch) cameraEdited = false;
+            if (!append) ClearScene();
             renderException = null;
             CheckCurrent();
-            leases.Add(source.AcquireLease());
+            if (append)
+            {
+                var held = source.AcquireLease(); streamingSourceLease?.Dispose(); streamingSourceLease = held;
+            }
+            else leases.Add(source.AcquireLease());
             snapshot = source;
+            if (!append) await service.RestoreShaderBundleAsync(source, cancellation.Token);
             if (source.Occurrences.Select(x => x.Key).Distinct().Count() != source.Occurrences.Count)
                 throw new InvalidDataException("Duplicate occurrence keys.");
+            var changedInstances = new HashSet<string>(StringComparer.Ordinal);
             foreach (var occurrence in source.Occurrences)
             {
                 CheckCurrent();
                 if (!source.Meshes.ContainsKey(occurrence.GeometryKey))
                     throw new InvalidDataException($"The geometry for {occurrence.Label} is missing.");
-                occurrences.Add(occurrence.Key, occurrence);
-                visibility.Add(occurrence.Key, occurrence.SourceVisible);
+                if (occurrences.TryAdd(occurrence.Key, occurrence))
+                {
+                    visibility.Add(occurrence.Key, occurrence.SourceVisible);
+                    changedInstances.Add(occurrence.GeometryKey);
+                }
+                else
+                {
+                    var previous = occurrences[occurrence.Key];
+                    if (previous.GeometryKey != occurrence.GeometryKey)
+                        throw new InvalidDataException("The streamed occurrence changed its geometry.");
+                    if (previous.World != occurrence.World || previous.SourceVisible != occurrence.SourceVisible)
+                        changedInstances.Add(occurrence.GeometryKey);
+                }
             }
             int total = source.Meshes.Values.Sum(m => m.Geometry.Primitives.Sum(p => Math.Max(1, p.Submeshes.Count)));
             int completed = 0;
+            int queuedUploads = 0;
+            long queuedUploadBytes = 0;
+            int uploadsSinceFrame = 0;
+            long bytesSinceFrame = 0;
+            bool presentedInitialBatch = append && !firstBatch;
+            var instanceBatch = new InstanceRetirementBatch(this);
+            const int maximumQueuedUploads = 8;
+            const long maximumQueuedUploadBytes = 16L * 1024 * 1024;
+            async Task FlushUploadsAsync()
+            {
+                if (queuedUploads == 0) return;
+                foreach (var job in pendingGeometry)
+                {
+                    var geometry = await job.Geometry;
+                        leases.Add(geometry);
+                        CheckCurrent();
+                        // Matrices, GUIDs, row table, and pending instance-buffer copies.
+                        leases.Add(source.MemoryBudget.Reserve(checked((long)job.Rows.Length * 384), "instance upload copies"));
+                        leases.Add(service.ReserveGpu(checked((long)job.Rows.Length * 104), "instance buffers"));
+                        var keys = job.Rows.Select(x => Guid.NewGuid()).ToArray();
+                        for (int i = 0; i < job.Rows.Length; i++) instanceKeys.Add(keys[i], job.Rows[i].Key);
+                        InstancingMeshGeometryModel3D model = new SurfaceInstancingModel(job.Material.TechniqueName);
+                        model.Geometry = geometry.Geometry; model.Material = job.Material.Material;
+                        model.IsTransparent = job.Material.IsTransparent;
+                        model.Instances = job.Rows.Select(x => ViewportGeometry.NativeMatrix(x.World)).ToArray();
+                        model.InstanceParamArray = job.Rows.Select(x => InstanceAppearance(x.Key)).ToArray();
+                        model.InstanceIdentifiers = keys; model.OctreeManager = new InstancingModel3DOctreeManager();
+                        model.CullMode = SharpDX.Direct3D11.CullMode.None; model.IsHitTestVisible = true;
+                        var part = new Part(model, job.Rows, keys, job.Primitive.Key, job.Mesh.Key, job.Submesh, geometry);
+                        ApplyInstances(part);
+                        parts.Add(part);
+                        RenderView.Items.Add(model);
+                        Progress("Loading", ++completed, total);
+                }
+                pendingGeometry.Clear();
+                uploadsSinceFrame += queuedUploads;
+                bytesSinceFrame += queuedUploadBytes;
+                if (!presentedInitialBatch || uploadsSinceFrame >= 64 || bytesSinceFrame >= maximumQueuedUploadBytes)
+                {
+                    await WaitForFrameAsync(cancellation.Token);
+                    instanceBatch.ReleaseAfterFrame();
+                    presentedInitialBatch = true; uploadsSinceFrame = 0; bytesSinceFrame = 0;
+                }
+                else await Dispatcher.Yield(DispatcherPriority.Background);
+                CheckCurrent();
+                queuedUploads = 0;
+                queuedUploadBytes = 0;
+            }
+            var occurrencesByGeometry = source.Occurrences.GroupBy(row => row.GeometryKey)
+                .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.Ordinal);
             foreach (var mesh in source.Meshes.Values)
             {
-                var rows = source.Occurrences.Where(x => x.GeometryKey == mesh.Key).ToArray();
+                if (append && loadedGeometryKeys.Contains(mesh.Key))
+                {
+                    if (changedInstances.Contains(mesh.Key))
+                        await ReconcileGeometryInstancesBatchedAsync(source, mesh.Key,
+                            occurrencesByGeometry.GetValueOrDefault(mesh.Key) ?? [], cancellation.Token, instanceBatch);
+                    CheckCurrent();
+                    continue;
+                }
+                var rows = occurrencesByGeometry.GetValueOrDefault(mesh.Key) ?? [];
                 if (rows.Length == 0) continue;
                 foreach (var primitive in mesh.Geometry.Primitives)
                 {
@@ -151,6 +252,11 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
                         source.Materials.TryGetValue(identity, out materialSource);
                     var material = await service.AcquireMaterialAsync(source, materialSource, primitive, cancellation.Token);
                     leases.Add(material);
+                    if (material.RequiresSceneDepth)
+                    {
+                        previousDepthMsaa ??= RenderView.MSAA;
+                        if (RenderView.MSAA == MSAALevel.Disable) RenderView.MSAA = MSAALevel.Two;
+                    }
                     if (materialSource is not null)
                         foreach (string diagnostic in material.Diagnostics)
                             rendererIssues.Add(new(materialSource.Asset.Identity, "MaterialRenderer", diagnostic));
@@ -159,39 +265,49 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
                     foreach (var submesh in submeshes)
                     {
                         CheckCurrent();
-                        var geometry = await service.AcquireGeometryAsync(source, mesh, primitive, submesh,
-                            material.UvSet, material.NormalMapped, cancellation.Token);
-                        leases.Add(geometry);
-                        CheckCurrent();
-                        // Matrices, GUIDs, row table, and pending instance-buffer copies.
-                        leases.Add(source.MemoryBudget.Reserve(checked((long)rows.Length * 384), "instance upload copies"));
-                        leases.Add(service.ReserveGpu(checked((long)rows.Length * 104), "instance buffers"));
-                        var keys = rows.Select(x => Guid.NewGuid()).ToArray();
-                        for (int i = 0; i < rows.Length; i++) instanceKeys.Add(keys[i], rows[i].Key);
-                        InstancingMeshGeometryModel3D model = new SurfaceInstancingModel(material.TechniqueName);
-                        model.Geometry = geometry.Geometry; model.Material = material.Material;
-                        model.Instances = rows.Select(x => ViewportGeometry.NativeMatrix(x.World)).ToArray();
-                        model.InstanceParamArray = rows.Select(x => InstanceAppearance(x.Key)).ToArray();
-                        model.InstanceIdentifiers = keys; model.OctreeManager = new InstancingModel3DOctreeManager();
-                        model.CullMode = SharpDX.Direct3D11.CullMode.None; model.IsHitTestVisible = true;
-                        var part = new Part(model, rows, keys);
-                        ApplyInstances(part);
-                        parts.Add(part);
-                        RenderView.Items.Add(model);
-                        Progress("Loading", ++completed, total);
-                        // Let Helix publish one bounded mesh upload before the next conversion.
-                        await WaitForFrameAsync(cancellation.Token);
+                        bool colors = primitive.Colors?.Count == primitive.Positions.Count;
+                        long uploadBytes = ViewportGeometry.GeometryBytes(primitive.Positions.Count, submesh.IndexCount, colors);
+                        long admissionBytes = checked(ViewportGeometry.RetainedConversionBytes(primitive.Positions.Count,
+                            submesh.IndexCount, colors) + (long)primitive.Positions.Count * HelixToolkit.SharpDX.DefaultVertex.SizeInBytes +
+                            (long)rows.Length * 384);
+                        if (queuedUploads > 0 && (queuedUploads >= maximumQueuedUploads ||
+                            uploadBytes > maximumQueuedUploadBytes - queuedUploadBytes ||
+                            admissionBytes > source.MemoryBudget.MaximumBytes - source.MemoryBudget.UsedBytes))
+                            await FlushUploadsAsync();
+                        pendingGeometry.Add(new(service.AcquireGeometryAsync(source, mesh, primitive, submesh,
+                            material.UvSet, material.NormalMapped, cancellation.Token), mesh, primitive, submesh, rows, material));
+                        queuedUploads++;
+                        queuedUploadBytes = checked(queuedUploadBytes + uploadBytes);
+                        // Bound pending uploads by count, bytes and the existing CPU admission limit.
+                        if (queuedUploads >= maximumQueuedUploads || queuedUploadBytes >= maximumQueuedUploadBytes)
+                            await FlushUploadsAsync();
                     }
                 }
+                loadedGeometryKeys.Add(mesh.Key);
             }
+            await FlushUploadsAsync();
+            await instanceBatch.FlushAsync(cancellation.Token);
             CheckCurrent();
-            FrameRegion();
+            if (!append || firstBatch || !cameraEdited)
+            {
+                FrameRegion();
+                if (!append || firstBatch)
+                    await WaitForFrameAsync(cancellation.Token);
+                else
+                    RenderView.InvalidateRender();
+                CheckCurrent();
+            }
             UpdateVisibleStatus();
             RefreshHiddenAnimation();
             Progress("Ready", completed, total);
+            if (!append) await service.PrepareShaderBundleAsync(source, cancellation.Token);
         }
         catch (Exception error)
         {
+            cancellation.Cancel();
+            foreach (var pending in pendingGeometry)
+                try { (await pending.Geometry).Dispose(); } catch { }
+            pendingGeometry.Clear();
             if (entered)
             {
                 ClearScene();
@@ -219,6 +335,12 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
 
     private async Task WaitForFrameAsync(CancellationToken token)
     {
+        using var timing = AssetLoadDiagnostics.Measure("UploadFrameWait");
+        if (frameWaitAsyncOverride is { } waitOverride)
+        {
+            await waitOverride(token);
+            return;
+        }
         if (!RenderView.IsLoaded || !RenderView.IsVisible || RenderView.RenderHost?.IsRendering != true)
         {
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Render, token);
@@ -230,7 +352,25 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
         try
         {
             RenderView.InvalidateRender();
-            await completion.Task.WaitAsync(TimeSpan.FromSeconds(5), token);
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            var limit = TimeSpan.FromSeconds(5);
+            while (!completion.Task.IsCompleted)
+            {
+                var remaining = limit - System.Diagnostics.Stopwatch.GetElapsedTime(started);
+                if (remaining <= TimeSpan.Zero) throw new TimeoutException("The viewport did not render a frame.");
+                try
+                {
+                    await completion.Task.WaitAsync(remaining < TimeSpan.FromMilliseconds(100)
+                        ? remaining : TimeSpan.FromMilliseconds(100), token);
+                }
+                catch (TimeoutException) when (System.Diagnostics.Stopwatch.GetElapsedTime(started) < limit)
+                {
+                    // A request made while the host finishes its previous frame can be consumed by that frame.
+                    // Keep requesting presentation until an actual completed-frame event arrives.
+                    RenderView.InvalidateRender();
+                }
+            }
+            await completion.Task;
         }
         finally { RenderView.OnRendered -= Rendered; }
     }
@@ -242,13 +382,19 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     }
 
     public void SetSelection(string? occurrenceKey)
+        => SetSelections(occurrenceKey is null ? [] : [new(occurrenceKey)]);
+
+    public void SetSelections(IEnumerable<RenderMeshSelection> selected)
     {
         Dispatcher.VerifyAccess();
-        var next = occurrenceKey is not null && occurrences.ContainsKey(occurrenceKey) ? occurrenceKey : null;
-        if (selection == next) return;
-        selection = next;
+        meshSelections.Clear();
+        foreach (var item in selected)
+            if (occurrences.TryGetValue(item.OccurrenceKey, out var occurrence) && (item.PrimitiveKey is null ||
+                snapshot!.Meshes[occurrence.GeometryKey].Geometry.Primitives.Any(p => p.Key == item.PrimitiveKey)))
+                meshSelections.Add(item);
+        selection = meshSelections.LastOrDefault()?.OccurrenceKey;
         foreach (var part in parts)
-            part.Model.InstanceParamArray = part.Model.InstanceIdentifiers!.Select(id => InstanceAppearance(instanceKeys[id])).ToArray();
+            part.Model.InstanceParamArray = part.Model.InstanceIdentifiers!.Select(id => InstanceAppearance(instanceKeys[id], part.PrimitiveKey)).ToArray();
         RenderView.InvalidateRender();
     }
 
@@ -269,10 +415,12 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     private void UpdateVisibleStatus()
     { if (snapshot is not null) StatusText.Text = $"{VisibleOccurrenceCount:N0} objects"; }
 
-    private InstanceParameter InstanceAppearance(string key) => new()
+    private bool IsSelected(string key, string? primitiveKey) => meshSelections.Contains(new(key)) ||
+        primitiveKey is not null && meshSelections.Contains(new(key, primitiveKey));
+    private InstanceParameter InstanceAppearance(string key, string? primitiveKey = null) => new()
     {
-        DiffuseColor = key == selection ? new Color4(.95f, .64f, .22f, 1) : new Color4(.62f, .65f, .68f, 1),
-        EmissiveColor = key == selection
+        DiffuseColor = IsSelected(key, primitiveKey) ? new Color4(.95f, .64f, .22f, 1) : new Color4(.62f, .65f, .68f, 1),
+        EmissiveColor = IsSelected(key, primitiveKey)
             ? new Color4(.1f, .06f, 0, occurrences[key].SourceVisible ? 0 : 1)
             : new Color4(0, 0, 0, occurrences[key].SourceVisible ? 0 : 1),
         TexCoordOffset = Numerics.Vector2.Zero
@@ -283,7 +431,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
         var indices = Enumerable.Range(0, part.Occurrences.Count).Where(i => visibility.IsVisible(part.Occurrences[i].Key)).ToArray();
         part.Model.Instances = indices.Select(i => ViewportGeometry.NativeMatrix(part.Occurrences[i].World)).ToArray();
         part.Model.InstanceIdentifiers = indices.Select(i => part.Identifiers[i]).ToArray();
-        part.Model.InstanceParamArray = indices.Select(i => InstanceAppearance(part.Occurrences[i].Key)).ToArray();
+        part.Model.InstanceParamArray = indices.Select(i => InstanceAppearance(part.Occurrences[i].Key, part.PrimitiveKey)).ToArray();
         part.Model.Visibility = indices.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
     }
     public void FrameSelection()
@@ -294,17 +442,21 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     private void Frame(GeometryBounds bounds)
     {
         Dispatcher.VerifyAccess();
+        using var timing = AssetLoadDiagnostics.Measure("CameraFrame", $"{bounds.Minimum}|{bounds.Maximum}");
         if (!ViewportGeometry.Finite(bounds.Minimum) || !ViewportGeometry.Finite(bounds.Maximum))
             throw new InvalidDataException("Invalid camera bounds.");
-        var size = bounds.Maximum - bounds.Minimum;
-        double radius = Math.Max(size.Length() / 2, .01);
+        double x = (double)bounds.Maximum.X - bounds.Minimum.X;
+        double y = (double)bounds.Maximum.Y - bounds.Minimum.Y;
+        double z = (double)bounds.Maximum.Z - bounds.Minimum.Z;
+        double radius = Math.Max(Math.Sqrt(x * x + y * y + z * z) / 2, .01);
         if (RenderView.Camera is PerspectiveCamera camera)
         {
-            camera.NearPlaneDistance = Math.Max(radius / 10000, .0001);
+            camera.NearPlaneDistance = ViewportGeometry.CameraNearPlane(radius);
             camera.FarPlaneDistance = Math.Max(radius * 100, 100);
         }
-        var center = (bounds.Minimum + bounds.Maximum) / 2;
-        RenderView.ZoomExtents(new Point3D(center.X, center.Y, center.Z), radius, 0);
+        var center = new Point3D(((double)bounds.Minimum.X + bounds.Maximum.X) / 2,
+            ((double)bounds.Minimum.Y + bounds.Maximum.Y) / 2, ((double)bounds.Minimum.Z + bounds.Maximum.Z) / 2);
+        RenderView.ZoomExtents(center, radius, 0);
     }
 
     private void PointerDown(object sender, MouseButtonEventArgs e)
@@ -313,10 +465,19 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     {
         if ((e.GetPosition(RenderView) - pointerStart).Length > 4 || snapshot is null) return;
         string? key = null;
+        string? primitiveKey = null;
         foreach (var hit in RenderView.FindHits(e.GetPosition(RenderView)))
-            if (TryResolveHit(hit, out key)) break;
-        SetSelection(key);
+            if (TryResolveHit(hit, out key))
+            { primitiveKey = parts.First(p => ReferenceEquals(p.Model, hit.ModelHit)).PrimitiveKey; break; }
+        var next = Keyboard.Modifiers.HasFlag(ModifierKeys.Control) ? meshSelections.ToHashSet() : [];
+        if (key is not null)
+        {
+            var item = new RenderMeshSelection(key, primitiveKey);
+            if (!next.Remove(item)) next.Add(item);
+        }
+        SetSelections(next);
         SelectionChanged?.Invoke(this, key);
+        MeshSelectionChanged?.Invoke(this, SelectedMeshes);
     }
 
     public bool TryResolveHit(HitTestResult hit, out string? occurrenceKey)
@@ -339,6 +500,17 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
 
     private void FrameClicked(object sender, RoutedEventArgs e) => FrameRegion();
     private void SelectionClicked(object sender, RoutedEventArgs e) => FrameSelection();
+    private void FlyEnabled(object sender, RoutedEventArgs e)
+    {
+        if (RenderView.Camera is PerspectiveCamera camera)
+        {
+            var look = RotateFlightLook(new((float)camera.LookDirection.X,
+                (float)camera.LookDirection.Y, (float)camera.LookDirection.Z), 0, 0);
+            camera.LookDirection = new(look.X, look.Y, look.Z);
+            camera.UpDirection = new(0, 1, 0);
+        }
+        RenderView.Focus();
+    }
     private void FlyDisabled(object sender, RoutedEventArgs e) => StopFlight();
     private void FlyDown(object sender, MouseButtonEventArgs e)
     {
@@ -355,23 +527,39 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
         var next = e.GetPosition(RenderView);
         var delta = next - flyPointer; flyPointer = next;
         var look = new Numerics.Vector3((float)camera.LookDirection.X, (float)camera.LookDirection.Y, (float)camera.LookDirection.Z);
-        var yaw = Numerics.Matrix4x4.CreateFromAxisAngle(Numerics.Vector3.UnitY, (float)(-delta.X * .004));
-        look = Numerics.Vector3.TransformNormal(look, yaw);
-        var right = Numerics.Vector3.Cross(look, Numerics.Vector3.UnitY);
-        right = right.LengthSquared() < 1e-8f ? Numerics.Vector3.UnitX : Numerics.Vector3.Normalize(right);
-        var pitched = Numerics.Vector3.TransformNormal(look, Numerics.Matrix4x4.CreateFromAxisAngle(right, (float)(-delta.Y * .004)));
-        if (Math.Abs(Numerics.Vector3.Dot(Numerics.Vector3.Normalize(pitched), Numerics.Vector3.UnitY)) < .995f) look = pitched;
+        look = RotateFlightLook(look, delta.X, delta.Y);
         camera.LookDirection = new(look.X, look.Y, look.Z); camera.UpDirection = new(0, 1, 0);
         e.Handled = true;
+    }
+    private static Numerics.Vector3 RotateFlightLook(Numerics.Vector3 look, double deltaX, double deltaY)
+    {
+        var length = look.Length();
+        if (!float.IsFinite(length) || length < 1e-6f) { look = -Numerics.Vector3.UnitZ; length = 1; }
+        if (!double.IsFinite(deltaX) || !double.IsFinite(deltaY)) return look;
+        var horizontal = new Numerics.Vector3(look.X, 0, look.Z);
+        horizontal = horizontal.LengthSquared() < 1e-8f ? -Numerics.Vector3.UnitZ : Numerics.Vector3.Normalize(horizontal);
+        horizontal = Numerics.Vector3.TransformNormal(horizontal,
+            Numerics.Matrix4x4.CreateFromAxisAngle(Numerics.Vector3.UnitY, (float)(-deltaX * .004)));
+        var maximumPitch = Math.Asin(.995);
+        var pitch = Math.Clamp(Math.Asin(Math.Clamp(look.Y / length, -1, 1)) - deltaY * .004,
+            -maximumPitch, maximumPitch);
+        return (horizontal * (float)Math.Cos(pitch) + Numerics.Vector3.UnitY * (float)Math.Sin(pitch)) * length;
     }
     private void KeyDownHandler(object sender, KeyEventArgs e)
     {
         if (e.Key == Key.F) { FrameSelection(); e.Handled = true; return; }
-        if (FlyToggle.IsChecked != true || e.Key is not (Key.W or Key.A or Key.S or Key.D or Key.Q or Key.E)) return;
-        flyKeys.Add(e.Key); lastFlyTime = flyClock.Elapsed.TotalSeconds; flyTimer.Start(); e.Handled = true;
+        if (e.Key is not (Key.W or Key.A or Key.S or Key.D or Key.Q or Key.E)) return;
+        if (FlyToggle.IsChecked != true) return;
+        e.Handled = true;
+        if (flyKeys.Count == 0) lastFlyTime = flyClock.Elapsed.TotalSeconds;
+        flyKeys.Add(e.Key); flyTimer.Start();
     }
     private void KeyUpHandler(object sender, KeyEventArgs e)
-    { if (flyKeys.Remove(e.Key)) e.Handled = true; if (flyKeys.Count == 0) flyTimer.Stop(); }
+    {
+        if (flyKeys.Remove(e.Key) || FlyToggle.IsChecked == true &&
+            e.Key is Key.W or Key.A or Key.S or Key.D or Key.Q or Key.E) e.Handled = true;
+        if (flyKeys.Count == 0) flyTimer.Stop();
+    }
     private void FlyTick(object? sender, EventArgs e)
     {
         if (FlyToggle.IsChecked != true || RenderView.Camera is not PerspectiveCamera camera) { StopFlight(); return; }
@@ -407,11 +595,14 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     {
         Dispatcher.VerifyAccess();
         StopFlight();
+        ClearPoseGeometry();
         hiddenTimer.Stop();
         foreach (var part in parts) { RenderView.Items.Remove(part.Model); part.Model.Dispose(); }
-        parts.Clear(); instanceKeys.Clear(); occurrences.Clear(); visibility.Clear(); rendererIssues.Clear(); selection = null;
+        parts.Clear(); loadedGeometryKeys.Clear(); instanceKeys.Clear(); occurrences.Clear(); visibility.Clear(); rendererIssues.Clear(); selection = null; meshSelections.Clear();
         for (int i = leases.Count - 1; i >= 0; i--) leases[i].Dispose();
         leases.Clear(); snapshot = null; StatusText.Text = "";
+        streamingSourceLease?.Dispose(); streamingSourceLease = null;
+        if (previousDepthMsaa is { } msaa) { RenderView.MSAA = msaa; previousDepthMsaa = null; }
     }
 
     public async Task UnloadAsync()
@@ -431,5 +622,9 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
         RenderView.Dispose(); service = null;
     }
     private sealed record Part(InstancingMeshGeometryModel3D Model, IReadOnlyList<RenderOccurrence> Occurrences,
-        IReadOnlyList<Guid> Identifiers);
+        IReadOnlyList<Guid> Identifiers, string PrimitiveKey, string? GeometryKey = null, GeometrySubmesh? Submesh = null,
+        AssetViewportService.GeometryLease? GeometryLease = null);
+    private sealed record PendingGeometry(Task<AssetViewportService.GeometryLease> Geometry, RenderMesh Mesh,
+        MeshPrimitive Primitive, GeometrySubmesh Submesh, RenderOccurrence[] Rows, AssetViewportService.MaterialLease Material);
+
 }

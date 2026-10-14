@@ -4,8 +4,8 @@ using Deviant.Core;
 
 namespace Deviant.Browser;
 
-/// <summary>A source snapshot and its single-thread-owned SQLite catalog.</summary>
-public sealed class CatalogSession : IBrowserCatalogSession
+/// <summary>A verified source snapshot with a responsive in-memory catalog and a background SQLite cache.</summary>
+public sealed partial class CatalogSession : IBrowserCatalogSession
 {
     private readonly SerializedWorker worker;
     private readonly IResourceCatalog catalog;
@@ -15,13 +15,6 @@ public sealed class CatalogSession : IBrowserCatalogSession
     private TaskCompletionSource<bool>? leasesDrained;
     private int leaseCount;
     private bool disposalRequested;
-
-    private CatalogSession(ArchiveSnapshot snapshot, IResourceCatalog catalog, SerializedWorker worker)
-    {
-        Snapshot = snapshot;
-        this.catalog = catalog;
-        this.worker = worker;
-    }
 
     public ArchiveSnapshot Snapshot { get; }
 
@@ -44,18 +37,22 @@ public sealed class CatalogSession : IBrowserCatalogSession
         var snapshot = await Task.Run(async () =>
             await reader.OpenAsync(input, progress, cancellationToken).ConfigureAwait(false), cancellationToken).ConfigureAwait(false);
 
+        var catalog = CatalogService.OpenInMemory(snapshot, cancellationToken);
         var worker = new SerializedWorker();
-        IResourceCatalog? catalog = null;
         try
         {
-            catalog = await worker.InvokeAsync(
-                () => CatalogService.Open(snapshot, cacheRoot, progress, cancellationToken), cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
-            return new CatalogSession(snapshot, catalog, worker);
+            var session = new CatalogSession(snapshot, catalog, worker, cacheRoot, progress, cancellationToken);
+            if (cancellationToken.IsCancellationRequested)
+            {
+                await session.DisposeAsync().ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            return session;
         }
         catch
         {
-            await worker.StopAsync(catalog is null ? null : catalog.Dispose).ConfigureAwait(false);
+            await worker.StopAsync(catalog.Dispose).ConfigureAwait(false);
             throw;
         }
     }
@@ -137,9 +134,19 @@ public sealed class CatalogSession : IBrowserCatalogSession
         lock (disposeGate)
             waitForLeases = leaseCount == 0 ? Task.CompletedTask : (leasesDrained ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
         await waitForLeases.ConfigureAwait(false);
+        await persistenceCancellation.CancelAsync().ConfigureAwait(false);
         await lifetime.CancelAsync().ConfigureAwait(false);
-        try { await worker.StopAsync(catalog.Dispose).ConfigureAwait(false); }
-        finally { lifetime.Dispose(); }
+        var stopWorker = worker.StopAsync(catalog.Dispose);
+        try
+        {
+            try { await persistenceTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
+        finally
+        {
+            try { await stopWorker.ConfigureAwait(false); }
+            finally { persistenceCancellation.Dispose(); lifetime.Dispose(); }
+        }
     }
 
     private void ReleaseLease()

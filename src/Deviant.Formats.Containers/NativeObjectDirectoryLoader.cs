@@ -8,6 +8,56 @@ namespace Deviant.Formats.Containers;
 public sealed class NativeObjectDirectoryLoader
 {
     public const string DirectVersion = "native-directory-qzip-v1";
+    public const string MetadataVersion = "native-directory-metadata-v1";
+
+    /// <summary>Reads the complete object-frame prefix while checking the original logical container bounds.</summary>
+    public DecodeResult<NativeObjectDirectoryDocument> ReadMetadata(ReadOnlyMemory<byte> logicalMetadata,
+        long originalLogicalLength, ResourceIdentity identity, SourceRevision revision,
+        IReadOnlyList<SourceExtent> physicalExtents, bool requireExactBodyLength = false,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(identity); ArgumentNullException.ThrowIfNull(revision);
+        ArgumentNullException.ThrowIfNull(physicalExtents); token.ThrowIfCancellationRequested();
+        DecodeResult<NativeObjectDirectoryDocument> Fail(string code) => new(null, identity, revision,
+            physicalExtents, [], [code], [], new Dictionary<string, string>());
+        if (originalLogicalLength < logicalMetadata.Length || logicalMetadata.Length < 40)
+            return Fail("NativeMetadataLogicalBounds");
+        var bytes = logicalMetadata.Span;
+        if (!bytes[..8].SequenceEqual("DC_INFO "u8) || BinaryPrimitives.ReadUInt32LittleEndian(bytes[8..]) != 3)
+            return Fail("NativeDirectoryHeaderUnsupported");
+        var directoryLength = 16L + BinaryPrimitives.ReadUInt32LittleEndian(bytes[12..]);
+        if (directoryLength < 24 || directoryLength > bytes.Length - 16)
+            return Fail("NativeMetadataDirectoryBounds");
+        var dataOffset = checked((int)directoryLength);
+        if (!bytes.Slice(dataOffset, 8).SequenceEqual("DC_DATA "u8) || BinaryPrimitives.ReadUInt32LittleEndian(bytes[(dataOffset + 8)..]) != 23)
+            return Fail("NativeDataHeaderUnsupported");
+        var bodyOffset = checked(dataOffset + 16);
+        var bodyLength = BinaryPrimitives.ReadUInt32LittleEndian(bytes[(dataOffset + 12)..]);
+        if (bodyLength > originalLogicalLength - bodyOffset ||
+            requireExactBodyLength && bodyLength != originalLogicalLength - bodyOffset)
+            return Fail("NativeMetadataDeclaredBodyBounds");
+        var result = new NativeObjectDirectoryReader().ParseMetadata(bytes[..bodyOffset], logicalMetadata[bodyOffset..],
+            identity, revision, new(identity, bodyOffset, bodyLength), physicalExtents, token);
+        var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+        return result with { Steps = [new(nameof(NativeObjectDirectoryLoader), MetadataVersion,
+            "complete-object-frames;declared-body-validated;remainder-omitted", hash), .. result.Steps] };
+    }
+
+    public DecodeResult<NativeObjectDirectoryDocument> ReadDirectMetadata(ReadOnlyMemory<byte> storedMetadata,
+        long originalStoredLength, ResourceIdentity identity, SourceRevision revision, SourceExtent metadataExtent,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(metadataExtent); token.ThrowIfCancellationRequested();
+        if (storedMetadata.Length < 45 || !storedMetadata.Span[..5].SequenceEqual("QZIP\0"u8) ||
+            metadataExtent.Length != storedMetadata.Length || originalStoredLength < storedMetadata.Length ||
+            metadataExtent.Offset < 0 || metadataExtent.Offset > long.MaxValue - metadataExtent.Length)
+            return new(null, identity, revision, [metadataExtent], [], ["NativeDirectMetadataSourceMismatch"], [], new Dictionary<string, string>());
+        var hash = Convert.ToHexString(SHA256.HashData(storedMetadata.Span)).ToLowerInvariant();
+        if (metadataExtent.PayloadSha256 is { } expected && !StringComparer.OrdinalIgnoreCase.Equals(hash, expected))
+            return new(null, identity, revision, [metadataExtent], [], ["NativeDirectSourceHashMismatch"], [], new Dictionary<string, string>());
+        return ReadMetadata(storedMetadata[5..], originalStoredLength - 5, identity, revision,
+            [metadataExtent with { PayloadSha256 = hash }], true, token);
+    }
 
     /// <summary>Reads a QZIP-wrapped native directory directly from its source memory.</summary>
     public DecodeResult<NativeObjectDirectoryDocument> ReadDirect(ReadOnlyMemory<byte> storedBytes,

@@ -8,6 +8,7 @@ namespace Deviant.Formats.Textures;
 public static class PngTextureWriter
 {
     private static readonly byte[] Signature = [137, 80, 78, 71, 13, 10, 26, 10];
+    private static readonly uint[] CrcTable = CreateCrcTable();
     private const long MaximumPixels = 64L * 1024 * 1024;
 
     public static void Write(Stream destination, TextureSurface surface, bool? isSrgb = null,
@@ -83,10 +84,18 @@ public static class PngTextureWriter
     }
 
     private static uint UpdateCrc(uint crc, byte value)
+        => (crc >> 8) ^ CrcTable[(crc ^ value) & 255];
+
+    private static uint[] CreateCrcTable()
     {
-        crc ^= value;
-        for (var bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ ((crc & 1) == 0 ? 0 : 0xEDB8_8320u);
-        return crc;
+        var table = new uint[256];
+        for (uint index = 0; index < table.Length; index++)
+        {
+            var crc = index;
+            for (var bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ ((crc & 1) == 0 ? 0 : 0xEDB8_8320u);
+            table[index] = crc;
+        }
+        return table;
     }
 
     private sealed class IdatChunkStream(Stream destination) : Stream

@@ -14,7 +14,7 @@ public enum NameOrigin { Stored, Verified, Candidate, UserAlias, Description }
 public sealed record NameEvidence(string Text, NameOrigin Origin, string Source, string? CollisionGroup = null);
 public enum AssetCompleteness { Complete, Unverified, Partial }
 public enum AssetAvailability { Available, Missing, Ambiguous, Unsupported, Malformed }
-[Flags] public enum AssetCapabilities { None = 0, Original = 1, Preview = 2, PartialPreview = 4, Wav = 8, Ogg = 16, Png = 32, Dds = 64, Glb = 128, Json = 256, Csv = 512, Svg = 1024 }
+[Flags] public enum AssetCapabilities { None = 0, Original = 1, Preview = 2, PartialPreview = 4, Wav = 8, Ogg = 16, Png = 32, Dds = 64, Glb = 128, Json = 256, Csv = 512, Svg = 1024, Fbx = 2048 }
 public sealed record SourceExtent(string RelativeSource, long Offset, long Length, string? PayloadSha256 = null);
 public sealed record DecodedExtent(ResourceIdentity Container, long Offset, long Length);
 public sealed record AssetDescriptor(ResourceIdentity Identity, SourceRevision Revision, string Family, string Label,
@@ -29,11 +29,20 @@ public sealed record AssetDescriptor(ResourceIdentity Identity, SourceRevision R
     public string? LookupKey { get; init; }
     public IReadOnlyDictionary<string,string> Metadata { get; init; } = new Dictionary<string,string>();
 }
-public enum AssetSort { Default, Name, Language, Codec, Duration, Channels, Availability, Completeness }
+public enum AssetSort { Default, Name, Language, Codec, Duration, Channels, Availability, Completeness, Animations }
+public sealed record CachedAssetPayloadFilter(SourceRevision Revision, string MetadataKey, string MetadataValue,
+    string MemberPath, long MaximumOrdinal, int MaximumPayloadBytes = 4 * 1024 * 1024);
 public sealed record AssetQuery(string? Search = null, string? GroupKey = null, string? Language = null,
     string? Codec = null, double? MinimumDuration = null, double? MaximumDuration = null, int? Channels = null,
     AssetAvailability? Availability = null, AssetCompleteness? Completeness = null, long Offset = 0, int Limit = 100, string? Family = null, string? ExactKey = null,
-    AssetSort Sort = AssetSort.Default, bool Descending = false);
+    AssetSort Sort = AssetSort.Default, bool Descending = false)
+{
+    public string? ModelKind { get; init; }
+    public string? ModelNameProfile { get; init; }
+    public string? CharacterGroup { get; init; }
+    public long? MaximumCatalogRow { get; init; }
+    public CachedAssetPayloadFilter? CachedPayloadFilter { get; init; }
+}
 public sealed record DecodeStep(string Decoder, string Version, string Options, string? PayloadSha256 = null);
 public sealed record DecodeResult<T>(T? Value, ResourceIdentity Identity, SourceRevision Revision,
     IReadOnlyList<SourceExtent> Extents, IReadOnlyList<DecodeStep> Steps, IReadOnlyList<string> Diagnostics,
@@ -41,7 +50,7 @@ public sealed record DecodeResult<T>(T? Value, ResourceIdentity Identity, Source
 public sealed record PreviewSession(ResourceIdentity Identity, SourceRevision Revision, string Path,
     AssetCompleteness Completeness, IAsyncDisposable Lease) : IAsyncDisposable
 { public ValueTask DisposeAsync() => Lease.DisposeAsync(); }
-public enum AssetExportFormat { Original, Wav, Ogg, Png, Dds, Glb, Json, Csv, Svg }
+public enum AssetExportFormat { Original, Wav, Ogg, Png, Dds, Glb, Json, Csv, Svg, Fbx }
 public sealed record AssetExportPlan(IReadOnlyList<ResourceIdentity> Resources, SourceRevision Revision,
     AssetExportFormat Format, string Destination, string Precision = "Pcm16");
 

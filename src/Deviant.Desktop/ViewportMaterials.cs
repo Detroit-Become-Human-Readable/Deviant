@@ -38,12 +38,7 @@ public static class ViewportMaterials
         if (!normal.Evidence.Verified) throw new InvalidDataException("The material binding is unavailable.");
         material.NormalMap = textureProvider(source!.TexturesBySlot[normal.SlotOrdinal]);
         material.UVTransform = new UVTransform(0, normal.UvScale, normal.UvOffset);
-        material.DiffuseMapSampler = new SamplerStateDescription
-        {
-            Filter = Filter.MinMagMipLinear, AddressU = TextureAddressMode.Wrap,
-            AddressV = TextureAddressMode.Wrap, AddressW = TextureAddressMode.Wrap,
-            MaximumLod = float.MaxValue, MaximumAnisotropy = 1
-        };
+        material.DiffuseMapSampler = AssetViewportService.SurfaceSampler(source.TexturesBySlot[normal.SlotOrdinal].Sampling);
         return new(material, normal.TextureCoordinateSet, true);
     }
 }

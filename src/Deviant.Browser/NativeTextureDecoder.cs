@@ -15,9 +15,9 @@ public sealed record NativeTextureDecodedDocument(DdsTextureDocument Document,
 { public ConvertedTextureInfo? Conversion { get; init; } }
 
 /// <summary>Builds texture documents from supported SEGS mip layouts.</summary>
-public sealed class NativeTextureDecoder
+public sealed partial class NativeTextureDecoder
 {
-    public const string Version = "native-texture-v5";
+    public const string Version = "native-texture-v10";
     public const long DefaultMaximumDecodedBytes = 32L * 1024 * 1024;
     private readonly long maximumDecodedBytes;
     public NativeTextureDecoder(long maximumDecodedBytes = DefaultMaximumDecodedBytes)
@@ -31,7 +31,7 @@ public sealed class NativeTextureDecoder
     public static bool IsSrgb(NativeTextureSource source)
     {
         ArgumentNullException.ThrowIfNull(source);
-        return source.Metadata.FirstByte is not (18 or 25) && source.Metadata.RawFixedPrefix84.Length > 14 &&
+        return source.Metadata.FirstByte is not (18 or 19 or 25) && source.Metadata.RawFixedPrefix84.Length > 14 &&
             source.Metadata.RawFixedPrefix84[14] == 1;
     }
 
@@ -54,25 +54,27 @@ public sealed class NativeTextureDecoder
     public NativeTextureDecodedDocument ReadDetailed(NativeTextureSource source, CancellationToken token = default,
         int maximumPreviewDimension = int.MaxValue)
     {
+        ArgumentNullException.ThrowIfNull(source);
         if (maximumPreviewDimension < 1) throw new ArgumentOutOfRangeException(nameof(maximumPreviewDimension));
+        if (source.PreviewDimension is { } previewDimension)
+            return ReadPreview(source, previewDimension, token);
         var metadata = ValidateMetadata(source, token);
         if (metadata.PostSelectorBoolean) return ReadConverted(source, maximumPreviewDimension, token);
         if (metadata.SizeGroupSelector == 2) return ReadCubemap(source, metadata, token);
 
         var mips = new SortedDictionary<int, (byte[] Bytes, NativeTextureMipSource Evidence)>();
         long decodedBytes = 0;
-        if (metadata.FirstByte is 5 or 7 or 18 or 25)
+        if (metadata.FirstByte is 5 or 7 or 11 or 18 or 19 or 25)
             for (var index = 0; index < metadata.MipSizeCount; index++)
                 if (metadata.MipByteLengthGroups[0][index] != MipByteLength(metadata.FirstByte,
                     Math.Max(1, metadata.Mip0Width >> index), Math.Max(1, metadata.Mip0Height >> index)))
                     throw Error("NativeMipSizeMismatch", "Mip byte size does not match its dimensions.");
-        if (metadata.DescriptorCount == 1)
         {
-            var descriptor = metadata.LodDescriptors[0];
-            if (descriptor.Width != metadata.Mip0Width || descriptor.Height != metadata.Mip0Height ||
-                descriptor.ThirdU16 != 1 || descriptor.TrailingByte != metadata.MipSizeCount)
+            var descriptor = metadata.LodDescriptors[^1];
+            var firstPackedMip = FindMipIndex(metadata, descriptor);
+            if (firstPackedMip < 0 || descriptor.ThirdU16 > 1 || descriptor.TrailingByte != metadata.MipSizeCount - firstPackedMip)
                 throw Error("NativeMipDescriptorMismatch", "Mip dimensions do not match the texture metadata.");
-            var nominalBytes = metadata.MipByteLengthGroups[0].Sum(length => (long)length);
+            var nominalBytes = metadata.MipByteLengthGroups[0].Skip(firstPackedMip).Sum(length => (long)length);
             var packedBytes = checked((nominalBytes + 255) & ~255L);
             if (packedBytes > TextureBufferPatternInspector.MaximumDecodedBytes || packedBytes > maximumDecodedBytes)
                 throw Error("NativeTextureDecodeBudget", "Mip data exceeds the decode budget.");
@@ -82,7 +84,7 @@ public sealed class NativeTextureDecoder
             var payload = GetPayload(source, reference, 2229);
             var buffer = ReadBuffer(source, payload, TextureBufferPatternKind.Raw, packedBytes, token);
             var packedOffset = 0;
-            for (var index = 0; index < metadata.MipSizeCount; index++)
+            for (var index = firstPackedMip; index < metadata.MipSizeCount; index++)
             {
                 token.ThrowIfCancellationRequested();
                 var length = checked((int)metadata.MipByteLengthGroups[0][index]);
@@ -92,13 +94,14 @@ public sealed class NativeTextureDecoder
                     buffer.PayloadExtent, new(payload.Identity, packedOffset, length))));
                 packedOffset = checked(packedOffset + length);
             }
+            decodedBytes = nominalBytes;
         }
         for (var descriptorIndex = 0; descriptorIndex < metadata.References.Count - 1; descriptorIndex++)
         {
             token.ThrowIfCancellationRequested();
             var reference = metadata.References[descriptorIndex + 1];
             var descriptor = metadata.LodDescriptors[descriptorIndex];
-            if (reference.Reference.ResourceType != 2230 || descriptor.ThirdU16 != 1)
+            if (reference.Reference.ResourceType != 2230 || descriptor.ThirdU16 > 1)
                 throw Error("UnsupportedNativeTextureLayout", "This mip layout is unavailable.");
             var index = FindMipIndex(metadata, descriptor);
             if (index < 0 || descriptor.TrailingByte != metadata.MipSizeCount - index)
@@ -122,10 +125,10 @@ public sealed class NativeTextureDecoder
         var supported = mips.Take(supportedCount).Select(pair => pair.Value).ToArray();
         var size = checked(148 + supported.Sum(mip => mip.Bytes.Length));
         var dds = new byte[size]; "DDS "u8.CopyTo(dds);
-        var compressed = metadata.FirstByte is 5 or 7 or 18 or 25;
+        var compressed = metadata.FirstByte is 5 or 7 or 18 or 19 or 25;
         Put(4, 124); Put(8, (supportedCount > 1 ? 0x21007u : 0x1007u) | (compressed ? 0x80000u : 8u));
         Put(12, metadata.Mip0Height); Put(16, metadata.Mip0Width);
-        Put(20, compressed ? (uint)supported[0].Bytes.Length : (uint)metadata.Mip0Width * 4); Put(28, (uint)supportedCount);
+        Put(20, compressed ? (uint)supported[0].Bytes.Length : (uint)metadata.Mip0Width * (metadata.FirstByte == 11 ? 1u : 4u)); Put(28, (uint)supportedCount);
         Put(76, 32); Put(80, 4); "DX10"u8.CopyTo(dds.AsSpan(84)); Put(108, supportedCount > 1 ? 0x401008u : 0x1000u);
         Put(128, DxgiFormat(metadata.FirstByte, IsSrgb(source)));
         Put(132, 3); Put(140, 1); if (compressed && metadata.FirstByte != 7) Put(144, 3);
@@ -203,10 +206,10 @@ public sealed class NativeTextureDecoder
         var supported = Enumerable.Range(0, faces.Length).SelectMany(face => Enumerable.Range(0, supportedCount)
             .Select(mip => mips[(face, mip)])).ToArray();
         var dds = new byte[checked(148 + supported.Sum(mip => mip.Bytes.Length))]; "DDS "u8.CopyTo(dds);
-        var compressed = metadata.FirstByte is 5 or 7 or 18 or 25;
+        var compressed = metadata.FirstByte is 5 or 7 or 18 or 19 or 25;
         Put(4, 124); Put(8, (supportedCount > 1 ? 0x21007u : 0x1007u) | (compressed ? 0x80000u : 8u));
         Put(12, metadata.Mip0Height); Put(16, metadata.Mip0Width);
-        Put(20, compressed ? (uint)supported[0].Bytes.Length : (uint)metadata.Mip0Width * 4); Put(28, (uint)supportedCount);
+        Put(20, compressed ? (uint)supported[0].Bytes.Length : (uint)metadata.Mip0Width * (metadata.FirstByte == 11 ? 1u : 4u)); Put(28, (uint)supportedCount);
         Put(76, 32); Put(80, 4); "DX10"u8.CopyTo(dds.AsSpan(84));
         Put(108, supportedCount > 1 ? 0x401008u : 0x1008u); Put(112, 0xFE00);
         Put(128, DxgiFormat(metadata.FirstByte, IsSrgb(source)));
@@ -244,7 +247,8 @@ public sealed class NativeTextureDecoder
             throw Error("NativeTextureMetadataMismatch", "Texture metadata does not match its source.");
         if (!MatchesSerializedMetadata(metadata, source.MetadataBytes.Span))
             throw Error("NativeTextureMetadataMismatch", "Texture metadata fields do not match their serialized values.");
-        if (metadata.FirstByte is not (0 or 5 or 7 or 18 or 25) || metadata.RawFixedPrefix84[0] != metadata.FirstByte)
+        if (metadata.FirstByte is not (0 or 5 or 7 or 11 or 18 or 19 or 25) || metadata.RawFixedPrefix84[0] != metadata.FirstByte ||
+            metadata.FirstByte == 11 && IsSrgb(source))
             throw Error("UnsupportedNativeTextureFormat", "This texture format is unavailable.");
         if (metadata.SizeGroupSelector is not (1 or 2) || metadata.SerializedSelector != 1 || metadata.ThirdU16 != 1 ||
             metadata.SkipLodSizeTables || metadata.MipByteLengthGroups.Count != (metadata.SizeGroupSelector == 2 ? 6 : 1) ||
@@ -273,12 +277,12 @@ public sealed class NativeTextureDecoder
     }
 
     private static bool IsSupportedConversion(TextureFileTextV24Document metadata) =>
-        (metadata.FirstByte, metadata.PostSelectorByte1) is (5, 7) or (7, 1) or (18, 21);
+        (metadata.FirstByte, metadata.PostSelectorByte1) is (5, 7) or (5, 17) or (5, 19) or (7, 1) or (11, 15) or (18, 21) or (19, 23);
 
     private sealed record ConvertedMip(int Index, TextureFileTextV24LodDescriptor Descriptor,
         TextureFileTextV24ResourceReference Reference);
 
-    private static ConvertedMip SelectConvertedMip(NativeTextureSource source, int maximumPreviewDimension)
+    private static ConvertedMip SelectConvertedMip(NativeTextureSource source, int maximumPreviewDimension, bool validatePayloads = true)
     {
         var metadata = source.Metadata;
         if (!IsSupportedConversion(metadata) || metadata.MipByteLengthGroups[0].Any(length => length != 0))
@@ -290,8 +294,9 @@ public sealed class NativeTextureDecoder
             if (index < 0 || value.ThirdU16 > 1 || value.TrailingByte != metadata.MipSizeCount - index || !seen.Add(index))
                 throw Error("NativeMipDescriptorMismatch", "Mip dimensions do not match the texture metadata.");
         }
-        foreach (var reference in metadata.References)
-            GetPayload(source, reference, reference.Sequence == 0 ? 2229u : 2230u);
+        if (validatePayloads)
+            foreach (var reference in metadata.References)
+                GetPayload(source, reference, reference.Sequence == 0 ? 2229u : 2230u);
         if (metadata.DescriptorCount == 1)
         {
             if (FindMipIndex(metadata, metadata.LodDescriptors[0]) != 0)
@@ -307,11 +312,12 @@ public sealed class NativeTextureDecoder
             value.Descriptor.Height <= maximumPreviewDimension) ?? baseMip;
     }
 
-    private NativeTextureDecodedDocument ReadConverted(NativeTextureSource source, int maximumPreviewDimension, CancellationToken token)
+    private NativeTextureDecodedDocument ReadConverted(NativeTextureSource source, int maximumPreviewDimension, CancellationToken token,
+        bool validatePayloads = true)
     {
-        var selected = SelectConvertedMip(source, maximumPreviewDimension);
+        var selected = SelectConvertedMip(source, maximumPreviewDimension, validatePayloads);
         var metadata = source.Metadata; var width = selected.Descriptor.Width; var height = selected.Descriptor.Height;
-        var normalizedBytes = checked(((width + 3L) / 4) * ((height + 3L) / 4) * (metadata.FirstByte == 7 ? 16 : 8));
+        var normalizedBytes = MipByteLength(metadata.FirstByte, width, height);
         if (selected.Reference.FollowingUInt32 < normalizedBytes ||
             selected.Reference.Reference.ResourceType == 2230 && selected.Reference.FollowingUInt32 != normalizedBytes)
             throw Error("NativeMipSizeMismatch", "Mip byte size does not match its dimensions.");
@@ -319,15 +325,58 @@ public sealed class NativeTextureDecoder
         if (!TextureBufferPatternInspector.TryGetPayload(payload.OriginalBytes.Span, payload.Extent, payload.Type,
             out _, out var body, out var payloadExtent, out _))
             throw Error("UnsupportedNativeMipPayload", "The mip payload uses an unavailable encoding.");
+        if (body.Length >= 4 && BinaryPrimitives.ReadUInt16LittleEndian(body) == 16 && BinaryPrimitives.ReadUInt16LittleEndian(body[2..]) == 255)
+        {
+            var packet = NativeTextureBlockPacketReader.ReadPacket(body, width, height, normalizedBytes, maximumDecodedBytes, token);
+            var blocks = packet.Blocks;
+            var blockDds = new byte[checked(148 + blocks.Length)]; "DDS "u8.CopyTo(blockDds);
+            bool compressed = metadata.FirstByte is 5 or 7 or 18 or 19 or 25;
+            Write(4, 124); Write(8, 0x1007u | (compressed ? 0x80000u : 8u)); Write(12, height); Write(16, width);
+            Write(20, compressed ? (uint)blocks.Length : (uint)width * (metadata.FirstByte == 11 ? 1u : 4u));
+            Write(28, 1); Write(76, 32); Write(80, 4); "DX10"u8.CopyTo(blockDds.AsSpan(84)); Write(108, 0x1000);
+            Write(128, DxgiFormat(metadata.FirstByte, IsSrgb(source))); Write(132, 3); Write(140, 1);
+            if (compressed && metadata.FirstByte != 7) Write(144, 3);
+            blocks.Span.CopyTo(blockDds.AsSpan(148));
+            var blockDocument = new DdsTextureReader().Read(blockDds, metadata.Identity, source.Revision);
+            var blockEvidence = new NativeTextureMipSource(selected.Index, width, height, payload.Identity,
+                payload.Sha256, Hash(blocks.Span), payloadExtent!, new(payload.Identity, 0, blocks.Length));
+            return new(blockDocument, [blockEvidence], metadata.MipSizeCount,
+                Enumerable.Range(0, metadata.MipSizeCount).Where(index => index != selected.Index).ToArray());
+            void Write(int offset, uint value) => BinaryPrimitives.WriteUInt32LittleEndian(blockDds.AsSpan(offset), value);
+        }
         var decoded = new ConvertedTextureDecoder().Read(body, metadata.PostSelectorByte1, width, height, maximumDecodedBytes, token);
-        var dds = new byte[checked(148 + decoded.Rgba8.Length)]; "DDS "u8.CopyTo(dds);
-        Put(4, 124); Put(8, 0x100F); Put(12, height); Put(16, width); Put(20, (uint)width * 4);
+        var compactRed = !validatePayloads && (decoded.Info.Selector is 15 or 21) && !IsSrgb(source);
+        var bytesPerPixel = compactRed ? 1 : 4;
+        var dds = new byte[checked(148 + width * height * bytesPerPixel)]; "DDS "u8.CopyTo(dds);
+        Put(4, 124); Put(8, 0x100F); Put(12, height); Put(16, width); Put(20, (uint)width * (uint)bytesPerPixel);
         Put(28, 1); Put(76, 32); Put(80, 4); "DX10"u8.CopyTo(dds.AsSpan(84)); Put(108, 0x1000);
-        Put(128, IsSrgb(source) ? 29u : 28u); Put(132, 3); Put(140, 1);
-        decoded.Rgba8.Span.CopyTo(dds.AsSpan(148)); token.ThrowIfCancellationRequested();
+        Put(128, compactRed ? 61u : IsSrgb(source) ? 29u : 28u); Put(132, 3); Put(140, 1);
+        if (compactRed)
+        {
+            var pixels = decoded.Rgba8.Span;
+            for (int pixel = 0; pixel < width * height; pixel++)
+            {
+                if ((pixel & 0xffff) == 0) token.ThrowIfCancellationRequested();
+                if (pixels[pixel * 4 + 1] != 0 || pixels[pixel * 4 + 2] != 0 || pixels[pixel * 4 + 3] != 255)
+                    throw Error("NativeScalarChannels", "The scalar texture channels do not match their source profile.");
+                dds[148 + pixel] = pixels[pixel * 4];
+            }
+        }
+        else decoded.Rgba8.Span.CopyTo(dds.AsSpan(148));
+        token.ThrowIfCancellationRequested();
+        if (metadata.FirstByte == 5 && decoded.Info.Selector is 17 or 19)
+        {
+            // RGB BC1 has opaque sampling alpha; the coefficient scratch channel is zero.
+            Put(144, 3);
+            for (var pixel = 148 + 3; pixel < dds.Length; pixel += 4)
+            {
+                if ((pixel & 4095) == 3) token.ThrowIfCancellationRequested();
+                dds[pixel] = 255;
+            }
+        }
         var document = new DdsTextureReader().Read(dds, metadata.Identity, source.Revision);
         var evidence = new NativeTextureMipSource(selected.Index, width, height, payload.Identity, payload.Sha256,
-            Hash(decoded.Rgba8.Span), payloadExtent!, new(payload.Identity, 0, decoded.Rgba8.Length));
+            compactRed ? Hash(decoded.Rgba8.Span) : Hash(dds.AsSpan(148)), payloadExtent!, new(payload.Identity, 0, decoded.Rgba8.Length));
         return new(document, [evidence], metadata.MipSizeCount,
             Enumerable.Range(0, metadata.MipSizeCount).Where(index => index != selected.Index).ToArray())
         { Conversion = decoded.Info };
@@ -339,14 +388,16 @@ public sealed class NativeTextureDecoder
         0 => srgb ? 91u : 87u,
         5 => srgb ? 72u : 71u,
         7 => srgb ? 78u : 77u,
+        11 => 61u,
         18 => 80u,
+        19 => 83u,
         25 => 95u,
         _ => throw Error("UnsupportedNativeTextureFormat", "This texture format is unavailable.")
     };
 
-    private static long MipByteLength(byte format, int width, int height) => format is 5 or 7 or 18 or 25
-        ? checked(((width + 3L) / 4) * ((height + 3L) / 4) * (format is 7 or 25 ? 16 : 8))
-        : checked((long)width * height * 4);
+    private static long MipByteLength(byte format, int width, int height) => format is 5 or 7 or 18 or 19 or 25
+        ? checked(((width + 3L) / 4) * ((height + 3L) / 4) * (format is 7 or 19 or 25 ? 16 : 8))
+        : checked((long)width * height * (format == 11 ? 1 : 4));
 
     private static NativeTexturePayload GetPayload(NativeTextureSource source,
         TextureFileTextV24ResourceReference reference, uint type)

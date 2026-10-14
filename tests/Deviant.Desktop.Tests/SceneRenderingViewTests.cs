@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.IO;
 using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
@@ -13,6 +14,152 @@ namespace Deviant.Desktop.Tests;
 [Collection("WPF")]
 public sealed class SceneRenderingViewTests
 {
+    [Fact]
+    public void ApprovedRetryReleasesFailedStreamBeforePreparingAgain() => Run(() =>
+    {
+        var loaded = Section();
+        var budget = new AssetMemoryBudget();
+        var sourceMemory = budget.Reserve(128, "generated first attempt");
+        var source = Snapshot(budget, [sourceMemory]);
+        using var retry = Snapshot(budget);
+        using var service = new AssetViewportService();
+        var calls = 0;
+        var view = new SceneView
+        {
+            RenderProvider = (_, _, _) => Task.FromResult(retry),
+            LargeDataConfirmationProvider = (_, _) => Task.FromResult(true),
+            StreamingRenderProvider = async (_, _, publish, token) =>
+            {
+                if (++calls == 1)
+                {
+                    await publish(source, token);
+                    source.Dispose();
+                    throw new ArchiveException("NativeContainerLimit", "Generated source limit");
+                }
+                Assert.Equal(0, sourceMemory.Bytes);
+                return retry;
+            }
+        };
+        view.SetViewportService(service);
+        try
+        {
+            Pump(view.LoadAsync(new Session(loaded)));
+            Pump(view.SelectResourceAsync(loaded.Result.Identity));
+            Pump(view.LoadRegionAsync());
+            Assert.Equal(2, calls);
+        }
+        finally { Pump(view.DisposeAsync().AsTask()); source.Dispose(); }
+    });
+
+    [Fact]
+    public void PendingLargeLoadDecisionKeepsStreamedGeometryUsable() => Run(() =>
+    {
+        var loaded = Section();
+        using var source = Snapshot(new AssetMemoryBudget());
+        using var service = new AssetViewportService();
+        var decision = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var prompted = false;
+        var view = new SceneView
+        {
+            RenderProvider = (_, _, _) => Task.FromResult(source),
+            StreamingRenderProvider = async (_, _, publish, token) =>
+            {
+                await publish(source, token);
+                throw new ArchiveException("NativeContainerLimit", "Generated source limit");
+            },
+            LargeDataConfirmationProvider = (_, _) => { prompted = true; return decision.Task; }
+        };
+        view.SetViewportService(service);
+        try
+        {
+            Pump(view.LoadAsync(new Session(loaded)));
+            Pump(view.SelectResourceAsync(loaded.Result.Identity));
+            var loading = view.LoadRegionAsync();
+            PumpUntil(() => prompted);
+            Assert.True(view.Viewport.VisiblePartCount > 0);
+            Assert.True(view.Viewport.IsEnabled);
+            view.CancelActivity();
+            Pump(Assert.ThrowsAnyAsync<OperationCanceledException>(() => loading.WaitAsync(TimeSpan.FromSeconds(2))));
+            Assert.Equal(0, view.Viewport.VisiblePartCount);
+        }
+        finally { decision.TrySetResult(false); Pump(view.DisposeAsync().AsTask()); }
+    });
+
+    [Fact]
+    public void CancellingPendingLargeLoadDecisionDrainsWithoutUserAnswer() => Run(() =>
+    {
+        var loaded = Section();
+        var decision = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var prompted = false;
+        var view = new SceneView
+        {
+            RenderProvider = (_, _, _) => Task.FromException<RenderAssetSnapshot>(new ArchiveException("NativeContainerLimit", "Generated source limit")),
+            LargeDataConfirmationProvider = (_, _) => { prompted = true; return decision.Task; }
+        };
+        try
+        {
+            Pump(view.LoadAsync(new Session(loaded)));
+            Pump(view.SelectResourceAsync(loaded.Result.Identity));
+            var loading = view.LoadRegionAsync();
+            PumpUntil(() => prompted);
+            view.CancelActivity();
+            Pump(Assert.ThrowsAnyAsync<OperationCanceledException>(() => loading.WaitAsync(TimeSpan.FromSeconds(2))));
+            Assert.False(view.IsLoading);
+            Assert.Equal("Cancelled", view.ActivityProgress.Stage);
+        }
+        finally { decision.TrySetResult(false); Pump(view.DisposeAsync().AsTask()); }
+    });
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void LargeExportRetriesOnlyAfterApprovalAndRestoresTheNormalBudget(bool approve) => Run(() =>
+    {
+        var budget = new AssetMemoryBudget();
+        using var source = Snapshot(budget);
+        var view = new SceneView();
+        int calls = 0, prompts = 0;
+        try
+        {
+            typeof(SceneView).GetField("renderSnapshot", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(view, source);
+            view.LargeDataConfirmationProvider = (message, _) =>
+            { prompts++; Assert.Contains("512 MiB", message); Assert.Contains("2 GiB", message); return Task.FromResult(approve); };
+            view.GeometryExportProvider = (snapshot, request, path, progress, token) =>
+            {
+                calls++;
+                if (calls == 1) { Assert.Equal(AssetMemoryBudget.DefaultMaximumBytes, budget.MaximumBytes); throw new ArchiveException("AssetMemoryLimit", "Generated staging limit"); }
+                Assert.Equal(2L * 1024 * 1024 * 1024, budget.MaximumBytes);
+                var identity = source.Occurrences[0].Entity;
+                return Task.FromResult(new Deviant.Export.Models.FbxGeometryExportReport(identity, source.Revision,
+                    new(identity,"selection"),Path.GetFileName(path),new string('a',64),1,1,0,[]));
+            };
+            var export = view.ExportGeometryAsync("Generated.fbx",entireLoadedScene:true,includeHidden:true);
+            if (approve) Pump(export);
+            else Assert.Throws<OperationCanceledException>(() => Pump(export));
+            Assert.Equal(approve ? 2 : 1, calls); Assert.Equal(1, prompts);
+            Assert.Equal(AssetMemoryBudget.DefaultMaximumBytes,budget.MaximumBytes);
+            Assert.Equal(0,budget.UsedBytes);
+        }
+        finally { Pump(view.DisposeAsync().AsTask()); }
+    });
+
+    [Fact]
+    public void FramingARegionAppliesTheImprovedDepthRange() => Run(() =>
+    {
+        var viewport = new AssetViewport();
+        try
+        {
+            viewport.Measure(new Size(800, 600));
+            viewport.Arrange(new Rect(0, 0, 800, 600));
+            typeof(AssetViewport).GetMethod("Frame", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(viewport, [new GeometryBounds(new(-10), new(10))]);
+            var camera = Assert.IsType<HelixToolkit.Wpf.SharpDX.PerspectiveCamera>(viewport.Viewport.Camera);
+            Assert.InRange(camera.NearPlaneDistance, .17, .18);
+            Assert.InRange(camera.FarPlaneDistance, 1732, 1733);
+        }
+        finally { Pump(viewport.DisposeAsync().AsTask()); }
+    });
+
     [Fact]
     public void RegionValuesRoundTripAndRejectNonPositiveSizes() => Run(() =>
     {
@@ -244,6 +391,37 @@ public sealed class SceneRenderingViewTests
     });
 
     [Fact]
+    public void LoadAllButtonUsesTheConfiguredLargeDataRegionProvider() => Run(() =>
+    {
+        var loaded = SyntheticRegionsSection();
+        var branch = loaded.Result.Value!.CatalogInstances[0];
+        var bounds = new GeometryBounds(Vector3.Zero, Vector3.One);
+        SceneRenderRequest? requested = null;
+        var view = new SceneView
+        {
+            RegionProviderWithLargeData = (_, _, _, _) => Task.FromResult(
+                new SceneRegionDiscovery([new(branch.Identity, "Region", bounds, bounds, 1)], [])),
+            RenderProvider = (request, _, _) =>
+            {
+                requested = request;
+                return Task.FromCanceled<RenderAssetSnapshot>(new CancellationToken(true));
+            }
+        };
+        try
+        {
+            Pump(view.LoadAsync(new Session(loaded)));
+            Pump(view.SelectResourceAsync(loaded.Result.Identity));
+            var button = (Button)view.FindName("LoadAllButton");
+            Assert.True(button.IsEnabled);
+            button.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            PumpUntil(() => requested is not null);
+            Assert.Equal(SceneRenderScope.Scene, requested!.Scope);
+            Assert.Equal(branch.Identity, requested.BranchInstance);
+        }
+        finally { Pump(view.DisposeAsync().AsTask()); }
+    });
+
+    [Fact]
     public void SceneMetadataCancellationCannotApplyLateRegionsOrStartGeometry() => Run(() =>
     {
         var loaded = SyntheticRegionsSection();
@@ -385,6 +563,44 @@ public sealed class SceneRenderingViewTests
     }
 
     [Fact]
+    public void ModelViewBorrowsSnapshotAndDisplaysEveryModelLocalPlacement() => Run(() =>
+    {
+        var budget = new AssetMemoryBudget(4096);
+        var retained = budget.Reserve(128, "generated model snapshot");
+        var snapshot = ModelLocalSnapshot(budget, retained);
+        var service = new AssetViewportService();
+        var view = new AssetModelView();
+        view.SetViewportService(service);
+        try
+        {
+            using var cancelled = new CancellationTokenSource(); cancelled.Cancel();
+            Assert.ThrowsAny<OperationCanceledException>(() => Pump(view.LoadAsync(snapshot, cancelled.Token)));
+            Assert.Equal(128, budget.UsedBytes);
+            Pump(view.LoadAsync(snapshot));
+            Assert.Same(snapshot, view.CurrentSnapshot);
+            Assert.Equal("Models · 2 groups", ((TextBlock)view.FindName("ModelName")).Text);
+            var details = ((TextBox)view.FindName("ModelDetails")).Text;
+            Assert.Contains("Model-local mesh", details);
+            Assert.Contains("Group 0", details);
+            Assert.Contains("Group 1", details);
+            Assert.Contains("Placement Model local", details);
+            snapshot.Dispose();
+            Assert.Equal(128, budget.UsedBytes);
+            Pump(view.LoadAsync(snapshot));
+            Assert.Same(snapshot, view.CurrentSnapshot);
+            Assert.Equal(128, budget.UsedBytes);
+            Pump(view.UnloadAsync());
+            Assert.Equal(0, budget.UsedBytes);
+        }
+        finally
+        {
+            Pump(view.DisposeAsync().AsTask());
+            snapshot.Dispose();
+            service.Dispose();
+        }
+    });
+
+    [Fact]
     public void IndividualHiddenModelPreservesSourceVisibilityAndNativeFlags()
     {
         using var scene = Snapshot(new AssetMemoryBudget());
@@ -419,6 +635,32 @@ public sealed class SceneRenderingViewTests
             Matrix4x4.Identity, occurrence.World, occurrence.Key, []);
         return new(Revision, new Dictionary<string, RenderMesh> { [mesh.Key] = mesh }, [occurrence],
             new Dictionary<ResourceIdentity, RenderMaterial>(), bounds, [], [hierarchy], new(1, 1, 0, 1, 1, 1), [], budget, resources);
+    }
+
+    private static RenderAssetSnapshot ModelLocalSnapshot(AssetMemoryBudget budget, IDisposable retained)
+    {
+        var revision = Revision;
+        var bounds = new GeometryBounds(Vector3.Zero, new(1, 1, 0));
+        var geometry = new GeometryAsset(new("generated", "1"), [], [], new Dictionary<string, string>());
+        var first = new RenderMesh(Identity(20), 0, geometry);
+        var second = new RenderMesh(Identity(21), 1, geometry);
+        var meshes = new Dictionary<string, RenderMesh> { [first.Key] = first, [second.Key] = second };
+        var occurrences = new[]
+        {
+            LocalOccurrence(first, 0), LocalOccurrence(second, 1)
+        };
+        return new(revision, meshes, occurrences, new Dictionary<ResourceIdentity, RenderMaterial>(), bounds,
+            [], [], new(0, 0, 0, 0, 0, 0), [], budget, [retained]);
+
+        static RenderOccurrence LocalOccurrence(RenderMesh mesh, int group) => new(
+            $"model-local/{mesh.Key}", mesh.Identity, mesh.Identity, $"Mesh group {group}", mesh.Key,
+            Matrix4x4.Identity, new(Vector3.Zero, new(1, 1, 0)), [])
+        {
+            PlacementOrigin = RenderPlacementOrigin.ModelLocal,
+            ModelPlacement = new(mesh.Identity, group),
+            SourceVisibilityKnown = false,
+            SourceVisible = true
+        };
     }
     private static SceneLoadedSection Section()
     {

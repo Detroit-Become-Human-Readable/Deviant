@@ -90,7 +90,6 @@ public sealed class NativeMeshDataReader
                 for (var d = 0; d < descriptors.Length; d++)
                 {
                     var at = r.Position; descriptors[d] = new(r.Word(), r.Extent(at, 4));
-                    if (descriptors[d].Stream > 3) throw new InvalidDataException("NativeVertexStreamIndexInvalid");
                 }
                 var streams = new NativeVertexStream[4];
                 for (var s = 0; s < streams.Length; s++)
@@ -106,22 +105,25 @@ public sealed class NativeMeshDataReader
             var tailWord = r.Word(); var tailRef = r.Reference(frame.Identity);
             var flag1 = r.Byte(); var flag2 = r.Byte(); var tailWord2 = r.Word();
             var metadataExtent = r.Extent(0, r.Position);
-            r.Tag("CLUPSKME"u8, 2); var clusterFlag = r.Byte();
-            if (clusterFlag != 0) throw new InvalidDataException("NativeMeshClustersUnsupported");
-            r.Tag("BLSHAPES"u8, 3);
-            var blendShapeCounts = new DecodedExtent[groups.Length];
-            for (var g = 0; g < groups.Length; g++)
-            {
-                token.ThrowIfCancellationRequested();
-                var at = r.Position;
-                if (r.Word() != 0) throw new InvalidDataException("NativeMeshBlendShapesUnsupported");
-                blendShapeCounts[g] = r.Extent(at, 4);
-            }
+            if (!new NativeMeshClusterV2Reader().TryRead(frame.RawPayload, frame.PayloadExtent,
+                    r.Position, out var clusterMetadata, out var clusterError, token) || clusterMetadata is null)
+                throw new InvalidDataException(clusterError ?? "NativeMeshClusterUnavailable");
+            var clusterFlag = clusterMetadata.Flag;
+            r.Skip(checked((int)clusterMetadata.Extent.Length));
+            if (!new NativeMeshBlendShapeV3Reader().TryRead(frame.RawPayload, frame.PayloadExtent,
+                    r.Position, groups.Length, out var blendShapeMetadata, out var blendShapeCounts,
+                    out var blendShapeError, token) || blendShapeMetadata is null)
+                throw new InvalidDataException(blendShapeError ?? "NativeMeshBlendShapeUnavailable");
+            r.Skip(checked((int)blendShapeMetadata.Extent.Length));
             if (r.Position != frame.RawPayload.Length) throw new InvalidDataException("NativeMeshMetadataEndMismatch");
             document = new(frame.Identity, frame.NativeId, frame.PayloadExtent, buffers, indices, groups,
                 referenceControl, references, factor, stored, name, tailWord,
                 tailRef.ResourceType == 0 && tailRef.Id == "0" ? null : tailRef,
-                flag1, flag2, tailWord2, metadataExtent, clusterFlag, blendShapeCounts);
+                flag1, flag2, tailWord2, metadataExtent, clusterFlag, blendShapeCounts)
+                {
+                    ClusterMetadata = clusterMetadata,
+                    BlendShapeMetadata = blendShapeMetadata
+                };
             return true;
         }
         catch (InvalidDataException error) { diagnostic = error.Message; return false; }
@@ -133,6 +135,7 @@ public sealed class NativeMeshDataReader
 internal sealed class NativeMeshByteReader(ReadOnlyMemory<byte> bytes, DecodedExtent source)
 {
     public int Position { get; private set; }
+    public int Remaining => bytes.Length - Position;
     public ReadOnlySpan<byte> Take(int length)
     {
         if (length < 0 || length > bytes.Length - Position) throw new InvalidDataException("NativeMeshTruncated");

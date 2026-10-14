@@ -57,10 +57,10 @@ public sealed class TextureCatalogSessionUpdatedEventArgs(TextureCatalogSessionP
 /// </summary>
 public sealed class TextureCatalogSession : IAsyncDisposable
 {
-    private readonly LocalizationReferenceReader references;
+    private readonly ICatalogReferenceProvider referenceProvider;
+    private readonly CatalogReferenceProvider? ownedReferenceProvider;
     private readonly TextureCatalogMembershipReader memberships;
     private readonly TextureCatalogSessionOptions options;
-    private readonly Lazy<Task> initialIndexValidation;
     private readonly CancellationTokenSource cancellation = new();
     private readonly SemaphoreSlim readGate = new(1, 1);
     private readonly object stateGate = new();
@@ -81,11 +81,30 @@ public sealed class TextureCatalogSession : IAsyncDisposable
     private string? message;
     private Exception? error;
     private bool disposed;
+    private int backgroundPauses;
+    private TaskCompletionSource backgroundReady = CompletedBackgroundSignal();
+
+    public IDisposable PauseBackgroundDiscovery()
+    {
+        lock (stateGate)
+        {
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (backgroundPauses++ == 0) backgroundReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            return new BackgroundPause(this);
+        }
+    }
+    private void ResumeBackgroundDiscovery()
+    { lock (stateGate) if (--backgroundPauses == 0) backgroundReady.TrySetResult(); }
+    private static TaskCompletionSource CompletedBackgroundSignal()
+    { var signal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); signal.SetResult(); return signal; }
+    private sealed class BackgroundPause(TextureCatalogSession owner) : IDisposable
+    { private TextureCatalogSession? owner = owner; public void Dispose() => Interlocked.Exchange(ref owner, null)?.ResumeBackgroundDiscovery(); }
 
     public TextureCatalogSession(ArchiveSnapshot snapshot, SourceRevision revision,
         LocalizationReferenceReader? referenceReader = null,
         TextureCatalogMembershipReader? membershipReader = null,
-        TextureCatalogSessionOptions? sessionOptions = null)
+        TextureCatalogSessionOptions? sessionOptions = null,
+        ICatalogReferenceProvider? referenceProvider = null)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentNullException.ThrowIfNull(revision);
@@ -97,11 +116,14 @@ public sealed class TextureCatalogSession : IAsyncDisposable
         ValidateOptions(options);
         Snapshot = snapshot;
         Revision = revision;
-        references = referenceReader ?? new LocalizationReferenceReader();
+        if (referenceProvider is not null &&
+            (!ReferenceEquals(referenceProvider.Snapshot, snapshot) || referenceProvider.Revision != revision))
+            throw new ArgumentException("The catalog reference provider belongs to another archive revision.", nameof(referenceProvider));
+        ownedReferenceProvider = referenceProvider is null
+            ? new CatalogReferenceProvider(snapshot, new AssetMemoryBudget(), referenceReader: referenceReader)
+            : null;
+        this.referenceProvider = referenceProvider ?? ownedReferenceProvider!;
         memberships = membershipReader ?? new TextureCatalogMembershipReader();
-        initialIndexValidation = new Lazy<Task>(
-            () => references.ValidateSnapshotIndexHashAsync(Snapshot, cancellation.Token),
-            LazyThreadSafetyMode.ExecutionAndPublication);
         updateContext = SynchronizationContext.Current;
         catalogRows = snapshot.Records.Where(row => row.Type == 3 && row.Validity == ResourceValidity.Valid)
             .OrderBy(row => row.Ordinal).ToArray();
@@ -114,6 +136,7 @@ public sealed class TextureCatalogSession : IAsyncDisposable
 
     public ArchiveSnapshot Snapshot { get; }
     public SourceRevision Revision { get; }
+    public ICatalogReferenceProvider ReferenceProvider => referenceProvider;
     public Task EnrichmentTask { get; }
     public TextureCatalogSessionProgress Progress { get { lock (stateGate) return CreateProgress(); } }
     public Exception? Error { get { lock (stateGate) return error; } }
@@ -129,7 +152,6 @@ public sealed class TextureCatalogSession : IAsyncDisposable
         ValidateCatalogIdentity(catalogIdentity);
         ThrowIfDisposed();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token, cancellationToken);
-        await EnsureInitialIndexValidAsync(linked.Token).ConfigureAwait(false);
         await readGate.WaitAsync(linked.Token).ConfigureAwait(false);
         try
         {
@@ -169,7 +191,7 @@ public sealed class TextureCatalogSession : IAsyncDisposable
             throw new ArchiveException("InvalidTextureIdentity", "The selected texture identity does not belong to this archive snapshot.");
         ThrowIfDisposed();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellation.Token, cancellationToken);
-        await EnsureInitialIndexValidAsync(linked.Token).ConfigureAwait(false);
+        await referenceProvider.ValidateSnapshotAsync(linked.Token).ConfigureAwait(false);
         await readGate.WaitAsync(linked.Token).ConfigureAwait(false);
         try
         {
@@ -185,22 +207,21 @@ public sealed class TextureCatalogSession : IAsyncDisposable
                 discoveryDiagnostics = diagnostics.ToArray();
             }
 
-            await references.ValidateSnapshotIndexHashAsync(Snapshot, linked.Token).ConfigureAwait(false);
             var related = new List<TextureCatalogRelatedGroup>(candidates.Length);
             foreach (var group in candidates)
             {
                 linked.Token.ThrowIfCancellationRequested();
-                var read = await references.ReadAsync(Snapshot, group.CatalogIdentity, linked.Token).ConfigureAwait(false);
+                using var readLease = await referenceProvider.ReadAsync(group.CatalogIdentity, linked.Token).ConfigureAwait(false);
+                var read = readLease.Result;
                 if (read.Status != LocalizationReferenceReadStatus.Verified ||
                     !StringComparer.Ordinal.Equals(read.ReferenceTableSha256, group.ReferenceTableSha256))
                     throw new ArchiveException("SourceChanged", "A related catalog reference table changed after discovery.");
-                await references.ValidateReferenceTableHashAsync(Snapshot, read, linked.Token).ConfigureAwait(false);
+                await referenceProvider.RevalidateAsync(read, linked.Token).ConfigureAwait(false);
                 var matches = group.References.Where(reference =>
                     (reference.ResolutionStatus == ReferenceStatus.Unique || reference.ResolutionStatus == ReferenceStatus.Ambiguous) &&
                     reference.Candidates.Contains(textureIdentity)).ToArray();
                 if (matches.Length > 0) related.Add(new(group, matches));
             }
-            await references.ValidateSnapshotIndexHashAsync(Snapshot, linked.Token).ConfigureAwait(false);
             return new(textureIdentity, Revision, discovery, discoveryDiagnostics, related.AsReadOnly());
         }
         catch (ArchiveException exception) when (exception.Code == "SourceChanged")
@@ -224,14 +245,13 @@ public sealed class TextureCatalogSession : IAsyncDisposable
             if (!TryGetGroup(catalogIdentity.Ordinal, out var expected))
                 throw new ArchiveException("TextureCatalogNotDiscovered", "The selected catalog has no discovered texture references.");
 
-            await EnsureInitialIndexValidAsync(linked.Token).ConfigureAwait(false);
-            await references.ValidateSnapshotIndexHashAsync(Snapshot, linked.Token).ConfigureAwait(false);
-            var read = await references.ReadAsync(Snapshot, catalogIdentity, linked.Token).ConfigureAwait(false);
+            await referenceProvider.ValidateSnapshotAsync(linked.Token).ConfigureAwait(false);
+            using var readLease = await referenceProvider.ReadAsync(catalogIdentity, linked.Token).ConfigureAwait(false);
+            var read = readLease.Result;
             if (read.Status != LocalizationReferenceReadStatus.Verified ||
                 !StringComparer.Ordinal.Equals(read.ReferenceTableSha256, expected.ReferenceTableSha256))
                 throw new ArchiveException("SourceChanged", "The selected catalog reference table changed after discovery.");
-            await references.ValidateReferenceTableHashAsync(Snapshot, read, linked.Token).ConfigureAwait(false);
-            await references.ValidateSnapshotIndexHashAsync(Snapshot, linked.Token).ConfigureAwait(false);
+            await referenceProvider.RevalidateAsync(read, linked.Token).ConfigureAwait(false);
         }
         catch (ArchiveException exception) when (exception.Code == "SourceChanged")
         {
@@ -261,6 +281,7 @@ public sealed class TextureCatalogSession : IAsyncDisposable
         readGate.Release();
         readGate.Dispose();
         cancellation.Dispose();
+        if (ownedReferenceProvider is not null) await ownedReferenceProvider.DisposeAsync().ConfigureAwait(false);
         lock (stateGate)
         {
             if (state == TextureCatalogSessionState.Running) state = TextureCatalogSessionState.Cancelled;
@@ -272,7 +293,7 @@ public sealed class TextureCatalogSession : IAsyncDisposable
     {
         try
         {
-            await EnsureInitialIndexValidAsync(cancellation.Token).ConfigureAwait(false);
+            await referenceProvider.ValidateSnapshotAsync(cancellation.Token).ConfigureAwait(false);
             PublishUpdate();
 
             var priorityRows = (options.PriorityCatalogs ?? Array.Empty<ResourceIdentity>())
@@ -282,6 +303,8 @@ public sealed class TextureCatalogSession : IAsyncDisposable
             foreach (var row in orderedRows)
             {
                 cancellation.Token.ThrowIfCancellationRequested();
+                Task admission; lock (stateGate) admission = backgroundReady.Task;
+                await admission.WaitAsync(cancellation.Token).ConfigureAwait(false);
                 if (LimitReachedBefore(row)) break;
                 await readGate.WaitAsync(cancellation.Token).ConfigureAwait(false);
                 try
@@ -341,7 +364,8 @@ public sealed class TextureCatalogSession : IAsyncDisposable
         var identity = new ResourceIdentity(Snapshot.IndexContentId, row.Ordinal);
         try
         {
-            var read = await references.ReadAsync(Snapshot, identity, token).ConfigureAwait(false);
+            using var readLease = await referenceProvider.ReadAsync(identity, token).ConfigureAwait(false);
+            var read = readLease.Result;
             if (read.Status != LocalizationReferenceReadStatus.Verified)
             {
                 MarkAttempted(row.Ordinal, 0, "UnsupportedCatalog", "The type-3 resource is not a supported COM_CONT v6 reference table.", incomplete: true);
@@ -543,16 +567,6 @@ public sealed class TextureCatalogSession : IAsyncDisposable
     private void ThrowIfDisposed()
     {
         if (disposed) throw new ObjectDisposedException(nameof(TextureCatalogSession));
-    }
-
-    private async Task EnsureInitialIndexValidAsync(CancellationToken token)
-    {
-        try { await initialIndexValidation.Value.WaitAsync(token).ConfigureAwait(false); }
-        catch (ArchiveException exception) when (exception.Code == "SourceChanged")
-        {
-            SetFatal(exception);
-            throw;
-        }
     }
 
     private TextureCatalogSessionState CurrentState { get { lock (stateGate) return state; } }

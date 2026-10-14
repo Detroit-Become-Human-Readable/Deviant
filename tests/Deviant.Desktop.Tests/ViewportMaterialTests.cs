@@ -13,6 +13,112 @@ namespace Deviant.Desktop.Tests;
 public sealed class ViewportMaterialTests
 {
     [Fact]
+    public void NativeStateWithoutAGraphKeepsTheNormalUvAndReleasesBothTechniques() => Run(() =>
+    {
+        var identity = new ResourceIdentity("index", 1);
+        var revision = new SourceRevision("index", "revision");
+        var binding = new MaterialTextureBinding(7, new(IdentifierNamespace.Native, "texture", identity),
+            MaterialTextureRole.Normal, 1, Vector2.One, Vector2.Zero, new(true, "shader", "Normal"));
+        var asset = new MaterialAsset(identity, revision, "normal", [binding], [], [])
+        { NativeRenderParameters = new(1, 3, 0x400, 0, 0, new(identity, 44, 35)) };
+        var source = new RenderMaterial(asset, new Dictionary<int, RenderTexture> { [7] = Texture(identity, revision) });
+        var opaque = source with { Asset = asset with
+        { NativeRenderParameters = asset.NativeRenderParameters with { StoredBlendSelector = 0 } } };
+        var primitive = new MeshPrimitive("triangle", PrimitiveTopology.Triangles,
+            [Vector3.Zero, Vector3.UnitX, Vector3.UnitY], [0, 1, 2], IndexElementFormat.UInt16,
+            [new("surface", 0, 3, [])], [Vector3.UnitZ, Vector3.UnitZ, Vector3.UnitZ],
+            [new(1, 0, 0, 1), new(1, 0, 0, 1), new(1, 0, 0, 1)],
+            [[Vector2.Zero, Vector2.UnitX, Vector2.UnitY], [Vector2.Zero, Vector2.UnitY, Vector2.UnitX]]);
+        var budget = new AssetMemoryBudget();
+        using var service = new AssetViewportService();
+        using var snapshot = new RenderAssetSnapshot(revision, new Dictionary<string, RenderMesh>(), [],
+            new Dictionary<ResourceIdentity, RenderMaterial>(), new(Vector3.Zero, Vector3.One), [], [],
+            new(0, 0, 0, 0, 0, 0), [], budget);
+        using (var alphaLease = service.AcquireMaterialAsync(snapshot, source, primitive, CancellationToken.None).GetAwaiter().GetResult())
+        using (var opaqueLease = service.AcquireMaterialAsync(snapshot, opaque, primitive, CancellationToken.None).GetAwaiter().GetResult())
+        {
+            Assert.True(alphaLease.NormalMapped);
+            Assert.Equal(1, alphaLease.UvSet);
+            Assert.False(alphaLease.SurfaceMapped);
+            Assert.True(alphaLease.IsTransparent);
+            Assert.False(opaqueLease.IsTransparent);
+            Assert.NotEqual(alphaLease.TechniqueName, opaqueLease.TechniqueName);
+            Assert.NotNull(service.EffectsManager[alphaLease.TechniqueName]);
+            Assert.True(service.GpuBytes > 0);
+        }
+        Assert.Equal(0, budget.UsedBytes);
+        Assert.Equal(0, service.GpuBytes);
+    });
+
+    [Fact]
+    public void SourceSamplerPreservesPointFilteringClampAndBorderState()
+    {
+        var profile = NativeTextureSamplingDecoder.Decode((1UL << 27) | (3UL << 30) | (2UL << 33) | (2UL << 53));
+        var sampler = AssetViewportService.SurfaceSampler(profile);
+        Assert.Equal(SharpDX.Direct3D11.Filter.MinMagMipPoint, sampler.Filter);
+        Assert.Equal(SharpDX.Direct3D11.TextureAddressMode.Clamp, sampler.AddressU);
+        Assert.Equal(SharpDX.Direct3D11.TextureAddressMode.Border, sampler.AddressV);
+        Assert.Equal(SharpDX.Direct3D11.TextureAddressMode.Mirror, sampler.AddressW);
+        Assert.Equal(0, sampler.MaximumLod);
+        Assert.Equal(1, sampler.BorderColor.R);
+        Assert.Equal(1, sampler.BorderColor.A);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void FaceNormalDiagnosticsRemainCorrectAcrossSharedMaterialCache(bool missingFirst) => Run(() =>
+    {
+        var revision = new SourceRevision("index", "revision");
+        var primitive = new MeshPrimitive("triangle", PrimitiveTopology.Triangles,
+            [Vector3.Zero, Vector3.UnitX, Vector3.UnitY], [0, 1, 2], IndexElementFormat.UInt16,
+            [new("surface", 0, 3, [])], [Vector3.Zero, Vector3.Zero, Vector3.Zero]);
+        var missing = primitive with { Normals = null };
+        var budget = new AssetMemoryBudget();
+        using var service = new AssetViewportService();
+        using var snapshot = new RenderAssetSnapshot(revision, new Dictionary<string, RenderMesh>(), [],
+            new Dictionary<ResourceIdentity, RenderMaterial>(), new(Vector3.Zero, Vector3.One), [], [],
+            new(0, 0, 0, 0, 0, 0), [], budget);
+        using var first = service.AcquireMaterialAsync(snapshot, null, missingFirst ? missing : primitive, CancellationToken.None).GetAwaiter().GetResult();
+        using var second = service.AcquireMaterialAsync(snapshot, null, missingFirst ? primitive : missing, CancellationToken.None).GetAwaiter().GetResult();
+        Assert.Equal(first.Diagnostics, second.Diagnostics);
+        Assert.Contains("Normal: Face normals used for display.", second.Diagnostics);
+    });
+
+    [Fact]
+    public void SharedMaterialCacheSeparatesUsableAndDegenerateTangentFrames() => Run(() =>
+    {
+        var identity = new ResourceIdentity("index", 1);
+        var revision = new SourceRevision("index", "revision");
+        var binding = new MaterialTextureBinding(7, new(IdentifierNamespace.Native, "texture", identity),
+            MaterialTextureRole.Normal, 0, Vector2.One, Vector2.Zero, new(true, "shader", "Normal"));
+        var source = new RenderMaterial(new(identity, revision, "normal", [binding], [], []),
+            new Dictionary<int, RenderTexture> { [7] = Texture(identity, revision) });
+        var primitive = new MeshPrimitive("triangle", PrimitiveTopology.Triangles,
+            [Vector3.Zero, Vector3.UnitX, Vector3.UnitY], [0, 1, 2], IndexElementFormat.UInt16,
+            [new("surface", 0, 3, [])], [Vector3.UnitZ, Vector3.UnitZ, Vector3.UnitZ],
+            [new(1, 0, 0, 1), new(1, 0, 0, 1), new(1, 0, 0, 1)],
+            [[Vector2.Zero, Vector2.UnitX, Vector2.UnitY]]);
+        var bad = primitive with { Tangents = [new(0, 0, 1, 1), new(0, 0, 1, 1), new(0, 0, 1, 1)] };
+        var budget = new AssetMemoryBudget();
+        using var service = new AssetViewportService();
+        using var snapshot = new RenderAssetSnapshot(revision, new Dictionary<string, RenderMesh>(), [],
+            new Dictionary<ResourceIdentity, RenderMaterial>(), new(Vector3.Zero, Vector3.One), [], [],
+            new(0, 0, 0, 0, 0, 0), [], budget);
+        using (var goodMaterial = service.AcquireMaterialAsync(snapshot, source, primitive, CancellationToken.None).GetAwaiter().GetResult())
+        using (var badMaterial = service.AcquireMaterialAsync(snapshot, source, bad, CancellationToken.None).GetAwaiter().GetResult())
+        {
+            Assert.True(goodMaterial.NormalMapped);
+            Assert.False(badMaterial.NormalMapped);
+            Assert.Null(badMaterial.Material.NormalMap);
+            Assert.Contains(badMaterial.Diagnostics, diagnostic => diagnostic.Contains("tangent frame", StringComparison.Ordinal));
+            Assert.Equal(3, ViewportGeometry.Convert(bad, bad.Submeshes[0]).Positions!.Count);
+        }
+        Assert.Equal(0, budget.UsedBytes);
+        Assert.Equal(0, service.GpuBytes);
+    });
+
+    [Fact]
     public void MissingDecodedNormalKeepsNeutralGeometryMaterialAndNativeReference() => Run(() =>
     {
         var identity = new ResourceIdentity("index", 1);

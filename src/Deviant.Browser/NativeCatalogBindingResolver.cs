@@ -11,13 +11,13 @@ public sealed record NativeCatalogBindingResult(ResourceIdentity NodeIdentity,
     ResourceIdentity? CompanionIdentity, SourceExtent? CatalogExtent, string? Diagnostic);
 
 /// <summary>Shares Goal A's exact native-prefix/archive-table catalog binding with render loading.</summary>
-public sealed class NativeCatalogBindingResolver
+public sealed class NativeCatalogBindingResolver : IDisposable
 {
     private readonly LocalizationReferenceReader references = new();
 
     public async Task<NativeCatalogBindingResult> ResolveAsync(ArchiveSnapshot snapshot,
         NativeObjectDirectoryDocument directory, ResourceIdentity nodeIdentity,
-        SceneCatalogInstance instance, CancellationToken token = default)
+        SceneCatalogInstance instance, CancellationToken token = default, NativeReferenceResolver? nativeResolver = null)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentNullException.ThrowIfNull(directory);
@@ -35,7 +35,7 @@ public sealed class NativeCatalogBindingResolver
         if (resolution is not { Status: ReferenceStatus.Unique, Candidates.Count: 1 })
             return new(nodeIdentity, instance, relationship, resolution.Candidates.FirstOrDefault() ?? instance.Identity, null, null,
                 "CatalogArchiveResolutionUnavailable");
-        var native = new NativeReferenceResolver(directory).Resolve(instance.Catalog);
+        var native = (nativeResolver ?? new NativeReferenceResolver(directory)).Resolve(instance.Catalog);
         if (native is not { Status: ReferenceStatus.Unique, Candidates.Count: 1 })
             return new(nodeIdentity, instance, relationship, resolution.Candidates[0], null, null,
                 "CatalogNativeResolutionUnavailable");
@@ -77,4 +77,5 @@ public sealed class NativeCatalogBindingResolver
         };
         return new(nodeIdentity, instance, verifiedRelationship, target, companion, extent, null);
     }
+    public void Dispose() => references.Dispose();
 }

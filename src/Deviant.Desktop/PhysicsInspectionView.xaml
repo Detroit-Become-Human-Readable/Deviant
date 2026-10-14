@@ -1,0 +1,141 @@
+<UserControl x:Class="Deviant.Desktop.PhysicsInspectionView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Foreground="{DynamicResource WindowForeground}">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <DockPanel Margin="0,0,0,12">
+            <StackPanel>
+                <TextBlock Text="Physics metadata" FontSize="20" FontWeight="SemiBold" />
+                <TextBlock x:Name="Summary" Margin="0,4,0,0" />
+            </StackPanel>
+            <TextBox x:Name="Search" Width="260" Height="32" Margin="12,0,0,0"
+                     HorizontalAlignment="Right" VerticalAlignment="Center"
+                     ToolTip="Search the selected list" AutomationProperties.Name="Search physics metadata"
+                     TextChanged="SearchChanged" />
+        </DockPanel>
+
+        <Grid x:Name="InspectionLayout" Grid.Row="1" SizeChanged="InspectionLayoutSizeChanged">
+            <Grid.RowDefinitions>
+                <RowDefinition x:Name="ResultsRow" Height="*" MinHeight="200" />
+                <RowDefinition x:Name="DiagnosticsSplitterRow" Height="0" />
+                <RowDefinition x:Name="DiagnosticsRow" Height="Auto" />
+            </Grid.RowDefinitions>
+            <TabControl x:Name="Sections" SelectionChanged="SectionChanged">
+                <TabItem Header="Types">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="2*" MinWidth="220" />
+                            <ColumnDefinition Width="8" />
+                            <ColumnDefinition Width="3*" MinWidth="260" />
+                        </Grid.ColumnDefinitions>
+                        <ListView x:Name="Types" Grid.Column="0" SelectionChanged="TypeSelected"
+                                  ItemsSource="{Binding}" VirtualizingPanel.IsVirtualizing="True"
+                                  VirtualizingPanel.VirtualizationMode="Recycling">
+                            <ListView.View><GridView>
+                                <GridViewColumn Header="Type" Width="280" DisplayMemberBinding="{Binding Label}" />
+                                <GridViewColumn Header="Parameters" Width="90" DisplayMemberBinding="{Binding ParameterCount}" />
+                            </GridView></ListView.View>
+                        </ListView>
+                        <GridSplitter Grid.Column="1" Width="8" HorizontalAlignment="Stretch"
+                                      VerticalAlignment="Stretch" ResizeDirection="Columns" />
+                        <DockPanel Grid.Column="2" Margin="12,8,8,8">
+                            <TextBlock x:Name="TypeTitle" DockPanel.Dock="Top" FontWeight="SemiBold"
+                                       Text="Select a type" Margin="0,0,0,8" />
+                            <Expander Header="Advanced" DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                                <TextBox x:Name="TypeAdvanced" IsReadOnly="True" FontFamily="Consolas"
+                                         TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                                         HorizontalScrollBarVisibility="Auto" MaxHeight="190" />
+                            </Expander>
+                            <TextBox x:Name="TypeDetails" IsReadOnly="True" TextWrapping="Wrap"
+                                     VerticalScrollBarVisibility="Auto" BorderThickness="0"
+                                     Background="Transparent" VerticalContentAlignment="Top" />
+                        </DockPanel>
+                    </Grid>
+                </TabItem>
+                <TabItem Header="Layouts">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="2*" MinWidth="220" />
+                            <ColumnDefinition Width="8" />
+                            <ColumnDefinition Width="3*" MinWidth="260" />
+                        </Grid.ColumnDefinitions>
+                        <ListView x:Name="Layouts" Grid.Column="0" SelectionChanged="LayoutSelected"
+                                  VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
+                            <ListView.View><GridView>
+                                <GridViewColumn Header="Layout" Width="280" DisplayMemberBinding="{Binding Label}" />
+                                <GridViewColumn Header="Members" Width="80" DisplayMemberBinding="{Binding MemberCount}" />
+                                <GridViewColumn Header="Parent" Width="95" DisplayMemberBinding="{Binding ParentStatus}" />
+                            </GridView></ListView.View>
+                        </ListView>
+                        <GridSplitter Grid.Column="1" Width="8" HorizontalAlignment="Stretch"
+                                      VerticalAlignment="Stretch" ResizeDirection="Columns" />
+                        <DockPanel Grid.Column="2" Margin="12,8,8,8">
+                            <TextBlock x:Name="LayoutTitle" DockPanel.Dock="Top" FontWeight="SemiBold"
+                                       Text="Select a layout" Margin="0,0,0,8" />
+                            <Expander Header="Advanced" DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                                <TextBox x:Name="LayoutAdvanced" IsReadOnly="True" FontFamily="Consolas"
+                                         TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                                         HorizontalScrollBarVisibility="Auto" MaxHeight="190" />
+                            </Expander>
+                            <TextBox x:Name="LayoutDetails" IsReadOnly="True" TextWrapping="Wrap"
+                                     VerticalScrollBarVisibility="Auto" BorderThickness="0"
+                                     Background="Transparent" VerticalContentAlignment="Top" />
+                        </DockPanel>
+                    </Grid>
+                </TabItem>
+                <TabItem Header="Items">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="2*" MinWidth="220" />
+                            <ColumnDefinition Width="8" />
+                            <ColumnDefinition Width="3*" MinWidth="260" />
+                        </Grid.ColumnDefinitions>
+                        <ListView x:Name="Items" Grid.Column="0" SelectionChanged="ItemSelected"
+                                  VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
+                            <ListView.View><GridView>
+                                <GridViewColumn Header="Item" Width="250" DisplayMemberBinding="{Binding Label}" />
+                                <GridViewColumn Header="Type" Width="220" DisplayMemberBinding="{Binding TypeLabel}" />
+                                <GridViewColumn Header="Status" Width="90" DisplayMemberBinding="{Binding Status}" />
+                            </GridView></ListView.View>
+                        </ListView>
+                        <GridSplitter Grid.Column="1" Width="8" HorizontalAlignment="Stretch"
+                                      VerticalAlignment="Stretch" ResizeDirection="Columns" />
+                        <DockPanel Grid.Column="2" Margin="12,8,8,8">
+                            <TextBlock x:Name="ItemTitle" DockPanel.Dock="Top" FontWeight="SemiBold"
+                                       Text="Select an item" Margin="0,0,0,8" />
+                            <Expander Header="Advanced" DockPanel.Dock="Bottom" Margin="0,10,0,0">
+                                <TextBox x:Name="ItemAdvanced" IsReadOnly="True" FontFamily="Consolas"
+                                         TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                                         HorizontalScrollBarVisibility="Auto" MaxHeight="190" />
+                            </Expander>
+                            <TextBox x:Name="ItemDetails" IsReadOnly="True" TextWrapping="Wrap"
+                                     VerticalScrollBarVisibility="Auto" BorderThickness="0"
+                                     Background="Transparent" VerticalContentAlignment="Top" />
+                        </DockPanel>
+                    </Grid>
+                </TabItem>
+            </TabControl>
+            <GridSplitter x:Name="DiagnosticsSplitter" Grid.Row="1" Height="8"
+                          HorizontalAlignment="Stretch" VerticalAlignment="Center"
+                          ResizeDirection="Rows" Visibility="Collapsed" />
+            <Expander x:Name="DiagnosticsExpander" Grid.Row="2" Header="Diagnostics" IsExpanded="False"
+                      Expanded="DiagnosticsExpanded" Collapsed="DiagnosticsCollapsed">
+                <ListView x:Name="Diagnostics" MaxHeight="130" IsTabStop="False">
+                    <ListView.View><GridView>
+                        <GridViewColumn Header="Stage" Width="150" DisplayMemberBinding="{Binding Stage}" />
+                        <GridViewColumn Header="Code" Width="500" DisplayMemberBinding="{Binding Code}" />
+                    </GridView></ListView.View>
+                </ListView>
+            </Expander>
+        </Grid>
+
+        <TextBlock x:Name="Status" Grid.Row="2" Margin="0,8,0,0" VerticalAlignment="Bottom"
+                   IsHitTestVisible="False" />
+    </Grid>
+</UserControl>
