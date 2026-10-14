@@ -20,7 +20,9 @@ public sealed class TextureCurrentRoleProjectionTests
         Assert.Contains("(p.ordinal,p.identity)>($cursor,$identity)", command.CommandText);
         command.CommandText = "EXPLAIN QUERY PLAN " + command.CommandText;
         var plan = new List<string>(); using (var reader = command.ExecuteReader()) while (reader.Read()) plan.Add(reader.GetString(3));
-        Assert.Contains(plan, line => line.Contains("texture_current_ordinal", StringComparison.Ordinal) && line.Contains("ordinal>?", StringComparison.Ordinal));
+        Assert.True(plan.Any(line => line.Contains("texture_current_ordinal", StringComparison.Ordinal) &&
+            (line.Contains("ordinal>?", StringComparison.Ordinal) || line.Contains("(ordinal,identity)>", StringComparison.Ordinal))),
+            string.Join(Environment.NewLine, plan));
         Assert.DoesNotContain(plan, line => line.Contains("TEMP B-TREE", StringComparison.Ordinal));
         Assert.DoesNotContain(plan, line => line.StartsWith("SCAN p", StringComparison.Ordinal));
     }
@@ -52,7 +54,7 @@ public sealed class TextureCurrentRoleProjectionTests
         Assert.Equal(0, fixture.Count("texture_projection_current_roles")); Assert.Equal(1, fixture.Count("texture_projection_current_role_rows"));
         Assert.Null(store.LoadTextureProjectionDetails("roles", store.CaptureTextureProjectionGeneration("roles"), baseline.Identity));
         Assert.Equal(TextureNameKind.Fallback, Assert.Single(store.QueryTextureProjections("roles",
-            store.CaptureTextureProjectionGeneration("roles"), new())).Entries).NameKind);
+            store.CaptureTextureProjectionGeneration("roles"), new()).Entries).NameKind);
     }
 
     [Fact]

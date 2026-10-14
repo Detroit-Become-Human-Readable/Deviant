@@ -11,6 +11,36 @@ namespace Deviant.Texture.Tests;
 public sealed class FeatureStoreTextureReadTests
 {
     [Fact]
+    public async Task ReaderDoesNotCaptureTheCallingSynchronizationContext()
+    {
+        using var fixture = await ProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        store.InitializeTextureProjections("context", [fixture.Entry("Generated texture")]);
+        using var lease = store.AcquireTextureProjectionReadLease("context");
+        var context = new CountingContext();
+        var previous = SynchronizationContext.Current;
+        Task<TextureDiscoveryFilterOptions> read;
+        try
+        {
+            SynchronizationContext.SetSynchronizationContext(context);
+            read = lease.ReadFilterOptionsAsync();
+        }
+        finally { SynchronizationContext.SetSynchronizationContext(previous); }
+        await read.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0, context.Posts);
+    }
+
+    private sealed class CountingContext : SynchronizationContext
+    {
+        public int Posts;
+        public override void Post(SendOrPostCallback callback, object? state)
+        {
+            Interlocked.Increment(ref Posts);
+            ThreadPool.QueueUserWorkItem(_ => callback(state));
+        }
+    }
+
+    [Fact]
     public async Task OptionsLeaseKeepsOneSourceGenerationAndCancellationDoesNotPoisonLaterReads()
     {
         using var fixture = await ProjectionFixture.CreateAsync();
@@ -80,7 +110,7 @@ public sealed class FeatureStoreTextureReadTests
         {
             releaseWriter.Set();
             await holder.WaitAsync(TimeSpan.FromSeconds(5));
-            Assert.True(false, "The generated writer did not acquire its gate.");
+            Assert.Fail("The generated writer did not acquire its gate.");
         }
 
         try
@@ -116,7 +146,7 @@ public sealed class FeatureStoreTextureReadTests
 
         store.Dispose();
 
-        Assert.Throws<ObjectDisposedException>(() => lease.ReadFilterOptionsAsync());
+        Assert.Throws<ObjectDisposedException>(() => { _ = lease.ReadFilterOptionsAsync(); });
     }
 
     private static T Field<T>(object target, string name) where T : class =>

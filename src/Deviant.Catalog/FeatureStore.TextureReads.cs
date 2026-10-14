@@ -1,4 +1,5 @@
 using Deviant.Assets;
+using Deviant.Core;
 using Microsoft.Data.Sqlite;
 
 namespace Deviant.Catalog;
@@ -229,7 +230,7 @@ public sealed partial class FeatureStore
             lock (gate)
             {
                 ObjectDisposedException.ThrowIf(disposed, this);
-                return readTask ??= owner.ReadTextureProjectionFiltersAsync(this, token);
+                return readTask ??= Task.Run(() => owner.ReadTextureProjectionFiltersAsync(this, token));
             }
         }
 
