@@ -10,6 +10,46 @@ namespace Deviant.Texture.Tests;
 
 public sealed class TextureBrowseGenerationTests
 {
+    [Theory]
+    [InlineData("TextureHistoryRowEvents", "sqlite_autoindex_texture_projection_rows_1")]
+    [InlineData("TextureHistoryAliasEvents", "sqlite_autoindex_texture_projection_alias_versions_1")]
+    public async Task HistoryRefreshSeeksChangedIdentitiesInsteadOfScanningTheProfile(string eventQuery, string sourceIndex)
+    {
+        using var fixture = await GeneratedTextureProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        store.InitializeTextureProjections("history-plan", [fixture.Entry("Generated texture")]);
+        string sql = (string)typeof(FeatureStore).GetField(eventQuery, BindingFlags.NonPublic | BindingFlags.Static)!.GetRawConstantValue()!;
+        using var command = Field<SqliteConnection>(store, "connection").CreateCommand();
+        command.CommandText = "EXPLAIN QUERY PLAN " + sql;
+        command.Parameters.AddWithValue("$revision", SourceIdentity.DerivedCacheKey(fixture.Revision.IndexContentId, fixture.Revision.PhysicalSourceStamp));
+        command.Parameters.AddWithValue("$profile", "history-plan");
+        var plan = new List<string>(); using var rows = command.ExecuteReader(); while (rows.Read()) plan.Add(rows.GetString(3));
+        Assert.Contains("texture_projection_history_dirty", plan[0], StringComparison.Ordinal);
+        Assert.Contains(plan, step => step.Contains(sourceIndex, StringComparison.Ordinal) && step.Contains("identity=?", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task HistoricalRolesStayCompleteWhenTheCurrentBackfillIsMissing()
+    {
+        using var fixture = await GeneratedTextureProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        var first = fixture.Entry("Texture A"); var second = fixture.Entry("Texture B", 2);
+        store.InitializeTextureProjections("role-coverage", [first, second]);
+        store.CommitTextureProjectionOwner("role-coverage", fixture.Checkpoint,
+            [fixture.Named(first, 32, 16, "BC1", "Diffuse", "Room"), fixture.Named(second, 64, 32, "BC3", "Normal", "Hall")]);
+        using (var remove = Field<SqliteConnection>(store, "connection").CreateCommand())
+        {
+            remove.CommandText = "DELETE FROM texture_projection_current_roles WHERE profile='role-coverage'; " +
+                "DELETE FROM texture_projection_current_role_rows WHERE profile='role-coverage'; " +
+                "DELETE FROM texture_projection_current_role_state WHERE profile='role-coverage';";
+            remove.ExecuteNonQuery();
+        }
+        using var pinned = store.AcquireTextureBrowseReadLease("role-coverage", fixture.Revision);
+        var response = await pinned.ReadAsync(new());
+        Assert.Equal(new[] { "Diffuse", "Normal" }, response.Options.VerifiedRoles);
+        Assert.Equal(2, response.Page.Total);
+    }
+
     [Fact]
     public async Task CatalogLabelsAndMembershipStayWithTheirPublishedGeneration()
     {

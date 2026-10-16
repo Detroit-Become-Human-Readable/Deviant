@@ -803,22 +803,29 @@ public sealed partial class FeatureStore
         return current ? projection : projection.Replace("p.thin", "(SELECT r.thin FROM texture_projection_rows r WHERE r.revision=p.revision AND r.profile=p.profile AND r.identity=p.identity AND r.generation=" + HistoricalTextureDataGeneration + ")", StringComparison.Ordinal);
     }
 
+    private const string TextureHistoryRowEvents = """
+        SELECT r.revision,r.profile,r.identity,r.generation FROM texture_projection_history_dirty d
+            CROSS JOIN texture_projection_rows r WHERE d.revision=$revision AND d.profile=$profile
+            AND r.revision=d.revision AND r.profile=d.profile AND r.identity=d.identity
+        """;
+    private const string TextureHistoryAliasEvents = """
+        SELECT a.revision,a.profile,a.identity,a.generation FROM texture_projection_history_dirty d
+            CROSS JOIN texture_projection_alias_versions a WHERE d.revision=$revision AND d.profile=$profile
+            AND a.revision=d.revision AND a.profile=d.profile AND a.identity=d.identity
+        """;
+
     private void RefreshTextureHistory(string profile, SqliteTransaction transaction)
     {
         using var diagnostic = TextureDiagnostic("TextureBrowser.Store.HistoryIndex", TextureDiagnosticKey());
         using var pending = TextureCommand("SELECT 1 FROM texture_projection_history_dirty WHERE revision=$revision AND profile=$profile LIMIT 1", profile, transaction);
         if (pending.ExecuteScalar() is null) return;
-        using var refresh = TextureCommand("""
+        using var refresh = TextureCommand($$"""
             DELETE FROM texture_projection_history_index AS h WHERE h.revision=$revision AND h.profile=$profile
                 AND h.identity IN(SELECT identity FROM texture_projection_history_dirty WHERE revision=$revision AND profile=$profile);
             WITH events AS (
-                SELECT r.revision,r.profile,r.identity,r.generation FROM texture_projection_rows r
-                    JOIN texture_projection_history_dirty d ON d.revision=r.revision AND d.profile=r.profile AND d.identity=r.identity
-                    WHERE r.revision=$revision AND r.profile=$profile
+                {{TextureHistoryRowEvents}}
                 UNION
-                SELECT a.revision,a.profile,a.identity,a.generation FROM texture_projection_alias_versions a
-                    JOIN texture_projection_history_dirty d ON d.revision=a.revision AND d.profile=a.profile AND d.identity=a.identity
-                    WHERE a.revision=$revision AND a.profile=$profile
+                {{TextureHistoryAliasEvents}}
             ), timeline AS (
                 SELECT e.*,LEAD(e.generation) OVER(PARTITION BY e.revision,e.profile,e.identity ORDER BY e.generation) AS next_generation,
                     (SELECT MAX(r.generation) FROM texture_projection_rows r WHERE r.revision=e.revision AND r.profile=e.profile
@@ -1019,13 +1026,14 @@ public sealed partial class FeatureStore
             "formats" => "SELECT DISTINCT p.format" + from + " WHERE " + scope + " AND p.format IS NOT NULL ORDER BY p.format",
             "contexts" => "SELECT DISTINCT p.context_key,p.context_label" + from + " WHERE " + scope +
                 " AND p.context_key IS NOT NULL AND p.context_label IS NOT NULL ORDER BY p.context_label",
-            // Drive the current/historical scalar rows first. Starting from links scans every retired generation.
+            // The current role cache has explicit per-row receipts; historical reads seek each role's active source version.
             "roles" when current => "SELECT DISTINCT l.role FROM texture_projection_current_roles l " +
                 "JOIN texture_projection_current_role_rows p ON p.revision=l.revision AND p.profile=l.profile AND p.identity=l.identity AND p.generation=l.generation " +
                 "WHERE l.revision=$revision AND l.profile=$profile ORDER BY l.role",
-            "roles" => "SELECT DISTINCT l.role" + from + " CROSS JOIN texture_projection_links l INDEXED BY sqlite_autoindex_texture_projection_links_1 WHERE " + scope +
-                " AND l.revision=p.revision AND l.profile=p.profile AND l.identity=p.identity AND l.generation=" + HistoricalTextureDataGeneration +
-                " AND l.relation=0 AND l.verified=1 AND l.role!='' ORDER BY l.role",
+            "roles" => "SELECT DISTINCT l.role FROM texture_projection_links l INDEXED BY texture_projection_role " +
+                "WHERE l.revision=$revision AND l.profile=$profile AND l.relation=0 AND l.verified=1 AND l.role!='' " +
+                "AND l.generation=(SELECT MAX(r.generation) FROM texture_projection_rows r " +
+                "WHERE r.revision=l.revision AND r.profile=l.profile AND r.identity=l.identity AND r.generation<=$generation) ORDER BY l.role",
             _ => throw new ArgumentOutOfRangeException(nameof(facet))
         };
         var command = readConnection is null ? TextureCommand(sql, profile, transaction) : readConnection.CreateCommand();

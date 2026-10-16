@@ -77,7 +77,7 @@ public sealed class TextureProjectionOptionsTests
     [InlineData(false, "formats")]
     [InlineData(false, "contexts")]
     [InlineData(false, "roles")]
-    public async Task OptionsReadCoveringScalarsAndDriveRoleLookupsFromTheRequestedProjection(bool current, string facet)
+    public async Task OptionsReadCoveringScalarsAndSeekTheActiveRoleVersions(bool current, string facet)
     {
         using var fixture = await Fixture.CreateAsync(); using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
         var baseline = fixture.Entry("Generated texture"); store.InitializeTextureProjections("options", [baseline]);
@@ -99,15 +99,15 @@ public sealed class TextureProjectionOptionsTests
             Assert.Contains(plan, line => line.Contains("texture_current_role_values", StringComparison.Ordinal));
             Assert.DoesNotContain(plan, line => line.Contains("texture_projection_links", StringComparison.Ordinal));
         }
-        else Assert.Contains(plan, line => line.Contains("COVERING INDEX " + expectedIndex, StringComparison.Ordinal));
+        else if (facet != "roles") Assert.Contains(plan, line => line.Contains("COVERING INDEX " + expectedIndex, StringComparison.Ordinal));
         if (!current && facet == "roles")
         {
-            int projection = plan.FindIndex(line => line.Contains(expectedIndex, StringComparison.Ordinal));
-            int role = plan.FindIndex(line => line.Contains("sqlite_autoindex_texture_projection_links_1", StringComparison.Ordinal));
-            Assert.True(projection >= 0 && role > projection, string.Join("\n", plan));
-            Assert.Contains(plan, line => line.Contains("sqlite_autoindex_texture_projection_links_1", StringComparison.Ordinal) &&
-                line.Contains("identity=?", StringComparison.Ordinal) && line.Contains("generation=?", StringComparison.Ordinal) &&
-                line.Contains("relation=?", StringComparison.Ordinal));
+            Assert.Contains(plan, line => line.Contains("COVERING INDEX texture_projection_role", StringComparison.Ordinal));
+            Assert.DoesNotContain(plan, line => line.Contains("texture_projection_history_index", StringComparison.Ordinal) ||
+                line.Contains("texture_history_options", StringComparison.Ordinal));
+            Assert.Contains(plan, line => line.Contains("sqlite_autoindex_texture_projection_rows_1", StringComparison.Ordinal) &&
+                line.Contains("identity=?", StringComparison.Ordinal) && line.Contains("generation<?", StringComparison.Ordinal) &&
+                line.Contains("revision=?", StringComparison.Ordinal));
         }
     }
 
