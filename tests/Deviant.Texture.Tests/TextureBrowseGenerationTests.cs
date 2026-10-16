@@ -10,6 +10,59 @@ namespace Deviant.Texture.Tests;
 
 public sealed class TextureBrowseGenerationTests
 {
+    [Fact]
+    public async Task UnpublishedSessionRebindsWithinItsFirstReadSnapshot()
+    {
+        using var fixture = await GeneratedTextureProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        using var writer = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        string profile = "first-read-" + Guid.NewGuid().ToString("N");
+        var first = fixture.Entry("Texture A"); var second = fixture.Entry("Texture B", 2);
+        store.InitializeTextureProjections(profile, [first]);
+        using var pin = store.AcquireTextureBrowseReadLease(profile, fixture.Revision, rebindUnpublished: true);
+        long replacement = writer.InitializeTextureProjections(profile, [first, second]);
+        int publications = 0;
+        using var observer = AssetLoadDiagnostics.Listener.Subscribe(new CounterObserver(value =>
+        {
+            if (value.Stage != "TextureBrowser.Store.BrowseSnapshot" || value.Key != profile) return;
+            if (Interlocked.Increment(ref publications) == 1) writer.InitializeTextureProjections(profile, [first]);
+        }));
+        var response = await pin.ReadAsync(new());
+        Assert.Equal(replacement, response.Token.Generation); Assert.Equal(response.Token, pin.Token);
+        Assert.Equal(2, response.Page.Total); Assert.Equal(2, response.Coverage.Resources);
+        Assert.Equal(2, response.Page.Entries.Count);
+        Assert.Equal("TextureBrowseGenerationUnavailable", (await Assert.ThrowsAsync<ArchiveException>(() => pin.ReadAsync(new()))).Code);
+    }
+
+    [Fact]
+    public async Task UnpublishedLocationReadsTheReplacementPageAndCoverageTogether()
+    {
+        using var fixture = await GeneratedTextureProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        var first = fixture.Entry("Texture A"); var second = fixture.Entry("Texture B", 2);
+        store.InitializeTextureProjections("locate-replacement", [first]);
+        using var pin = store.AcquireTextureBrowseReadLease("locate-replacement", fixture.Revision, rebindUnpublished: true);
+        long replacement = store.InitializeTextureProjections("locate-replacement", [first, second]);
+        var response = Assert.IsType<TextureBrowseResponse>(await pin.LocateAsync(second.Identity, new(Limit: 1)));
+        Assert.Equal(replacement, response.Token.Generation); Assert.Equal(response.Token, pin.Token);
+        Assert.Equal(1, response.Page.Offset); Assert.Equal(second.Identity, Assert.Single(response.Page.Entries).Identity);
+        Assert.Equal(2, response.Page.Total); Assert.Equal(2, response.Coverage.Resources);
+    }
+
+    [Fact]
+    public async Task PublishedSessionsDoNotRebindSilently()
+    {
+        using var fixture = await GeneratedTextureProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        var first = fixture.Entry("Texture A");
+        store.InitializeTextureProjections("published-pin", [first]);
+        using var pin = store.AcquireTextureBrowseReadLease("published-pin", fixture.Revision, rebindUnpublished: true);
+        var published = await pin.ReadAsync(new());
+        store.InitializeTextureProjections("published-pin", [first, fixture.Entry("Texture B", 2)]);
+        Assert.Equal("TextureBrowseGenerationUnavailable", (await Assert.ThrowsAsync<ArchiveException>(() => pin.ReadAsync(new()))).Code);
+        Assert.Equal(published.Token, pin.Token);
+    }
+
     [Theory]
     [InlineData("TextureHistoryRowEvents", "sqlite_autoindex_texture_projection_rows_1")]
     [InlineData("TextureHistoryAliasEvents", "sqlite_autoindex_texture_projection_alias_versions_1")]

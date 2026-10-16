@@ -17,6 +17,30 @@ namespace Deviant.Texture.Tests;
 public sealed class TextureDiscoverySessionTests
 {
     [Fact]
+    public async Task FirstBrowserPageSurvivesRepairBeforeItsReadStarts()
+    {
+        using var fixture = new DiscoveryFixture();
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        await using var native = new NativeTextureSession(catalogs);
+        var cache = new CacheManager(fixture.Settings, new(fixture.Cache));
+        await using var discovery = new TextureDiscoverySession(catalogs, native, new AliasStore(fixture.Library), cache);
+        await discovery.EnrichmentTask; discovery.Cancel();
+        await using var browsing = await discovery.OpenBrowseAsync(new());
+        var type = typeof(TextureDiscoverySession);
+        var store = (FeatureStore)type.GetField("features", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(discovery)!;
+        var baseline = (Dictionary<ResourceIdentity, TextureDiscoveryEntry>)type.GetField("projectionBaseline", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(discovery)!;
+        string profile = (string)type.GetProperty("ProjectionProfile", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(discovery)!;
+        var entry = Assert.Single(baseline.Values);
+        store.InitializeTextureProjections(profile, [entry, entry with { Identity = new(snapshot.IndexContentId, 99) }]);
+        long replacement = store.InitializeTextureProjections(profile, [entry]);
+        var response = await browsing.ReadAsync(new());
+        Assert.Equal(replacement, response.Token.Generation); Assert.Equal(1, response.Page.Total);
+        Assert.Equal(TextureNameKind.Fallback, Assert.Single(response.Page.Entries).NameKind);
+        Assert.Empty(response.Options.Formats); Assert.Equal(1, response.Coverage.FallbackNames);
+    }
+
+    [Fact]
     public async Task CorruptEntryRepairDoesNotPublishMixedGenerations()
     {
         using var fixture = new DiscoveryFixture();
@@ -30,6 +54,7 @@ public sealed class TextureDiscoverySessionTests
         await using var browse = await discovery.OpenBrowseAsync(new());
         await using var secondPin = await discovery.OpenBrowseAsync(new());
         var before = await browse.ReadAsync(new());
+        Assert.Equal(before.Token, (await secondPin.ReadAsync(new())).Token);
         var entry = Assert.Single(before.Page.Entries);
         Assert.Equal("environment.dds", entry.Label);
         using (var db = new SqliteConnection(new SqliteConnectionStringBuilder

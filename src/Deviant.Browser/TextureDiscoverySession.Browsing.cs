@@ -51,7 +51,7 @@ public sealed partial class TextureDiscoverySession
                 new Dictionary<string, long> { ["ProjectionReady"] = projectionReady ? 1 : 0 });
             if (store is not null)
                 lease = store.AcquireTextureBrowseReadLease(ProjectionProfile, Revision, token: own.Token,
-                    evidenceValidator: ValidBrowseEvidence);
+                    evidenceValidator: ValidBrowseEvidence, rebindUnpublished: true);
             TextureBrowseResponse? memory = null;
             if (lease is null)
             {
@@ -183,19 +183,13 @@ public sealed partial class TextureDiscoverySession
             try
             {
                 owner.EnsureBrowseSourceCurrent(source.Session, own.Token);
-                if (identity is not null)
+                if (identity is not null && lease is null)
                 {
-                    long? offset;
-                    if (lease is not null) offset = await lease.FindPageOffsetAsync(identity, query, own.Token).ConfigureAwait(false);
-                    else
-                    {
-                        int index = -1;
-                        for (int i = 0; i < memory!.Page.Entries.Count; i++)
-                            if (memory.Page.Entries[i].Identity == identity) { index = i; break; }
-                        offset = index < 0 ? null : index / query.Limit * query.Limit;
-                    }
-                    if (offset is null) return null;
-                    query = query with { Offset = offset.Value };
+                    int index = -1;
+                    for (int i = 0; i < memory!.Page.Entries.Count; i++)
+                        if (memory.Page.Entries[i].Identity == identity) { index = i; break; }
+                    if (index < 0) return null;
+                    query = query with { Offset = index / query.Limit * query.Limit };
                 }
                 TextureBrowseResponse result;
                 if (lease is null)
@@ -206,25 +200,29 @@ public sealed partial class TextureDiscoverySession
                 }
                 else
                 {
-                    try { result = await lease.ReadAsync(query, own.Token).ConfigureAwait(false); }
+                    async Task<TextureBrowseResponse?> ReadPageAsync() => identity is null
+                        ? await lease!.ReadAsync(query, own.Token).ConfigureAwait(false)
+                        : await lease!.LocateAsync(identity, query, own.Token).ConfigureAwait(false);
+                    try
+                    {
+                        var response = await ReadPageAsync().ConfigureAwait(false);
+                        if (response is null) return null;
+                        result = response;
+                    }
                     catch (TextureBrowseEvidenceException error)
                     {
                         own.Token.ThrowIfCancellationRequested();
                         lock (owner.projectionStoreGate)
                         {
                             own.Token.ThrowIfCancellationRequested();
-                            owner.RepairProjectedPage(store!, error.Identities, own.Token, validationGeneration: lease.Token.Generation);
+                            owner.RepairProjectedPage(store!, error.Identities, own.Token, validationGeneration: error.Generation ?? lease.Token.Generation);
                         }
                         lease.Dispose();
                         lease = store!.AcquireTextureBrowseReadLease(owner.ProjectionProfile, owner.Revision, token: own.Token,
-                            evidenceValidator: owner.ValidBrowseEvidence);
-                        if (identity is not null)
-                        {
-                            var offset = await lease.FindPageOffsetAsync(identity, query, own.Token).ConfigureAwait(false);
-                            if (offset is null) return null;
-                            query = query with { Offset = offset.Value };
-                        }
-                        result = await lease.ReadAsync(query, own.Token).ConfigureAwait(false);
+                            evidenceValidator: owner.ValidBrowseEvidence, rebindUnpublished: true);
+                        var response = await ReadPageAsync().ConfigureAwait(false);
+                        if (response is null) return null;
+                        result = response;
                     }
                 }
                 owner.EnsureBrowseSourceCurrent(source.Session, own.Token);
