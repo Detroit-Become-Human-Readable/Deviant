@@ -16,6 +16,7 @@ public sealed class ArchiveSourceSession : IDisposable
     private readonly CancellationTokenSource lifetime = new();
     private readonly SemaphoreSlim io = new(4, 4);
     private readonly object gate = new();
+    private readonly TaskCompletionSource pinsReleased = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Dictionary<uint, Pin> volumes = [];
     private readonly ConcurrentDictionary<RangeKey, Lazy<Task>> verified = new();
     private readonly ConcurrentDictionary<ReadKey, SharedRead> reads = new();
@@ -349,12 +350,18 @@ public sealed class ArchiveSourceSession : IDisposable
 
     private void ReleasePins()
     {
-        foreach (var pin in volumes.Values) pin.Handle.Dispose();
-        volumes.Clear(); index?.Handle.Dispose(); index = null;
-        lookupMemory?.Dispose(); lookupMemory = null; ids = null;
-        foreach (var held in projectionMemory) held.Dispose();
-        projectionMemory.Clear(); projections.Clear(); projectionBytes = 0;
-        verified.Clear(); reads.Clear();
+        try
+        {
+            foreach (var pin in volumes.Values) pin.Handle.Dispose();
+            volumes.Clear(); index?.Handle.Dispose(); index = null;
+            lookupMemory?.Dispose(); lookupMemory = null; ids = null;
+            foreach (var held in projectionMemory) held.Dispose();
+            projectionMemory.Clear(); projections.Clear(); projectionBytes = 0;
+            verified.Clear(); reads.Clear();
+            io.Dispose(); lifetime.Dispose();
+            pinsReleased.TrySetResult();
+        }
+        catch (Exception error) { pinsReleased.TrySetException(error); throw; }
     }
 
     private sealed record SharedBuffer(byte[] Bytes, IDisposable? Reservation) : IDisposable
@@ -387,15 +394,30 @@ public sealed class ArchiveSourceSession : IDisposable
     private readonly record struct ReadKey(long Ordinal, long Offset, int Length);
     private readonly record struct RangeKey(uint Package, long Offset, long Length, string Digest);
 
-    public sealed class Lease : IDisposable
+    public sealed class Lease : IDisposable, IAsyncDisposable
     {
         private Slot? slot;
+        private readonly object disposalGate = new();
+        private Task? release;
         public ArchiveSourceSession Session { get; }
         internal Lease(Slot slot, ArchiveSourceSession session) { this.slot = slot; Session = session; }
-        public void Dispose()
+        private Task Release()
         {
-            var current = Interlocked.Exchange(ref slot, null); if (current is null) return;
-            lock (current) if (--Session.owners == 0) { Session.Dispose(); if (ReferenceEquals(current.Session, Session)) current.Session = null; }
+            lock (disposalGate)
+            {
+                if (release is not null) return release;
+                var current = slot!; slot = null;
+                lock (current)
+                {
+                    if (--Session.owners != 0) return release = Task.CompletedTask;
+                    release = Session.pinsReleased.Task;
+                    try { Session.Dispose(); }
+                    finally { if (ReferenceEquals(current.Session, Session)) current.Session = null; }
+                }
+                return release;
+            }
         }
+        public void Dispose() => _ = Release();
+        public ValueTask DisposeAsync() => new(Release());
     }
 }

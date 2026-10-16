@@ -757,6 +757,6 @@ public sealed class SceneRenderSession : IAsyncDisposable
         }
         if (ownsPreparation && preparation is not null) await preparation.DisposeAsync().ConfigureAwait(false);
         references.Dispose(); bindings.Dispose();
-        sourceSession.Dispose();
+        await sourceSession.DisposeAsync().ConfigureAwait(false);
     }
 }

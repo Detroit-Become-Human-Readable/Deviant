@@ -91,7 +91,7 @@ public sealed partial class TextureDiscoverySession
                 return session;
             }
         }
-        catch { lease?.Dispose(); source.Dispose(); throw; }
+        catch { lease?.Dispose(); await source.DisposeAsync().ConfigureAwait(false); throw; }
     }
 
     private ResourceIdentity ParseBrowseCatalog(string key)
@@ -246,8 +246,12 @@ public sealed partial class TextureDiscoverySession
                     try { lease?.Dispose(); }
                     finally
                     {
-                        source.Dispose(); cancellation.Dispose(); serial.Dispose();
-                        lock (owner.gate) owner.browseSessions.Remove(this);
+                        try { await source.DisposeAsync().ConfigureAwait(false); }
+                        finally
+                        {
+                            cancellation.Dispose(); serial.Dispose();
+                            lock (owner.gate) owner.browseSessions.Remove(this);
+                        }
                     }
                 });
                 return new(disposal);

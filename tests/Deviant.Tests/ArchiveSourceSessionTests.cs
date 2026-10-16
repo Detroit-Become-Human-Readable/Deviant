@@ -12,6 +12,46 @@ namespace Deviant.Tests;
 public sealed class ArchiveSourceSessionTests
 {
     [Fact]
+    public async Task FinalAsyncOwnerWaitsForCancelledProducersBeforeReleasingSources()
+    {
+        using var fixture = new ArchiveFixture();
+        fixture.WriteIndex((17, 0, 9, 0, 4, 0, 0)); fixture.WriteVolume(0, [1, 2, 3, 4]);
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        var source = ArchiveSourceSession.Acquire(snapshot);
+        await source.Session.ReadAsync(new(snapshot.IndexContentId, 0), 0, 4);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finishing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pending = source.Session.GetProjectionAsync<object>("generated-cancellation", async token =>
+        {
+            entered.TrySetResult();
+            try { await Task.Delay(Timeout.Infinite, token); }
+            finally { finishing.TrySetResult(); await release.Task; }
+            return (new object(), 0L);
+        });
+        Task closing = Task.CompletedTask;
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            closing = source.DisposeAsync().AsTask();
+            await finishing.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(closing.IsCompleted, "Final owner disposal completed before its cancelled producer released source pins.");
+            release.TrySetResult();
+            await closing.WaitAsync(TimeSpan.FromSeconds(2));
+            using var exclusive = File.Open(fixture.Volume(0), FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            Assert.Equal(4, exclusive.Length);
+            Assert.Null(ArchiveSourceSession.TryAcquire(snapshot));
+        }
+        finally
+        {
+            release.TrySetResult();
+            try { await pending.WaitAsync(TimeSpan.FromSeconds(5)); } catch (OperationCanceledException) { }
+            await closing.WaitAsync(TimeSpan.FromSeconds(5));
+            source.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task VerificationLeaseChecksOnlyConsumedVolumes()
     {
         using var fixture = new ArchiveFixture();

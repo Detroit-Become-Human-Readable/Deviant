@@ -296,7 +296,7 @@ public sealed class CatalogReferenceProvider : ICatalogReferenceProvider, IAsync
         }
         readGate.Dispose();
         reader.Dispose();
-        sourceSession.Dispose();
+        await sourceSession.DisposeAsync().ConfigureAwait(false);
         lifetime.Dispose();
     }
 
