@@ -101,7 +101,7 @@ internal static partial class ConvertedTextureMath
                 var q5 = intermediate[at + 5];
                 var q3 = intermediate[at + 3];
                 var dcTerm = (intermediate[at + 4] + dc + 16) << 13;
-                var dcOpposite = (dc - intermediate[at + 4]) << 13;
+                var dcOpposite = (dc + 16 - intermediate[at + 4]) << 13;
                 var evenPlus = dcTerm + evenA;
                 var evenMinus = dcTerm - evenA;
                 var q1 = intermediate[at + 1];

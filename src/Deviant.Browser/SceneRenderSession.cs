@@ -34,7 +34,8 @@ public sealed class SceneRenderSession : IAsyncDisposable
         CacheManager? preparedCache = null, WorkspacePreparationScheduler? preparation = null)
     {
         this.snapshot = snapshot ?? throw new ArgumentNullException(nameof(snapshot));
-        this.models = models ?? throw new ArgumentNullException(nameof(models));
+        ArgumentNullException.ThrowIfNull(models);
+        this.models = preparedCache is null ? models : models.WithPreparedTextures(preparedCache);
         this.budget = budget ?? throw new ArgumentNullException(nameof(budget));
         if (models.Snapshot.IndexContentId != snapshot.IndexContentId) throw new ArchiveException("SourceChanged", "Model and scene sources differ.");
         sourceSession = ArchiveSourceSession.Acquire(snapshot, (bytes, reason) => budget.Reserve(bytes, reason));
@@ -119,15 +120,17 @@ public sealed class SceneRenderSession : IAsyncDisposable
                 (path, cancellation) => PreparedSceneCodec.ValidateAsync(path, key, Revision, cancellation, budget), token).ConfigureAwait(false);
             if (cached is not null)
             {
+                using var cacheOwner = new RenderResourceGroup();
+                cacheOwner.Add(cached);
                 try
                 {
                     var result = await PreparedSceneCodec.ReadAsync(cached.Path, key, sourceSession.Session,
-                        snapshot, budget, request.AllowLargeData, token).ConfigureAwait(false);
-                    result.OwnPreparedResource(cached);
+                        snapshot, budget, request.AllowLargeData, token, cacheOwner.AcquireLease).ConfigureAwait(false);
+                    result.OwnPreparedResource(cacheOwner.AcquireLease());
                     AssetLoadDiagnostics.Cache("PreparedScene", key, true);
                     return result;
                 }
-                catch { await cached.DisposeAsync().ConfigureAwait(false); throw; }
+                catch { throw; }
             }
         }
         AssetLoadDiagnostics.Cache("PreparedScene", key, false);

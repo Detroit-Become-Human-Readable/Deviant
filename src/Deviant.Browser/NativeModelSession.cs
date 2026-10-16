@@ -1,6 +1,7 @@
 using System.Numerics;
 using Deviant.Assets;
 using Deviant.Core;
+using Deviant.Catalog;
 using Deviant.Formats.Models;
 using Deviant.Formats.Shaders;
 using Deviant.Formats.Textures;
@@ -51,8 +52,14 @@ public sealed partial class NativeModelSession
     public const int MaximumSelections = 8192;
     public const int MaximumLargeSelections = 65_536;
     private readonly NativeTextureSession textures;
-    public NativeModelSession(NativeTextureSession textures, AssetMemoryBudget budget)
-    { this.textures = textures ?? throw new ArgumentNullException(nameof(textures)); MemoryBudget = budget ?? throw new ArgumentNullException(nameof(budget)); }
+    private readonly CacheManager? surfaceDiskCache;
+    public NativeModelSession(NativeTextureSession textures, AssetMemoryBudget budget, CacheManager? preparationCache = null)
+    {
+        this.textures = textures ?? throw new ArgumentNullException(nameof(textures));
+        MemoryBudget = budget ?? throw new ArgumentNullException(nameof(budget)); surfaceDiskCache = preparationCache;
+    }
+    internal NativeModelSession WithPreparedTextures(CacheManager cache)
+        => ReferenceEquals(surfaceDiskCache, cache) ? this : new(textures, MemoryBudget, cache);
     public ArchiveSnapshot Snapshot => textures.Snapshot;
     public SourceRevision Revision => textures.Revision;
     public AssetMemoryBudget MemoryBudget { get; }
@@ -434,7 +441,12 @@ public sealed partial class NativeModelSession
                 extents.AddRange(source.Payloads.Select(payload => payload.Extent));
                 token.ThrowIfCancellationRequested();
                 var pixels = sharedLease.Value;
-                var surface = pixels.EncodedDds is { } encoded
+                var surface = pixels.PixelSource is { } backing
+                    ? TextureSurface.RestoreBackedRgba8(pixels.Width, pixels.Height, backing,
+                        pixels.SourceIsHdr, pixels.IsSrgb, pixels.MipIndex, pixels.SourceFormat,
+                        pixels.SourceFormatName, pixels.SourcePayloadSha256, pixels.Subresource,
+                        identity, source.Revision, pixels.DisplayTransform)
+                    : pixels.EncodedDds is { } encoded
                     ? TextureSurface.RestoreEncodedDds(pixels.Width, pixels.Height, encoded, pixels.SourceIsHdr,
                         pixels.IsSrgb, pixels.MipIndex, pixels.SourceFormat, pixels.SourceFormatName,
                         pixels.SourcePayloadSha256, pixels.Subresource, identity, source.Revision, pixels.EncodedSelection)
@@ -494,7 +506,7 @@ public sealed partial class NativeModelSession
         var plan = NativeTextureDecoder.PlanPreview(source, maximumPreviewDimension, token);
         if (!plan.IsConverted) return new NativeTextureDecoder();
 
-        var decodedBytes = checked((long)plan.Width * plan.Height * 4);
+        var decodedBytes = plan.UsesNativeBlocks ? plan.SelectedEncodedBytes : checked((long)plan.Width * plan.Height * 4);
         const long existingMaximumDecodedBytes = 128L * 1024 * 1024;
         if (decodedBytes > existingMaximumDecodedBytes)
             throw new TextureFormatException("NativeTextureDecodeBudget", "Mip data exceeds the decode budget.");

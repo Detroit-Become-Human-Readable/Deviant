@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using Deviant.Archives;
 using Deviant.Assets;
 using Deviant.Browser;
+using Deviant.Catalog;
 using Deviant.Formats.Textures;
 using Xunit;
 
@@ -10,6 +11,82 @@ namespace Deviant.Texture.Tests;
 
 public sealed class PreparedSceneCodecTests
 {
+    [Fact]
+    public async Task BackedPixelsRoundTripWithoutRetainingEveryTextureArray()
+    {
+        using var fixture = new GeneratedArchive();
+        using var cache = new CacheManager(Path.Combine(fixture.Root, "settings"), new(Path.Combine(fixture.Root, "cache"), 64 * 1024 * 1024));
+        var archive = await new ArchiveReader().OpenAsync(fixture.Index);
+        var revision = new SourceRevision(archive.IndexContentId, archive.PhysicalSourceStamp);
+        var budget = new AssetMemoryBudget();
+        using var source = ArchiveSourceSession.Acquire(archive, (bytes, reason) => budget.Reserve(bytes, reason));
+        var owners = new List<IDisposable>();
+        var textures = new Dictionary<int, RenderTexture>();
+        var expected = new List<byte[]>();
+        for (int index = 0; index < 4; index++)
+        {
+            byte[] pixels = Enumerable.Range(0, 1024 * 1024 * 4).Select(value => (byte)(value + index * 7)).ToArray();
+            expected.Add(pixels);
+            var identity = new ResourceIdentity(archive.IndexContentId, 0, "texture/" + index);
+            var hash = Convert.ToHexString(SHA256.HashData(pixels)).ToLowerInvariant();
+            var resident = TextureSurface.RestoreRgba8(1024, 1024, pixels, false, true, 2,
+                TextureStorageFormat.Rgba8, "RGBA8", hash, new(MipIndex: 2), identity, revision);
+            var prepared = await PreparedTexturePixelSource.StoreAsync(cache, "texture/" + index, resident, hash, budget);
+            owners.Add(prepared);
+            textures.Add(index, new(identity, prepared.Surface, hash));
+        }
+        var aliasId = textures[0].NativeIdentity with { MemberPath = "alias" };
+        textures.Add(4, textures[0] with { NativeIdentity = aliasId });
+        var materialId = new ResourceIdentity(archive.IndexContentId, 0, "material");
+        var material = new RenderMaterial(new(materialId, revision, "generated", [], [], []), textures);
+        var extents = new SourceExtent[] { new(archive.Volumes[0].RelativeName, 0, 4,
+            Convert.ToHexString(SHA256.HashData(new byte[] { 1, 2, 3, 4 }))) };
+        var path = Path.Combine(fixture.Root, "backed.scene");
+        var reads = new PixelReads(fixture.Root);
+        using (var subscription = AssetLoadDiagnostics.Listener.Subscribe(reads))
+        using (var original = new RenderAssetSnapshot(revision, new Dictionary<string, RenderMesh>(), [],
+            new Dictionary<ResourceIdentity, RenderMaterial> { [materialId] = material }, new(Vector3.Zero, Vector3.One),
+            [], [], new(0, 0, 0, 0, 0, 0), extents, budget, owners))
+            await PreparedSceneCodec.WriteAsync(path, "backed", original);
+        Assert.Equal(4, reads.Count);
+        Assert.Equal(0, cache.ActivePreviewLeases);
+        Assert.True(await PreparedSceneCodec.ValidateAsync(path, "backed", revision));
+        long baseline = budget.UsedBytes;
+        using (var restored = await PreparedSceneCodec.ReadAsync(path, "backed", source.Session, archive, budget, false))
+        {
+            var slots = Assert.Single(restored.Materials.Values).TexturesBySlot;
+            Assert.All(slots.Values, texture => Assert.False(texture.Surface.HasRgba8));
+            Assert.All(slots.Values, texture => Assert.NotNull(texture.Surface.PixelSource));
+            Assert.Same(slots[0].Surface.PixelSource, slots[4].Surface.PixelSource);
+            Assert.True(budget.UsedBytes - baseline < 20L * 1024 * 1024);
+            long retained = budget.UsedBytes;
+            for (int index = 0; index < 4; index++)
+            {
+                using (var pixels = await slots[index].Surface.AcquireRgba8Async())
+                {
+                    Assert.Equal(expected[index], pixels.Surface.Rgba8.ToArray());
+                    Assert.True(pixels.Surface.IsSrgb); Assert.Equal(2, pixels.Surface.MipIndex);
+                }
+                Assert.Equal(retained, budget.UsedBytes);
+            }
+        }
+        Assert.Equal(baseline, budget.UsedBytes);
+        using var exclusive = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+    }
+
+    private sealed class PixelReads(string root) : IObserver<KeyValuePair<string, object?>>
+    {
+        public int Count;
+        public void OnNext(KeyValuePair<string, object?> value)
+        {
+            if (value.Value is AssetLoadCounterMeasurement { Stage: "PreparedTexturePixelsReadStarted", Key: { } key } &&
+                key.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                Interlocked.Increment(ref Count);
+        }
+        public void OnCompleted() { }
+        public void OnError(Exception error) { }
+    }
+
     [Fact]
     public async Task RoundTripPreservesGeometryPlacementPixelsAndSharedMaterialExpressions()
     {

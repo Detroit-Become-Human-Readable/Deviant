@@ -1,0 +1,33 @@
+<UserControl x:Class="Deviant.Desktop.RecordCategoriesView"
+             x:ClassModifier="internal"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Foreground="{DynamicResource WindowForeground}">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <TextBlock Text="Records" FontSize="20" FontWeight="SemiBold" />
+        <ScrollViewer Grid.Row="1" Margin="0,12,0,0" VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled">
+            <Grid>
+                <ItemsControl x:Name="CategoryButtons">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <WrapPanel />
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Button Content="{Binding Label}" AutomationProperties.Name="{Binding Label}"
+                                    Width="240" MinHeight="48" Margin="0,0,12,12" Padding="16,10"
+                                    HorizontalContentAlignment="Left" Click="Category_Click" />
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <TextBlock x:Name="EmptyState" Text="No record categories." />
+            </Grid>
+        </ScrollViewer>
+    </Grid>
+</UserControl>

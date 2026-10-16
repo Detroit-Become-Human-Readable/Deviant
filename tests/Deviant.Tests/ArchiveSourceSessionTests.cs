@@ -1,14 +1,78 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using Deviant.Archives;
 using Deviant.Assets;
 using Deviant.Core;
+using Microsoft.Win32.SafeHandles;
 using Xunit;
 
 namespace Deviant.Tests;
 
 public sealed class ArchiveSourceSessionTests
 {
+    [Fact]
+    public async Task VerificationLeaseChecksOnlyConsumedVolumes()
+    {
+        using var fixture = new ArchiveFixture();
+        fixture.WriteIndex((17, 0, 1, 0, 4, 0, 0), (17, 0, 2, 0, 4, 0, 1));
+        fixture.WriteVolume(0, [1, 2, 3, 4]); fixture.WriteVolume(1, [5, 6, 7, 8]);
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        var revisions = new RecordingRevisions();
+        using var source = ArchiveSourceSession.Acquire(snapshot, revisions: revisions);
+        using var other = await new SourceExtentVerifier().AcquireAsync(snapshot, [Extent(snapshot, 1, [5, 6, 7, 8])]);
+        using var selected = await new SourceExtentVerifier().AcquireAsync(snapshot, [Extent(snapshot, 0, [1, 2, 3, 4])]);
+        revisions.Captures.Clear();
+        selected.EnsureUnchanged();
+        Assert.Equal(2, revisions.Captures.GetValueOrDefault(fixture.Index));
+        Assert.Equal(2, revisions.Captures.GetValueOrDefault(fixture.Volume(0)));
+        Assert.Equal(0, revisions.Captures.GetValueOrDefault(fixture.Volume(1)));
+
+        revisions.ChangedPath = fixture.Volume(1);
+        selected.EnsureUnchanged();
+        using var repeated = await new SourceExtentVerifier().AcquireAsync(snapshot, [Extent(snapshot, 0, [1, 2, 3, 4])]);
+        repeated.EnsureUnchanged();
+        Assert.Equal("SourceChanged", Assert.Throws<ArchiveException>(other.EnsureUnchanged).Code);
+        Assert.Equal("SourceChanged", Assert.Throws<ArchiveException>(() => source.Session.EnsureCurrent()).Code);
+    }
+
+    [Theory]
+    [InlineData("index")]
+    [InlineData("first")]
+    [InlineData("second")]
+    public async Task VerificationLeaseStillChecksIndexAndEveryConsumedVolume(string changed)
+    {
+        using var fixture = new ArchiveFixture();
+        fixture.WriteIndex((17, 0, 1, 0, 4, 0, 0), (17, 0, 2, 0, 4, 0, 1));
+        fixture.WriteVolume(0, [1, 2, 3, 4]); fixture.WriteVolume(1, [5, 6, 7, 8]);
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        var revisions = new RecordingRevisions();
+        using var source = ArchiveSourceSession.Acquire(snapshot, revisions: revisions);
+        using var selected = await new SourceExtentVerifier().AcquireAsync(snapshot,
+            [Extent(snapshot, 0, [1, 2, 3, 4]), Extent(snapshot, 1, [5, 6, 7, 8])]);
+        revisions.ChangedPath = changed switch { "index" => fixture.Index, "first" => fixture.Volume(0), _ => fixture.Volume(1) };
+        Assert.Equal("SourceChanged", Assert.Throws<ArchiveException>(selected.EnsureUnchanged).Code);
+    }
+
+    private static SourceExtent Extent(ArchiveSnapshot snapshot, uint package, byte[] bytes) =>
+        new(snapshot.Volumes.Single(volume => volume.Package == package).RelativeName, 0, bytes.Length,
+            Convert.ToHexString(SHA256.HashData(bytes)));
+
+    private sealed class RecordingRevisions : ISourceRevisionProvider
+    {
+        private readonly FileRevisionProvider inner = new();
+        public ConcurrentDictionary<string, int> Captures { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public string? ChangedPath { get; set; }
+        public FileStamp Capture(string path) => Record(path, inner.Capture(path));
+        public FileStamp Capture(SafeFileHandle handle, string path) => Record(path, inner.Capture(handle, path));
+        private FileStamp Record(string path, FileStamp stamp)
+        {
+            Captures.AddOrUpdate(path, 1, (_, count) => count + 1);
+            return StringComparer.OrdinalIgnoreCase.Equals(ChangedPath, path)
+                ? stamp with { LastWriteUtcTicks = stamp.LastWriteUtcTicks + 1 } : stamp;
+        }
+    }
+
     [Fact]
     public async Task RepeatedVerifiedRangesShareOneIndexAndExtentReadWhilePinned()
     {

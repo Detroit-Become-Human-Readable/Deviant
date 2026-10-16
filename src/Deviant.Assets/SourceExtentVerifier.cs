@@ -27,8 +27,15 @@ public sealed class SourceExtentVerifier
         {
             try
             {
-                await shared.Session.VerifyAsync(extents, token, maximumBytes, maximumExtentCount).ConfigureAwait(false);
-                return new SourceExtentVerificationLease(() => shared.Session.EnsureCurrent(), shared);
+                var consumed = extents.ToArray();
+                var names = consumed.Select(extent => extent.RelativeSource).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var packages = snapshot.Volumes.Where(volume => names.Contains(volume.RelativeName))
+                    .Select(volume => volume.Package).Distinct().ToArray();
+                await shared.Session.VerifyAsync(consumed, token, maximumBytes, maximumExtentCount).ConfigureAwait(false);
+                return new SourceExtentVerificationLease(() =>
+                {
+                    foreach (var package in packages) shared.Session.EnsureCurrent(package);
+                }, shared);
             }
             catch { shared.Dispose(); throw; }
         }

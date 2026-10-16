@@ -21,8 +21,10 @@ public static class NativeTextureBlockPacketReader
         long maximumDecodedBytes, CancellationToken token = default)
     {
         token.ThrowIfCancellationRequested();
+        ushort selector = body.Length >= 4 ? BinaryPrimitives.ReadUInt16LittleEndian(body[2..]) : (ushort)0;
+        bool literal = selector == 12;
         if (body.Length < 52 || body.Length > TextureBufferPatternInspector.MaximumStoredBytes ||
-            BinaryPrimitives.ReadUInt16LittleEndian(body) != 16 || BinaryPrimitives.ReadUInt16LittleEndian(body[2..]) != 255 ||
+            BinaryPrimitives.ReadUInt16LittleEndian(body) != 16 || selector is not (12 or 255) ||
             BinaryPrimitives.ReadUInt16LittleEndian(body[6..]) != width || BinaryPrimitives.ReadUInt16LittleEndian(body[8..]) != height ||
             width is < 1 or > DdsTextureReader.MaximumDimension || height is < 1 or > DdsTextureReader.MaximumDimension ||
             (long)width * height > DdsTextureReader.MaximumPixelCount || expectedBytes < 1 || expectedBytes > maximumDecodedBytes || expectedBytes > int.MaxValue)
@@ -32,15 +34,22 @@ public static class NativeTextureBlockPacketReader
         int end = checked((52 + count * 16 + 15) & ~15);
         if (count is < 1 or > 4096 || end > body.Length || footer > 15 || BinaryPrimitives.ReadUInt16LittleEndian(body[42..]) != 0)
             throw Error("InvalidNativeBlockPacket", "The native texture packet directory is invalid.");
+        int headerBytes = end;
+        if (literal && (count != 1 || footer != 0 || expectedBytes != ((width + 3L) / 4) * ((height + 3L) / 4) * 16))
+            throw Error("InvalidNativeBlockPacketSize", "The literal BC3 packet does not match its image size.");
         long total = 0;
         for (int index = 0; index < count; index++)
         {
             token.ThrowIfCancellationRequested();
             var row = Descriptor(body, index);
-            if (row.Offset != ((end + 15) & ~15) || row.Encoded < 1 || row.Decoded is < 1 or > 65536 ||
-                row.Encoded > row.Decoded || row.Offset > body.Length - row.Encoded)
+            int offset = literal ? headerBytes : row.Offset;
+            int alignedEnd = (end + 15) & ~15;
+            bool placement = literal ? row.Offset == 0 || row.Offset == headerBytes
+                : row.Offset == alignedEnd || index > 0 && row.Offset > alignedEnd && row.Offset % (1 << 20) == 0;
+            if (!placement || row.Encoded < 1 || row.Decoded < 1 || row.Decoded > (literal ? expectedBytes : 65536) ||
+                row.Encoded > row.Decoded || literal && row.Encoded != row.Decoded || offset > body.Length - row.Encoded)
                 throw Error("InvalidNativeBlockPacketRange", "The native texture chunk bounds are invalid.");
-            end = checked(row.Offset + row.Encoded); total = checked(total + row.Decoded);
+            end = checked(offset + row.Encoded); total = checked(total + row.Decoded);
             if (total > expectedBytes) throw Error("InvalidNativeBlockPacketSize", "The texture packet exceeds its declared native image size.");
         }
         if (total != expectedBytes || end + footer > body.Length)
@@ -49,7 +58,7 @@ public static class NativeTextureBlockPacketReader
         for (int index = 0; index < count; index++)
         {
             token.ThrowIfCancellationRequested(); var row = Descriptor(body, index);
-            var input = body.Slice(row.Offset, row.Encoded); var destination = output.AsSpan(cursor, row.Decoded);
+            var input = body.Slice(literal ? headerBytes : row.Offset, row.Encoded); var destination = output.AsSpan(cursor, row.Decoded);
             if (row.Encoded == row.Decoded) input.CopyTo(destination);
             else Inflate(input, destination, token);
             cursor += row.Decoded;
@@ -75,7 +84,7 @@ public static class NativeTextureBlockPacketReader
             throw Error("InvalidNativeBlockPacketCompression", "The texture chunk zlib header is invalid.");
         try
         {
-            using var input = new MemoryStream(compressed.ToArray(), writable: false);
+            using var input = new ExactZlibInput(compressed.ToArray());
             using var zlib = new ZLibStream(input, CompressionMode.Decompress);
             int written = 0;
             while (written < output.Length)
@@ -85,12 +94,30 @@ public static class NativeTextureBlockPacketReader
                 written += read;
             }
             if (zlib.ReadByte() != -1) throw new InvalidDataException("The texture chunk exceeds its declared size.");
+            if (input.Position != input.Length)
+                throw new InvalidDataException("The texture chunk contains unused compressed bytes.");
             uint a = 1, b = 0;
             foreach (byte value in output) { a = (a + value) % 65521; b = (b + a) % 65521; }
             if (((b << 16) | a) != BinaryPrimitives.ReadUInt32BigEndian(compressed[^4..]))
                 throw new InvalidDataException("The texture chunk checksum does not match.");
         }
         catch (InvalidDataException error) { throw new TextureFormatException("InvalidNativeBlockPacketCompression", error.Message, error); }
+    }
+
+    private sealed class ExactZlibInput(byte[] bytes) : MemoryStream(bytes, writable: false)
+    {
+        // Keep bulk reads, then feed the final eight bytes individually so inflater
+        // read-ahead cannot conceal bytes after the zlib checksum.
+        private readonly long tailStart = Math.Max(0, bytes.Length - 8);
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            base.Read(buffer, offset, Limit(count));
+
+        public override int Read(Span<byte> buffer) => base.Read(buffer[..Limit(buffer.Length)]);
+
+        private int Limit(int requested) => Position < tailStart
+            ? (int)Math.Min(requested, tailStart - Position)
+            : Math.Min(requested, 1);
     }
 
     private static TextureFormatException Error(string code, string message) => new(code, message);

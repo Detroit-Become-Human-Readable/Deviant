@@ -16,6 +16,15 @@ public sealed record ViewportMaterial(PhongMaterial Material, int TextureCoordin
 
 public static class ViewportMaterials
 {
+    internal static RenderTexture? FindUsableNormalTexture(RenderMaterial? source,
+        IReadOnlySet<int> availableUvSets, bool normalFrameAvailable)
+    {
+        var binding = source?.Asset.Bindings.SingleOrDefault(value => value.Role == MaterialTextureRole.Normal &&
+            source.TexturesBySlot.ContainsKey(value.SlotOrdinal));
+        if (binding is null || !normalFrameAvailable || !availableUvSets.Contains(binding.TextureCoordinateSet)) return null;
+        if (!binding.Evidence.Verified) throw new InvalidDataException("The material binding is unavailable.");
+        return source!.TexturesBySlot[binding.SlotOrdinal];
+    }
     public static ViewportMaterial Create(RenderMaterial? source, Func<RenderTexture, TextureModel> textureProvider,
         IReadOnlySet<int>? availableNormalUvSets = null, bool normalFrameAvailable = true)
     {

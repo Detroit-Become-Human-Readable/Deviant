@@ -86,7 +86,7 @@ public enum TextureToneMapOperator { Reinhard, Aces }
 public sealed record TextureDisplayTransform(TextureToneMapOperator Operator, float ExposureStops,
     bool EncodedSrgb, string Version = "texture-display-v1");
 
-public sealed class TextureSurface
+public sealed partial class TextureSurface
 {
     public static bool CanRetainEncodedDds(DdsTextureDocument document, TextureSubresourceSelection selection,
         CancellationToken token = default)

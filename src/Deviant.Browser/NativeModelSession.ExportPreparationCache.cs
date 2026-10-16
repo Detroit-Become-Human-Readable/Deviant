@@ -467,7 +467,8 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
                     .ToArray()
             },
             Hdr = hdr,
-            NativeDecoder = NativeTextureSession.Version, Surface = "dds-base-mip-rgba-v1"
+            NativeSource = NativeTextureSession.Version, NativeDecoder = NativeTextureDecoder.Version,
+            Surface = "dds-base-mip-rgba-v1"
         }));
 
     public Task<(DdsTextureDocument Document, TextureSurface Surface, IAsyncDisposable Lease)> AcquireTextureAsync(
@@ -477,7 +478,8 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
 
     public static string PlannedTextureKey(NativeTextureExportFingerprint plan, NativeFbxHdrConversion? hdr = null)
         => CacheManager.PreparedKey("export-texture", Profile, JsonSerializer.Serialize(new
-        { Plan = plan, Hdr = hdr, Decoder = NativeTextureSession.Version, Surface = "dds-base-mip-rgba-v1" }));
+        { Plan = plan, Hdr = hdr, Source = NativeTextureSession.Version,
+            Decoder = NativeTextureDecoder.Version, Surface = "dds-base-mip-rgba-v1" }));
 
     /// <summary>Looks up original preparation using metadata before the producer reads any native payloads.</summary>
     public async Task<(DdsTextureDocument Document, TextureSurface Surface, NativeTextureExportSourceEvidence Evidence,

@@ -213,7 +213,7 @@
                     </GroupBox>
                 </StackPanel>
             </ScrollViewer>
-        </Grid><ContentControl x:Name="StringsHost" Visibility="Collapsed" /><ContentControl x:Name="DdsHost" Visibility="Collapsed" /><ContentControl x:Name="AnimationHost" Visibility="Collapsed"/><ContentControl x:Name="ShaderHost" Visibility="Collapsed"/><ContentControl x:Name="PhysicsHost" Visibility="Collapsed"/><ContentControl x:Name="ReferencesHost" Visibility="Collapsed"/><ContentControl x:Name="AssetsHost" Visibility="Collapsed"/><ContentControl x:Name="BufferHost" Visibility="Collapsed"/><ContentControl x:Name="ScenesHost" Visibility="Collapsed"/></Grid>
+        </Grid><Border x:Name="RecordsHost" Visibility="Collapsed"/><ContentControl x:Name="StringsHost" Visibility="Collapsed" /><ContentControl x:Name="DdsHost" Visibility="Collapsed" /><ContentControl x:Name="AnimationHost" Visibility="Collapsed"/><ContentControl x:Name="ShaderHost" Visibility="Collapsed"/><ContentControl x:Name="PhysicsHost" Visibility="Collapsed"/><ContentControl x:Name="ReferencesHost" Visibility="Collapsed"/><ContentControl x:Name="AssetsHost" Visibility="Collapsed"/><ContentControl x:Name="BufferHost" Visibility="Collapsed"/><ContentControl x:Name="ScenesHost" Visibility="Collapsed"/></Grid>
         </Grid>
         </TabItem><TabItem x:Name="CharactersTab" Header="Characters" Visibility="Collapsed" IsEnabled="False"><ContentControl x:Name="CharactersHost"/></TabItem></TabControl>
         </Grid>

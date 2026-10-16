@@ -93,6 +93,15 @@ internal readonly record struct TextureContentKey(SourceRevision Revision, strin
     public static TextureContentKey Create(RenderTexture texture, SourceRevision revision, bool srgb)
     {
         var surface = texture.Surface;
+        if (surface.PixelSource is { } backing)
+        {
+            if (surface.Width <= 0 || surface.Height <= 0 || backing.ByteLength != (long)surface.Width * surface.Height * 4 ||
+                surface.Revision is not null && surface.Revision != revision || backing.RgbaSha256.Length != 64 ||
+                !backing.RgbaSha256.All(Uri.IsHexDigit) ||
+                !string.Equals(backing.RgbaSha256, texture.RgbaSha256, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("The prepared texture identity is invalid.");
+            return new(revision, backing.RgbaSha256.ToUpperInvariant(), surface.Width, surface.Height, srgb);
+        }
         if (surface.Width <= 0 || surface.Height <= 0 || (long)surface.Width * surface.Height * 4 != surface.Rgba8.Length)
             throw new InvalidDataException("The texture pixel layout is invalid.");
         string hash = Convert.ToHexString(SHA256.HashData(surface.Rgba8.Span));
@@ -107,6 +116,16 @@ internal sealed class SharedTexturePool<TResource> where TResource : IDisposable
 {
     private readonly Dictionary<TextureContentKey, Entry> entries = [];
     public int Count => entries.Count;
+
+    public bool TryAcquire(TextureContentKey key, out Lease? lease)
+    {
+        if (entries.TryGetValue(key, out var entry))
+        {
+            checked { entry.References++; }
+            lease = new(this, key, entry.Resource); return true;
+        }
+        lease = null; return false;
+    }
 
     public Lease Acquire(TextureContentKey key, Func<TResource> create)
     {

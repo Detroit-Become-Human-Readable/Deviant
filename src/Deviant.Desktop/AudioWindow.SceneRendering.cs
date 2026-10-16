@@ -112,7 +112,7 @@ public partial class AudioWindow
         if (nativeModels is null || !ReferenceEquals(nativeModels.Textures, textures))
         {
             renderMemoryBudget ??= new();
-            nativeModels = new(textures, renderMemoryBudget);
+            nativeModels = new(textures, renderMemoryBudget, cache);
             sceneRenderer = new(current.Snapshot, nativeModels, renderMemoryBudget, cache, EnsureWorkspacePreparation());
         }
         return sceneRenderer!;

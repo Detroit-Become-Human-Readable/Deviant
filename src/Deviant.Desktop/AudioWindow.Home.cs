@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Threading;
 using Deviant.Core;
 
 namespace Deviant.Desktop;
@@ -7,6 +8,7 @@ namespace Deviant.Desktop;
 public partial class AudioWindow
 {
     private bool synchronizingExplorer;
+    private long explorerSelectionRequest;
     private ArchiveSnapshot? homeTypeSnapshot;
     private HashSet<uint> homeResourceTypes = [];
 
@@ -70,6 +72,7 @@ public partial class AudioWindow
                 case "characters": await ShowCharactersCoreAsync(linked.Token, navigation); break;
                 case "textures": await ShowTexturesAsync(linked.Token); break;
                 case "scenes": await ShowScenesAsync(linked.Token); break;
+                case "records": ShowRecords(); break;
                 case "animation": await ShowAnimationAsync(linked.Token); break;
                 case "shader-picker":
                     var choice = ContainerChoiceDialog.Read(this, session.Snapshot);
@@ -84,13 +87,24 @@ public partial class AudioWindow
 
     private void SelectExplorerView(string view)
     {
-        synchronizingExplorer = true;
-        try
+        var request = ++explorerSelectionRequest;
+        var navigation = navigationGeneration;
+        if (ExplorerTree.SelectedItem is NavigationItem selected && selected.View == view) return;
+        TrySelect(allowRetry: true);
+
+        void TrySelect(bool allowRetry)
         {
-            ExplorerTree.UpdateLayout();
-            Select(ExplorerTree);
+            if (request != explorerSelectionRequest || navigation != navigationGeneration || closingInProgress) return;
+            if (ExplorerTree.SelectedItem is NavigationItem current && current.View == view) return;
+            var previousSynchronization = synchronizingExplorer;
+            synchronizingExplorer = true;
+            try
+            {
+                if (!Select(ExplorerTree) && allowRetry)
+                    Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () => TrySelect(allowRetry: false));
+            }
+            finally { synchronizingExplorer = previousSynchronization; }
         }
-        finally { synchronizingExplorer = false; }
 
         bool Select(ItemsControl parent)
         {
@@ -104,7 +118,6 @@ public partial class AudioWindow
                 }
                 if (!item.Children.Any(child => child.View == view)) continue;
                 container.IsExpanded = true;
-                container.UpdateLayout();
                 if (Select(container)) return true;
             }
             return false;

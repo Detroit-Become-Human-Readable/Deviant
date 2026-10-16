@@ -9,11 +9,14 @@ namespace Deviant.Browser;
 /// <summary>Source selection for one preview mip; cube previews retain all six faces.
 /// Converted size fields conservatively allow RGBA8 output before its packet encoding is inspected.</summary>
 public sealed record NativeTexturePreviewPlan(int MipIndex, int Width, int Height, bool IsCubeMap, bool IsConverted,
-    IReadOnlyList<ResourceIdentity> RequiredPayloadIdentities, long PackageDecodedBytes, long SelectedEncodedBytes);
+    IReadOnlyList<ResourceIdentity> RequiredPayloadIdentities, long PackageDecodedBytes, long SelectedEncodedBytes)
+{
+    public bool UsesNativeBlocks { get; init; }
+}
 
 public sealed partial class NativeTextureDecoder
 {
-    public const string PreviewVersion = "native-texture-preview-v4-shared-source-surfaces";
+    public const string PreviewVersion = "native-texture-preview-v4-shared-source-surfaces/" + Version;
     private sealed record PreviewSelection(NativeTexturePreviewPlan Plan, TextureFileTextV24ResourceReference Reference,
         TextureBufferPatternKind Kind, IReadOnlyList<long> FaceOffsets, int FaceBytes);
 
@@ -29,9 +32,9 @@ public sealed partial class NativeTextureDecoder
     {
         if (plan.IsConverted)
         {
-            long pixels = checked((long)plan.Width * plan.Height * 4);
-            if (pixels > maximumDecodedBytes) throw Error("NativeTextureDecodeBudget", "Mip data exceeds the decode budget.");
-            return checked(pixels * 3 + 1024 * 1024);
+            long decodedBytes = plan.UsesNativeBlocks ? plan.SelectedEncodedBytes : checked((long)plan.Width * plan.Height * 4);
+            if (decodedBytes > maximumDecodedBytes) throw Error("NativeTextureDecodeBudget", "Mip data exceeds the decode budget.");
+            return checked(decodedBytes * 3 + 1024 * 1024);
         }
         if (plan.PackageDecodedBytes > TextureBufferPatternInspector.MaximumDecodedBytes)
         {
@@ -141,9 +144,11 @@ public sealed partial class NativeTextureDecoder
             long bytes = MipByteLength(metadata.FirstByte, selected.Descriptor.Width, selected.Descriptor.Height);
             if (selected.Reference.FollowingUInt32 < bytes || selected.Reference.Reference.ResourceType == 2230 && selected.Reference.FollowingUInt32 != bytes)
                 throw Error("NativeMipSizeMismatch", "Mip byte size does not match its dimensions.");
-            long outputBound = checked((long)selected.Descriptor.Width * selected.Descriptor.Height * 4);
+            bool nativeBlocks = metadata.PostSelectorByte1 == 12;
+            long outputBound = nativeBlocks ? bytes : checked((long)selected.Descriptor.Width * selected.Descriptor.Height * 4);
             return new(new(selected.Index, selected.Descriptor.Width, selected.Descriptor.Height, false, true,
-                Array.AsReadOnly(new[] { selected.Reference.Resolution.Candidates[0] }), outputBound, outputBound), selected.Reference,
+                Array.AsReadOnly(new[] { selected.Reference.Resolution.Candidates[0] }), outputBound, outputBound)
+                { UsesNativeBlocks = nativeBlocks }, selected.Reference,
                 selected.Reference.Reference.ResourceType == 2229 ? TextureBufferPatternKind.Raw : TextureBufferPatternKind.RawLod, [0], checked((int)bytes));
         }
         bool cube = metadata.SizeGroupSelector == 2; int faceCount = cube ? 6 : 1;

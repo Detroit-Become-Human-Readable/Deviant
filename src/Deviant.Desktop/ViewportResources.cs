@@ -229,15 +229,18 @@ public sealed partial class AssetViewportService : IDisposable
                 if (graphTechnique is not null)
                 {
                     foreach (int slot in graphTechnique.TextureSlots)
-                        graphTextures.Add(AcquireTexture(snapshot, source.TexturesBySlot[slot], normalMap: false));
+                        graphTextures.Add(await AcquireTextureAsync(snapshot, source.TexturesBySlot[slot], normalMap: false, token));
                 }
             }
             if (graphTechnique is null && source?.Asset.NativeRenderParameters is not null)
                 graphTechnique = AcquireNormalTechnique(snapshot, state);
             var availableNormalUvSets = primitiveNormalUvSets.Where(index => graphTechnique?.IsSurfaceGraph != true || index == 0).ToHashSet();
+            var normalTexture = ViewportMaterials.FindUsableNormalTexture(source, availableNormalUvSets, normalFrameAvailable);
+            if (normalTexture is not null) texture = await AcquireTextureAsync(snapshot, normalTexture, normalMap: true, token);
             var prepared = ViewportMaterials.Create(source, surface =>
             {
-                texture = AcquireTexture(snapshot, surface, normalMap: true);
+                if (!ReferenceEquals(surface, normalTexture) || texture is null)
+                    throw new InvalidDataException("The normal texture changed during material preparation.");
                 return texture.Texture;
             }, availableNormalUvSets, normalFrameAvailable);
             diagnostics.AddRange(prepared.Diagnostics);
@@ -266,6 +269,39 @@ public sealed partial class AssetViewportService : IDisposable
             foreach (var graphTexture in graphTextures) graphTexture.Dispose();
             graphTechnique?.Dispose(); texture?.Dispose(); throw;
         }
+    }
+
+    private async Task<TextureLease> AcquireTextureAsync(RenderAssetSnapshot snapshot, RenderTexture source,
+        bool normalMap, CancellationToken token)
+    {
+        if (source.Surface.PixelSource is null) return AcquireTexture(snapshot, source, normalMap);
+        var surface = source.Surface;
+        if (surface.IsHdr || surface.DisplayTransform is not null)
+            throw new InvalidDataException("The material requires an RGBA8 texture.");
+        bool srgb = !normalMap && surface.IsSrgb;
+        var key = TextureContentKey.Create(source, snapshot.Revision, srgb);
+        if (textures.TryAcquire(key, out var existing)) return new(this, existing!);
+        EnsureResourceAdmission(snapshot.MemoryBudget, surface.PixelSource.ByteLength, surface.PixelSource.ByteLength);
+        IDisposable? held = snapshot.AcquireLease();
+        RawTextureLoader? loader = null;
+        try
+        {
+            loader = await RawTextureLoader.CreateBackedAsync(surface, srgb, snapshot.MemoryBudget, token);
+            token.ThrowIfCancellationRequested();
+            var leased = textures.Acquire(key, () =>
+            {
+                var gpu = ReserveGpu(surface.PixelSource.ByteLength, "texture buffers");
+                try
+                {
+                    var model = new TextureModel(Guid.NewGuid(), loader);
+                    var entry = new TextureEntry(model, loader, null, gpu, held);
+                    loader = null; held = null; return entry;
+                }
+                catch { gpu.Dispose(); throw; }
+            });
+            return new(this, leased);
+        }
+        finally { loader?.Dispose(); held?.Dispose(); }
     }
 
     private TextureLease AcquireTexture(RenderAssetSnapshot snapshot, RenderTexture source, bool normalMap)
@@ -379,9 +415,31 @@ public sealed partial class AssetViewportService : IDisposable
 
     internal sealed class RawTextureLoader(byte[] pixels, int width, int height, bool srgb) : ITextureInfoLoader, IDisposable
     {
+        public static async Task<RawTextureLoader> CreateBackedAsync(TextureSurface surface, bool srgb,
+            AssetMemoryBudget budget, CancellationToken token = default)
+        {
+            ArgumentNullException.ThrowIfNull(surface); ArgumentNullException.ThrowIfNull(budget);
+            if (surface.PixelSource is null || surface.IsHdr || surface.DisplayTransform is not null)
+                throw new InvalidDataException("The prepared RGBA texture is unavailable.");
+            TextureSurfaceLease? prefetched = await surface.AcquireRgba8Async(token).ConfigureAwait(false);
+            try
+            {
+                token.ThrowIfCancellationRequested();
+                var loader = new RawTextureLoader([], surface.Width, surface.Height, srgb)
+                { backing = surface, backingBudget = budget, firstPixels = prefetched, pixelLifetime = new() };
+                prefetched = null; return loader;
+            }
+            finally { prefetched?.Dispose(); }
+        }
         private byte[]? data = pixels;
         private bool compressedStream;
         private IDisposable? encodedCopyReservation;
+        private readonly object uploadGate = new();
+        private TextureSurface? backing;
+        private AssetMemoryBudget? backingBudget;
+        private TextureSurfaceLease? firstPixels;
+        private CancellationTokenSource? pixelLifetime;
+        private readonly Dictionary<Guid, (TextureSurfaceLease Pixels, IDisposable? Copy)> uploads = [];
 
         public static RawTextureLoader CreateEncoded2D(DdsTextureDocument document, SourceRevision revision,
             bool srgb, AssetMemoryBudget budget)
@@ -434,21 +492,60 @@ public sealed partial class AssetViewportService : IDisposable
         }
         public TextureInfo Load(Guid id)
         {
+            lock (uploadGate)
+            {
             var bytes = data ?? throw new ObjectDisposedException(nameof(RawTextureLoader));
+            if (backing is not null)
+            {
+                if (uploads.ContainsKey(id)) throw new InvalidOperationException("The texture upload is already active.");
+                TextureSurfaceLease? leased = firstPixels ?? backing.AcquireRgba8Async(pixelLifetime!.Token).GetAwaiter().GetResult();
+                firstPixels = null;
+                IDisposable? copy = null;
+                try
+                {
+                    var rgba = leased.Surface.Rgba8;
+                    if (MemoryMarshal.TryGetArray(rgba, out var segment) && segment.Array is { } array &&
+                        segment.Offset == 0 && segment.Count == array.Length) bytes = array;
+                    else
+                    {
+                        copy = backingBudget!.Reserve(rgba.Length, "backed texture upload copy");
+                        bytes = rgba.ToArray();
+                    }
+                    var info = new TextureInfo(bytes, srgb ? Format.R8G8B8A8_UNorm_SRgb : Format.R8G8B8A8_UNorm,
+                        width, height, generateMipMaps: false);
+                    uploads.Add(id, (leased, copy)); leased = null; copy = null;
+                    return info;
+                }
+                finally { leased?.Dispose(); copy?.Dispose(); }
+            }
             return compressedStream
                 ? new TextureInfo(new MemoryStream(bytes, writable: false), generateMipMaps: false)
                 : new TextureInfo(bytes, srgb ? Format.R8G8B8A8_UNorm_SRgb : Format.R8G8B8A8_UNorm,
                     width, height, generateMipMaps: false);
+            }
         }
         public void Complete(Guid id, TextureInfo? info, bool succeeded)
         {
+            lock (uploadGate)
+            {
+                if (uploads.Remove(id, out var upload))
+                { upload.Pixels.Dispose(); upload.Copy?.Dispose(); }
+            }
             if (compressedStream) info?.Texture?.Dispose();
             if (!succeeded) throw new InvalidOperationException("The texture could not be uploaded.");
         }
         public void Dispose()
         {
+            pixelLifetime?.Cancel();
+            lock (uploadGate)
+            {
             data = null;
             Interlocked.Exchange(ref encodedCopyReservation, null)?.Dispose();
+                firstPixels?.Dispose(); firstPixels = null;
+                foreach (var upload in uploads.Values) { upload.Pixels.Dispose(); upload.Copy?.Dispose(); }
+                uploads.Clear(); backing = null;
+                pixelLifetime?.Dispose(); pixelLifetime = null;
+            }
         }
     }
     private sealed class ActionLease(Action release) : IDisposable

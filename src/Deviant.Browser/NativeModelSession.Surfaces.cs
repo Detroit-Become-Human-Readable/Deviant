@@ -17,7 +17,7 @@ public sealed partial class NativeModelSession
             .Append(source.Revision.IndexContentId).Append('\n')
             .Append(source.Revision.PhysicalSourceStamp).Append('\n')
             .Append(NativeTextureDecoder.PreviewVersion).Append('\n')
-            .Append("encoded-surface-v1").Append('\n')
+            .Append("prepared-surface-v2").Append('\n')
             .Append(maximumPreviewDimension).Append('\n')
             .Append(metadata.FirstByte).Append(':').Append(metadata.SerializedSelector).Append(':')
             .Append(metadata.PostSelectorBoolean).Append(':').Append(metadata.Mip0Width).Append('x')
@@ -41,6 +41,22 @@ public sealed partial class NativeModelSession
         NativeContainerLease container, int maximumPreviewDimension, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
+        var preparationKey = surfaceDiskCache is null ? null : CreateSurfacePreparationKey(source, maximumPreviewDimension);
+        if (surfaceDiskCache is not null)
+        {
+            var prepared = await PreparedTexturePixelSource.TryAcquireAsync(surfaceDiskCache, preparationKey!, MemoryBudget, token).ConfigureAwait(false);
+            if (prepared is not null)
+            {
+                try
+                {
+                    if (prepared.Surface.Revision != source.Revision)
+                        throw new TextureFormatException("PreparedTextureChanged", "The prepared texture belongs to another source revision.");
+                    container.EnsureUnchanged(); token.ThrowIfCancellationRequested();
+                    return FromPrepared(prepared);
+                }
+                catch { prepared.Dispose(); throw; }
+            }
+        }
         var nativeDecoder = CreateSourceLoadedTextureDecoder(source, maximumPreviewDimension, token);
         using var decodeScratch = MemoryBudget.Reserve(
             nativeDecoder.EstimatePreviewWorkingSetBytes(source, maximumPreviewDimension, token), "texture decoding");
@@ -78,6 +94,17 @@ public sealed partial class NativeModelSession
             using (MemoryBudget.Reserve(NativeTextureSession.MaximumResourceBytes, "texture validation"))
                 await textures.RevalidateAsync(source, token).ConfigureAwait(false);
             container.EnsureUnchanged();
+            if (encoded is null && surfaceDiskCache is not null)
+            {
+                var resident = TextureSurface.RestoreRgba8(pixels.Width, pixels.Height, pixels.Rgba8,
+                    pixels.SourceIsHdr, pixels.IsSrgb, nativeMip, pixels.SourceFormat, pixels.SourceFormatName,
+                    pixels.SourcePayloadSha256, pixels.Subresource with { MipIndex = nativeMip },
+                    source.Metadata.Identity, source.Revision, pixels.DisplayTransform);
+                var prepared = await PreparedTexturePixelSource.StoreAsync(surfaceDiskCache, preparationKey!, resident,
+                    rgbaSha256, MemoryBudget, resize, token).ConfigureAwait(false);
+                try { token.ThrowIfCancellationRequested(); return FromPrepared(prepared); }
+                catch { prepared.Dispose(); throw; }
+            }
             try
             {
                 var shared = new SharedSurfacePixels(pixels.Width, pixels.Height,
@@ -94,15 +121,26 @@ public sealed partial class NativeModelSession
         finally { encodedMemory?.Dispose(); pixelMemory?.Dispose(); }
     }
 
+    private static SharedSurfacePixels FromPrepared(PreparedTexturePixelSource prepared)
+    {
+        var surface = prepared.Surface;
+        return new(surface.Width, surface.Height, ReadOnlyMemory<byte>.Empty, surface.SourceIsHdr,
+            surface.IsSrgb, surface.MipIndex, surface.SourceFormat, surface.SourceFormatName,
+            surface.SourcePayloadSha256, surface.Subresource, surface.DisplayTransform,
+            prepared.PreviewWasResized, prepared.RgbaSha256, prepared, pixelSource: prepared);
+    }
+
     private sealed class SharedSurfacePixels(int width, int height, ReadOnlyMemory<byte> rgba8,
         bool sourceIsHdr, bool isSrgb, int mipIndex, TextureStorageFormat sourceFormat, string sourceFormatName,
         string sourcePayloadSha256, TextureSubresourceSelection subresource, TextureDisplayTransform? displayTransform,
-        bool previewWasResized, string rgbaSha256, AssetMemoryBudget.Reservation reservation,
-        DdsTextureDocument? encodedDds = null, TextureSubresourceSelection? encodedSelection = null) : IDisposable
+        bool previewWasResized, string rgbaSha256, IDisposable reservation,
+        DdsTextureDocument? encodedDds = null, TextureSubresourceSelection? encodedSelection = null,
+        ITexturePixelSource? pixelSource = null) : IDisposable
     {
         public int Width { get; } = width;
         public int Height { get; } = height;
         public ReadOnlyMemory<byte> Rgba8 { get; } = rgba8;
+        public ITexturePixelSource? PixelSource { get; } = pixelSource;
         public DdsTextureDocument? EncodedDds { get; } = encodedDds;
         public TextureSubresourceSelection? EncodedSelection { get; } = encodedSelection;
         public bool SourceIsHdr { get; } = sourceIsHdr;

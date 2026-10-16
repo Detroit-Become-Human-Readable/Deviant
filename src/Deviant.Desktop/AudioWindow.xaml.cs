@@ -71,6 +71,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     private readonly AssetFamilyView familyView=new();
     private readonly BufferInspectionView bufferView=new();
     private readonly SceneView sceneView = new();
+    private readonly RecordCategoriesView recordsView = new();
     private ISceneCatalogSession? sceneSession;
     private bool stringsMode;
     public TextureCatalogSessionOptions? TextureCatalogOptions { get; set; }
@@ -96,6 +97,7 @@ public partial class AudioWindow : Window, IAssetNavigator
         InitializeCharacters();
         ReferencesHost.Content=referencesView;
         ScenesHost.Content = sceneView;
+        RecordsHost.Child = recordsView;
         sceneView.AssetNavigator = this;
         sceneView.TextureOwnerQueryProvider = QueryTexturesByOwnerAsync;
         InitializeSceneRendering();

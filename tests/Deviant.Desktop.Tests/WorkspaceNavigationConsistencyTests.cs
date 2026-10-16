@@ -32,6 +32,7 @@ public sealed class WorkspaceNavigationConsistencyTests
         Assert.DoesNotContain(explorer.Items.Cast<NavigationItem>(), item => item.Label is "Dialogue" or "Strings");
         Assert.Equal("Dialogue & Strings", Named<Button>(window, "HomeStringsButton").Content);
         Invoke(window, "Home_Click", window, new RoutedEventArgs());
+        Pump(Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle).Task);
         Assert.True(Named<FrameworkElement>(window, "ExplorerNavigationPane").IsVisible);
         Assert.True(Named<FrameworkElement>(window, "HomeHost").IsVisible);
         Assert.False(window.CharactersBrowser.IsVisible);
@@ -75,6 +76,7 @@ public sealed class WorkspaceNavigationConsistencyTests
         window.CharacterCatalogProvider = (_, token) => { entered.SetResult(); return release.Task.WaitAsync(token); };
         var show = window.ShowCharactersAsync(); Pump(entered.Task);
         Invoke(window, "Home_Click", window, new RoutedEventArgs()); Pump(show);
+        Pump(Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle).Task);
         Invoke(window, "RefreshActivity");
         Assert.True(Named<FrameworkElement>(window, "HomeHost").IsVisible);
         Assert.False(Named<ProcessingAnimation>(window, "WindowProcessing").IsActive);

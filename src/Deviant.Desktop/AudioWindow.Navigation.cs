@@ -59,6 +59,7 @@ public partial class AudioWindow
         textureExplorer.OpenDdsRequested += OpenDds_Click;
         foreach(var node in new[]{new NavigationItem("Home","home"),audioNavigation,stringsNavigation,textureNavigation,charactersNavigation,scenesNavigation,inspectionNavigation,new NavigationItem("Bookmarks","bookmarks"),collectionsNavigation,new NavigationItem("Recent items","recent"),new NavigationItem("Saved filters","filters")})explorerRoots.Add(node);
         ExplorerTree.ItemsSource=explorerRoots;
+        recordsView.OpenCategoryRequested += OpenRecordCategory;
         stringsView.SelectedRecordChanged += (_, _) => SelectionForLibraryChanged();
         stringsView.ChoicesChanged += (_, _) => UpdateExplorerGroups();
         animationView.SelectedResourceChanged+=(_,_)=>SelectionForLibraryChanged();shaderView.SelectedResourceChanged+=(_,_)=>SelectionForLibraryChanged();
@@ -104,6 +105,7 @@ public partial class AudioWindow
         if(snapshot.Records.Any(row=>row.Type==Deviant.Formats.Animation.AnimationDataReader.ResourceType))inspectionNavigation.Children.Add(new("Animation records","animation"));
         if(snapshot.Records.Any(row=>row.Type==29))inspectionNavigation.Children.Add(new("Container sources","shader-picker"));
         if(snapshot.Records.Any(row=>row.Type==29))inspectionNavigation.Children.Add(new("Physics","physics-picker"));
+        recordsView.SetCategories(inspectionNavigation.Children);
         bankNodes.Clear(); audioLanguageNodes.Clear(); stringLanguageNodes.Clear();
         bankNavigation.Children.Clear(); audioLanguageNavigation.Children.Clear(); stringLanguageNavigation.Children.Clear();
         UpdateExplorerGroups();
@@ -137,10 +139,11 @@ public partial class AudioWindow
         if (view is not ("scenes" or "model")) PauseSceneWorkForNavigation();
         if (view != "buffer") PauseCommonGroupsForNavigation();
         currentView = view;
-        SelectExplorerView(view == "model" ? "scenes" : view == "dds" ? "textures" : view);
+        if (view == "records") recordsView.SetCategories(inspectionNavigation.Children);
         if (view == "audio") EnsureAudioEnrichment();
         HomeHost.Visibility = LibraryHost.Visibility = Visibility.Collapsed; ContentHost.Visibility = Visibility.Visible;
         AudioLayout.Visibility = view == "audio" ? Visibility.Visible : Visibility.Collapsed;
+        RecordsHost.Visibility = view == "records" ? Visibility.Visible : Visibility.Collapsed;
         StringsHost.Visibility = view == "strings" ? Visibility.Visible : Visibility.Collapsed;
         DdsHost.Visibility = view == "dds" ? Visibility.Visible : Visibility.Collapsed;
         AnimationHost.Visibility=view=="animation"?Visibility.Visible:Visibility.Collapsed;ShaderHost.Visibility=view=="shader"?Visibility.Visible:Visibility.Collapsed;
@@ -153,6 +156,36 @@ public partial class AudioWindow
         SaveFilterButton.IsEnabled = session is not null&&view is "audio" or "strings" or "textures";
         SelectionForLibraryChanged(); UpdatePlaybackPresentation();UpdateExplorerStatus();
         UpdateWorkspaceStatus();
+        SelectExplorerView(view switch
+        {
+            "model" => "scenes", "dds" => "textures", "shader" => "shader-picker",
+            "physics" => "physics-picker", _ => view
+        });
+    }
+    private void ShowRecords()
+    {
+        ShowBrowse("records");
+    }
+
+    private async void OpenRecordCategory(NavigationItem category)
+    {
+        if (!RequireWorkspaceNavigation()) return;
+        var navigation = BeginNavigation();
+        try { await OpenRecordCategoryAsync(category.View, navigation.Token); }
+        catch (OperationCanceledException) { }
+        catch (Exception error) { NavigationError(error); }
+    }
+
+    private async Task OpenRecordCategoryAsync(string view, CancellationToken token)
+    {
+        if (session is null) return;
+        if (view == "animation") { await ShowAnimationAsync(token); return; }
+        var choice = view is "shader-picker" or "physics-picker"
+            ? ContainerChoiceDialog.Read(this, session.Snapshot) : null;
+        if (choice is null) return;
+        token.ThrowIfCancellationRequested();
+        if (view == "shader-picker") await InspectShaderResourceAsync(choice, token);
+        else await InspectPhysicsAsync(choice, token);
     }
     private void Home_Click(object sender,RoutedEventArgs e)
     {
@@ -246,11 +279,9 @@ public partial class AudioWindow
             if(node.View=="dds") {ShowBrowse("dds");return;}
             if(node.View=="textures"){await ShowTexturesAsync(navigation.Token);if(node.Group is not null)await SelectTextureContextAsync(node.Group,navigation.Generation,navigation.Token);return;}
             if(node.View=="scenes"){await ShowScenesAsync(navigation.Token);return;}
-            if(node.View=="animation"){await ShowAnimationAsync(navigation.Token);return;}
-            if(node.View=="shader-picker")
-            {if(session is null)return;var choice=ContainerChoiceDialog.Read(this,session.Snapshot);if(choice is not null)await InspectShaderResourceAsync(choice,navigation.Token);return;}
-            if(node.View=="physics-picker")
-            {if(session is null)return;var choice=ContainerChoiceDialog.Read(this,session.Snapshot);if(choice is not null)await InspectPhysicsAsync(choice,navigation.Token);return;}
+            if(node.View=="records"){ShowRecords();return;}
+            if(node.View is "animation" or "shader-picker" or "physics-picker")
+            {await OpenRecordCategoryAsync(node.View,navigation.Token);return;}
             if(node.View is "bookmarks" or "recent" or "filters" or "collections" or "collection") { ShowLibrary(node.View,node.Id);return; }
             if(session is null) { Home_Click(this,new());HomeStatus.Text="Open a workspace to browse assets.";return; }
             if(node.View=="strings") { await ShowStringsAsync(navigation.Token);if(navigation.Generation!=navigationGeneration)return;if(node.Language is not null) await stringsView.ApplyFilterAsync(new Dictionary<string,string>{{"language",node.Language}},navigation.Token); }

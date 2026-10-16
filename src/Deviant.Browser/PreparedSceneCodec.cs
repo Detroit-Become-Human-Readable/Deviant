@@ -12,11 +12,12 @@ namespace Deviant.Browser;
 /// <summary>Versioned scene preparation retaining exact geometry, source ranges and material expressions.</summary>
 public static class PreparedSceneCodec
 {
-    public const string Profile = "prepared-scene-v3-encoded-surfaces";
+    public const string Profile = "prepared-scene-v4-backed-pixels";
     private const uint Magic = 0x314E4353;
-    private const int FormatVersion = 3;
+    private const int FormatVersion = 4;
     private const int MaximumMetadataBytes = 64 * 1024 * 1024;
-    private const long MaximumFileBytes = 2L * 1024 * 1024 * 1024;
+    private const long MaximumFileBytes = 20L * 1024 * 1024 * 1024;
+    private const long MaximumOwnedBytes = 2L * 1024 * 1024 * 1024;
     private static readonly JsonSerializerOptions json = new() { IncludeFields = true, MaxDepth = 128 };
 
     public static async Task WriteAsync(string path, string key, RenderAssetSnapshot source, CancellationToken token = default)
@@ -63,14 +64,20 @@ public static class PreparedSceneCodec
             {
                 token.ThrowIfCancellationRequested();
                 var row = TextureRow.From(texture);
-                var surface = texture.Surface;
+                if (!row.ValidMetadata() || texture.Surface.PixelSource is { } backing &&
+                    (!string.Equals(backing.RgbaSha256, row.RgbaSha256, StringComparison.OrdinalIgnoreCase) ||
+                     backing.ByteLength != (long)row.Width * row.Height * 4))
+                    throw new InvalidDataException("The prepared texture identity is invalid.");
+                if (!writtenBlobs.Add((row.EncodingKind, row.BlobSha256))) { writer.Write(0); continue; }
+                using var hydrated = texture.Surface.PixelSource is not null
+                    ? await texture.Surface.AcquireRgba8Async(token).ConfigureAwait(false) : null;
+                var surface = hydrated?.Surface ?? texture.Surface;
                 var bytes = surface.EncodedDds?.OriginalBytes ?? surface.Rgba8;
                 if (surface.IsHdr || !IsDigest(row.RgbaSha256) || Hash(bytes.Span) != row.BlobSha256 ||
-                    row.EncodingKind == TextureEncodingKind.Rgba8 && (!surface.HasRgba8 || row.BlobSha256 != row.RgbaSha256) ||
+                    row.EncodingKind is TextureEncodingKind.Rgba8 or TextureEncodingKind.BackedRgba8 && (!surface.HasRgba8 || row.BlobSha256 != row.RgbaSha256) ||
                     row.EncodingKind == TextureEncodingKind.Dds && (surface.HasRgba8 || surface.EncodedDdsSelection is null ||
                         !TextureSurface.CanRetainEncodedDds(surface.EncodedDds!, surface.EncodedDdsSelection, token)))
                     throw new InvalidDataException("The prepared texture content changed.");
-                if (!writtenBlobs.Add((row.EncodingKind, row.BlobSha256))) { writer.Write(0); continue; }
                 writer.Write(bytes.Length); writer.Write(bytes.Span);
             }
             writer.Flush(); await file.FlushAsync(token).ConfigureAwait(false);
@@ -96,7 +103,7 @@ public static class PreparedSceneCodec
             using var scratch = budget?.Reserve(checked(metadataBytes * 4L + 128 * 1024), "prepared scene validation");
             file.Position = sizeof(uint) + sizeof(int);
             var manifest = ReadJson<Manifest>(reader);
-            if (manifest.Key != key || manifest.Revision != revision || manifest.OwnedBytes is < 1 or > MaximumFileBytes ||
+            if (manifest.Key != key || manifest.Revision != revision || manifest.OwnedBytes is < 1 or > MaximumOwnedBytes ||
                 manifest.Textures is null || manifest.Textures.Any(row => !row.ValidMetadata())) return false;
             file.Position = 0;
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -116,7 +123,8 @@ public static class PreparedSceneCodec
     }
 
     public static async Task<RenderAssetSnapshot> ReadAsync(string path, string key, ArchiveSourceSession source,
-        ArchiveSnapshot archive, AssetMemoryBudget budget, bool allowLargeData, CancellationToken token = default)
+        ArchiveSnapshot archive, AssetMemoryBudget budget, bool allowLargeData, CancellationToken token = default,
+        Func<IDisposable>? acquireBackingOwner = null)
     {
         using var timing = AssetLoadDiagnostics.Measure("PreparedSceneRead", key);
         var resources = new List<IDisposable>();
@@ -130,7 +138,7 @@ public static class PreparedSceneCodec
                 throw new InvalidDataException("The scene preparation format is invalid.");
             var manifest = ReadJson<Manifest>(reader);
             if (manifest.Key != key || manifest.Revision != new SourceRevision(archive.IndexContentId, archive.PhysicalSourceStamp) ||
-                manifest.OwnedBytes is < 1 or > MaximumFileBytes || manifest.MeshCount is < 0 or > NativeModelSession.MaximumLargeSelections ||
+                manifest.OwnedBytes is < 1 or > MaximumOwnedBytes || manifest.MeshCount is < 0 or > NativeModelSession.MaximumLargeSelections ||
                 manifest.Textures is null || manifest.Textures.Any(row => !row.ValidMetadata()))
                 throw new InvalidDataException("The scene preparation identity is invalid.");
             resources.Add(budget.Reserve(manifest.OwnedBytes, "prepared scene content"));
@@ -159,12 +167,35 @@ public static class PreparedSceneCodec
             }
             var textures = new RenderTexture[manifest.Textures.Length];
             var blobs = new Dictionary<(TextureEncodingKind Kind, string Hash), byte[]>();
+            var backings = new Dictionary<(TextureEncodingKind Kind, string Hash), PreparedTexturePixelSource>();
             var documents = new Dictionary<string, DdsTextureDocument>(StringComparer.Ordinal);
             for (int index = 0; index < textures.Length; index++)
             {
                 token.ThrowIfCancellationRequested(); var row = manifest.Textures[index];
                 int length = Count(reader, checked((int)DdsTextureReader.MaximumInputBytes));
                 var blobKey = (row.EncodingKind, row.BlobSha256);
+                if (row.EncodingKind == TextureEncodingKind.BackedRgba8)
+                {
+                    PreparedTexturePixelSource pixels;
+                    if (length == 0)
+                    {
+                        if (!backings.TryGetValue(blobKey, out pixels!))
+                            throw new InvalidDataException("The prepared texture blob reference is invalid.");
+                    }
+                    else
+                    {
+                        if (length != checked(row.Width * row.Height * 4) || length > file.Length - file.Position - 32 || backings.ContainsKey(blobKey))
+                            throw new InvalidDataException("The prepared pixel range is invalid.");
+                        long offset = file.Position;
+                        pixels = await PreparedTexturePixelSource.OpenRangeAsync(path, offset, length, row.RgbaSha256,
+                            row.RestoreBacking, budget, row.Resized, token, acquireBackingOwner).ConfigureAwait(false);
+                        resources.Add(pixels); backings.Add(blobKey, pixels);
+                        file.Position = checked(offset + length);
+                    }
+                    textures[index] = new(row.Identity, row.RestoreBacking(pixels), row.RgbaSha256, row.SourceIdentity, row.CatalogIdentity)
+                        { PreviewWasResized = row.Resized, Sampling = row.Sampling };
+                    continue;
+                }
                 byte[] bytes;
                 if (length == 0)
                 {
@@ -211,9 +242,10 @@ public static class PreparedSceneCodec
                 p.Positions.Count * 12L + p.Indices.Count * 4L + (p.Normals?.Count ?? 0) * 12L + (p.Tangents?.Count ?? 0) * 16L +
                 (p.TextureCoordinates?.Sum(uv => uv.Count) ?? 0) * 8L + (p.Colors?.Count ?? 0) * 16L + 4096)) +
             snapshot.Materials.Values.SelectMany(material => material.TexturesBySlot.Values).DistinctBy(texture =>
-                (texture.Surface.EncodedDds is null ? TextureEncodingKind.Rgba8 : TextureEncodingKind.Dds,
+                (TextureRow.Encoding(texture.Surface),
                  texture.Surface.EncodedDds?.ContentSha256 ?? texture.RgbaSha256))
-                .Sum(texture => (texture.Surface.EncodedDds?.OriginalBytes.Length ?? texture.Surface.Rgba8.Length) + 4096L));
+                .Sum(texture => texture.Surface.PixelSource is null
+                    ? (texture.Surface.EncodedDds?.OriginalBytes.Length ?? texture.Surface.Rgba8.Length) + 4096L : 0));
 
     private static void WriteValues<T>(BinaryWriter writer, IReadOnlyList<T> values, AssetMemoryBudget budget, CancellationToken token) where T : unmanaged
     {
@@ -295,7 +327,7 @@ public static class PreparedSceneCodec
         float[]? Constants, MaterialInput? Input, int? Slot, string? Components, DecodedExtent? Extent);
     private sealed record GraphRow(ExpressionRow[] Nodes, int Color, int Opacity, int Cutoff, MaterialInput[] Inputs,
         int[] Slots, string[] Diagnostics, bool IsUnlit);
-    private enum TextureEncodingKind { Rgba8, Dds }
+    private enum TextureEncodingKind { Rgba8, Dds, BackedRgba8 }
     private sealed record TextureRow(ResourceIdentity Identity, string RgbaSha256, ResourceIdentity? SourceIdentity,
         ResourceIdentity? CatalogIdentity, bool Resized, NativeTextureSamplingProfile? Sampling,
         int Width, int Height, bool SourceIsHdr, bool IsSrgb, int Mip, TextureStorageFormat Format, string FormatName,
@@ -308,15 +340,20 @@ public static class PreparedSceneCodec
             texture.CatalogIdentity, texture.PreviewWasResized, texture.Sampling, surface.Width, surface.Height, surface.SourceIsHdr,
             surface.IsSrgb, surface.MipIndex, surface.SourceFormat, surface.SourceFormatName, surface.SourcePayloadSha256,
             surface.Subresource, surface.Identity, surface.Revision, surface.DisplayTransform,
-            surface.EncodedDds is null ? TextureEncodingKind.Rgba8 : TextureEncodingKind.Dds,
+            Encoding(surface),
             surface.EncodedDds?.ContentSha256 ?? texture.RgbaSha256, surface.EncodedDdsSelection); }
         public bool ValidMetadata() => Width is >= 1 and <= DdsTextureReader.MaximumDimension &&
             Height is >= 1 and <= DdsTextureReader.MaximumDimension && (long)Width * Height <= DdsTextureReader.MaximumPixelCount &&
             Mip >= 0 && IsDigest(RgbaSha256) && IsDigest(BlobSha256) && IsDigest(PayloadSha256) &&
             Subresource is not null && Subresource.MipIndex == Mip && Enum.IsDefined(Format) && !string.IsNullOrWhiteSpace(FormatName) &&
-            Enum.IsDefined(EncodingKind) && (EncodingKind == TextureEncodingKind.Rgba8
+            Enum.IsDefined(EncodingKind) && (EncodingKind is TextureEncodingKind.Rgba8 or TextureEncodingKind.BackedRgba8
                 ? BlobSha256 == RgbaSha256 && EncodedSelection is null
                 : EncodedSelection is not null && DisplayTransform is null && !SourceIsHdr && !Resized);
+        public static TextureEncodingKind Encoding(TextureSurface surface) => surface.PixelSource is not null
+            ? TextureEncodingKind.BackedRgba8 : surface.EncodedDds is null ? TextureEncodingKind.Rgba8 : TextureEncodingKind.Dds;
+        public TextureSurface RestoreBacking(ITexturePixelSource pixels) => TextureSurface.RestoreBackedRgba8(Width, Height,
+            pixels, SourceIsHdr, IsSrgb, Mip, Format, FormatName, PayloadSha256, Subresource, SurfaceIdentity,
+            SurfaceRevision, DisplayTransform);
         public RenderTexture Restore(byte[] bytes, DdsTextureDocument? document) => new(Identity,
             EncodingKind == TextureEncodingKind.Dds
                 ? TextureSurface.RestoreEncodedDds(Width, Height, document!, SourceIsHdr, IsSrgb, Mip, Format, FormatName,

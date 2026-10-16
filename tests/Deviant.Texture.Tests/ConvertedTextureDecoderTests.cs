@@ -89,6 +89,18 @@ public sealed class ConvertedTextureDecoderTests
     }
 
     [Theory]
+    [InlineData(-1)]
+    [InlineData(1)]
+    public void SingleRedPlaneRoundsSmallHorizontalFrequenciesSymmetrically(int coefficient)
+    {
+        var packet = ConvertedTextureFixture.Packet(8, 8, 15, red: 128, horizontalAc: coefficient);
+        var decoded = new ConvertedTextureDecoder().Read(packet, 15, 8, 8, 256);
+
+        Assert.All(Enumerable.Range(0, 64), pixel =>
+            Assert.Equal(new byte[] { 128, 0, 0, 255 }, decoded.Rgba8.Slice(pixel * 4, 4).ToArray()));
+    }
+
+    [Theory]
     [InlineData(64, 192)]
     [InlineData(200, 40)]
     public void TwoLumaPlanesKeepIndependentPredictorsAndPackedChannels(byte red, byte green)
@@ -369,7 +381,7 @@ internal static class ConvertedTextureFixture
     }
 
     internal static byte[] Packet(int width, int height, ushort selector, byte alpha = 127, int verticalAc = 0,
-        byte red = 64, byte green = 192, byte blue = 96)
+        byte red = 64, byte green = 192, byte blue = 96, int horizontalAc = 0)
     {
         var bits = new List<int>(); var predictors = new int[4]; var edge = selector is 15 or 17 or 19 or 21 or 23 ? 8 : 16;
         for (var tile = 0; tile < width * height / (edge * edge); tile++)
@@ -386,6 +398,13 @@ internal static class ConvertedTextureFixture
             {
                 var encoded = difference < 0 ? difference - 1 + (1 << category) : difference;
                 for (var bit = category - 1; bit >= 0; bit--) bits.Add((encoded >> bit) & 1);
+            }
+            if (component == 0 && horizontalAc != 0)
+            {
+                if (horizontalAc is not (1 or -1) || verticalAc != 0)
+                    throw new ArgumentOutOfRangeException(nameof(horizontalAc));
+                // One coefficient at zigzag position 1 (horizontal frequency 1), run 0 / size 1.
+                Write("00"); Write(horizontalAc > 0 ? "1" : "0");
             }
             if (component == 0 && verticalAc != 0)
             {

@@ -13,7 +13,7 @@ public sealed record ConvertedTextureDocument(ReadOnlyMemory<byte> Rgba8, Conver
 /// <summary>Decodes supported version-16 coefficient packets into texture samples.</summary>
 public sealed class ConvertedTextureDecoder
 {
-    public const string Version = "converted-texture-v16-4";
+    public const string Version = "converted-texture-v16-5";
     private const int HeaderLength = 52;
     private const int DescriptorLength = 16;
     private const int MaximumChunkCount = 4096;

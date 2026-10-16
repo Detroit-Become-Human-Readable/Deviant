@@ -17,7 +17,7 @@ public sealed record NativeTextureDecodedDocument(DdsTextureDocument Document,
 /// <summary>Builds texture documents from supported SEGS mip layouts.</summary>
 public sealed partial class NativeTextureDecoder
 {
-    public const string Version = "native-texture-v10";
+    public const string Version = "native-texture-v12/" + ConvertedTextureDecoder.Version;
     public const long DefaultMaximumDecodedBytes = 32L * 1024 * 1024;
     private readonly long maximumDecodedBytes;
     public NativeTextureDecoder(long maximumDecodedBytes = DefaultMaximumDecodedBytes)
@@ -43,7 +43,9 @@ public sealed partial class NativeTextureDecoder
         if (metadata.PostSelectorBoolean)
         {
             var selected = SelectConvertedMip(source, maximumPreviewDimension);
-            decodedBytes = checked((long)selected.Descriptor.Width * selected.Descriptor.Height * 4);
+            decodedBytes = metadata.PostSelectorByte1 == 12
+                ? MipByteLength(metadata.FirstByte, selected.Descriptor.Width, selected.Descriptor.Height)
+                : checked((long)selected.Descriptor.Width * selected.Descriptor.Height * 4);
         }
         else decodedBytes = metadata.MipByteLengthGroups.Sum(group => group.Sum(length => (long)length));
         if (decodedBytes > maximumDecodedBytes)
@@ -277,7 +279,7 @@ public sealed partial class NativeTextureDecoder
     }
 
     private static bool IsSupportedConversion(TextureFileTextV24Document metadata) =>
-        (metadata.FirstByte, metadata.PostSelectorByte1) is (5, 7) or (5, 17) or (5, 19) or (7, 1) or (11, 15) or (18, 21) or (19, 23);
+        (metadata.FirstByte, metadata.PostSelectorByte1) is (5, 7) or (5, 17) or (5, 19) or (7, 1) or (7, 12) or (11, 15) or (18, 21) or (19, 23);
 
     private sealed record ConvertedMip(int Index, TextureFileTextV24LodDescriptor Descriptor,
         TextureFileTextV24ResourceReference Reference);
@@ -325,7 +327,9 @@ public sealed partial class NativeTextureDecoder
         if (!TextureBufferPatternInspector.TryGetPayload(payload.OriginalBytes.Span, payload.Extent, payload.Type,
             out _, out var body, out var payloadExtent, out _))
             throw Error("UnsupportedNativeMipPayload", "The mip payload uses an unavailable encoding.");
-        if (body.Length >= 4 && BinaryPrimitives.ReadUInt16LittleEndian(body) == 16 && BinaryPrimitives.ReadUInt16LittleEndian(body[2..]) == 255)
+        if (body.Length >= 4 && BinaryPrimitives.ReadUInt16LittleEndian(body) == 16 &&
+            (BinaryPrimitives.ReadUInt16LittleEndian(body[2..]) == 255 ||
+             metadata.PostSelectorByte1 == 12 && BinaryPrimitives.ReadUInt16LittleEndian(body[2..]) == 12))
         {
             var packet = NativeTextureBlockPacketReader.ReadPacket(body, width, height, normalizedBytes, maximumDecodedBytes, token);
             var blocks = packet.Blocks;

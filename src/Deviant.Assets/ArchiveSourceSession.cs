@@ -226,6 +226,7 @@ public sealed class ArchiveSourceSession : IDisposable
         if (extents.Count is < 1 || extents.Count > maximumExtentCount) throw new ArgumentException("Source extent count is invalid.", nameof(extents));
         await ValidateIndexAsync(token).ConfigureAwait(false);
         long total = 0;
+        var consumedPackages = new HashSet<uint>();
         foreach (var extent in extents.Distinct())
         {
             token.ThrowIfCancellationRequested();
@@ -235,6 +236,7 @@ public sealed class ArchiveSourceSession : IDisposable
                 throw new ArgumentException("Source extent is invalid.", nameof(extents));
             total = checked(total + extent.Length);
             if (total > maximumBytes) throw new ArgumentException("Source verification exceeds its byte limit.", nameof(extents));
+            consumedPackages.Add(volume.Package);
             EnsureCurrent(volume.Package);
             var key = new RangeKey(volume.Package, extent.Offset, extent.Length, digest.ToUpperInvariant());
             if (!volume.Stamp.Reliable)
@@ -247,7 +249,7 @@ public sealed class ArchiveSourceSession : IDisposable
             }
             EnsureCurrent(volume.Package);
         }
-        EnsureCurrent();
+        foreach (var package in consumedPackages) EnsureCurrent(package);
     }
 
     private async Task VerifyCoreAsync(uint package, SourceExtent extent, CancellationToken token)
