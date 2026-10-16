@@ -349,6 +349,53 @@ public sealed class TextureDiscoverySessionTests
         Assert.Equal(1, discovery.Coverage.MetadataInspected);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RestoredIncompleteOwnerOnlyRebuildsWhenItsFinalMembershipChanges(bool changedMembership)
+    {
+        using var fixture = new DiscoveryFixture();
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        var revision = new SourceRevision(snapshot.IndexContentId, snapshot.PhysicalSourceStamp);
+        var cache = new CacheManager(fixture.Settings, new(fixture.Cache));
+        var aliases = new AliasStore(fixture.Library);
+        string profile;
+        await using (var catalogs = new TextureCatalogSession(snapshot, revision))
+        await using (var native = new NativeTextureSession(catalogs))
+        await using (var cold = new TextureDiscoverySession(catalogs, native, aliases, cache))
+        {
+            await cold.EnrichmentTask;
+            Assert.Equal("environment.dds", Assert.Single((await cold.QueryAsync(new())).Entries).Label);
+            profile = (string)typeof(TextureDiscoverySession).GetProperty("ProjectionProfile", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(cold)!;
+        }
+        long generation;
+        using (var store = FeatureStore.Open(snapshot, fixture.Cache))
+        {
+            generation = store.CaptureTextureProjectionGeneration(profile);
+            var checkpoint = Assert.Single(store.LoadTextureProjectionOwners(profile));
+            checkpoint = checkpoint with { MembershipComplete = false,
+                MembershipKey = changedMembership ? checkpoint.MembershipKey + "/earlier-membership" : checkpoint.MembershipKey };
+            using var db = new SqliteConnection(new SqliteConnectionStringBuilder
+                { DataSource = Directory.GetFiles(fixture.Cache, "catalog-*.sqlite3").Single(), Pooling = false }.ToString());
+            db.Open(); using var command = db.CreateCommand();
+            command.CommandText = "UPDATE texture_projection_owners SET payload=$payload WHERE profile=$profile";
+            command.Parameters.AddWithValue("$payload", System.Text.Json.JsonSerializer.Serialize(checkpoint));
+            command.Parameters.AddWithValue("$profile", profile); Assert.Equal(1, command.ExecuteNonQuery());
+        }
+        for (int launch = 0; launch < 2; launch++)
+        {
+            await using var catalogs = new TextureCatalogSession(snapshot, revision);
+            await catalogs.EnrichmentTask;
+            await using var native = new NativeTextureSession(catalogs);
+            await using var warm = new TextureDiscoverySession(catalogs, native, aliases, cache);
+            await warm.EnrichmentTask;
+            Assert.Equal("environment.dds", Assert.Single((await warm.QueryAsync(new())).Entries).Label);
+            using var store = FeatureStore.Open(snapshot, fixture.Cache);
+            Assert.True(Assert.Single(store.LoadTextureProjectionOwners(profile)).MembershipComplete);
+            Assert.Equal(generation + (changedMembership ? 1 : 0), store.CaptureTextureProjectionGeneration(profile));
+        }
+    }
+
     [Fact]
     public async Task WarmNamesRestoreWhileCatalogsAreBlockedAndNoOwnerReadBudgetIsAvailable()
     {
@@ -1030,3 +1077,4 @@ public sealed class TextureDiscoverySessionTests
         public void Dispose() { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }
 }
+

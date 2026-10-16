@@ -734,7 +734,7 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
                         if (inspectedContainers.Add(checkpoint.Identity)) containersInspected++;
                     }
                     lock (gate)
-                        if (checkpoint.MembershipComplete && !projectionRebuildOwners.Contains(checkpoint.Identity))
+                        if (!projectionRebuildOwners.Contains(checkpoint.Identity))
                             processedMemberships[checkpoint.Identity] = checkpoint.MembershipKey;
                 }
             }
