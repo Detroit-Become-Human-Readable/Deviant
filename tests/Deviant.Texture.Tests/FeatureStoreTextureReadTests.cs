@@ -4,12 +4,155 @@ using Deviant.Assets;
 using Deviant.Browser;
 using Deviant.Catalog;
 using Deviant.Core;
+using Microsoft.Data.Sqlite;
 using Xunit;
 
 namespace Deviant.Texture.Tests;
 
 public sealed class FeatureStoreTextureReadTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RepairPublicationRemovesObsoleteFacetsBeforeReadersSeeItsHead(bool repairComponent)
+    {
+        using var fixture = await ProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        var baseline = fixture.Entry("Generated texture");
+        store.InitializeTextureProjections("repair-options", [baseline]);
+        long generation = store.CommitTextureProjectionOwner("repair-options", fixture.Checkpoint,
+            [fixture.Named(baseline, 32, 16, "BC1", "Diffuse", "Room")]);
+        var rows = new Dictionary<ResourceIdentity, TextureDiscoveryEntry> { [baseline.Identity] = baseline };
+        if (repairComponent) store.RepairTextureProjectionEvidence("repair-options", rows, _ => false);
+        else store.QuarantineTextureProjectionEvidence("repair-options", rows, [baseline.Identity], _ => false);
+        Assert.True(store.CaptureTextureProjectionGeneration("repair-options") > generation);
+        using var lease = store.AcquireTextureProjectionReadLease("repair-options");
+        var options = await lease.ReadFilterOptionsAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Empty(options.Formats);
+        Assert.Empty(options.Dimensions);
+        Assert.Empty(options.VerifiedRoles);
+        Assert.Empty(options.Contexts);
+    }
+
+    [Fact]
+    public async Task ExistingBaselinePreparesLegacyHistoryBeforeReturningItsGeneration()
+    {
+        using var fixture = await ProjectionFixture.CreateAsync();
+        var baseline = fixture.Entry("Generated texture");
+        long generation;
+        using (var writer = FeatureStore.Open(fixture.Snapshot, fixture.Cache))
+        {
+            writer.InitializeTextureProjections("legacy-options", [baseline]);
+            generation = writer.CommitTextureProjectionOwner("legacy-options", fixture.Checkpoint,
+                [fixture.Named(baseline, 32, 16, "BC1", "Diffuse", "Room")]);
+            using var legacy = Field<SqliteConnection>(writer, "connection").CreateCommand();
+            legacy.CommandText = "DELETE FROM texture_projection_history_index; INSERT OR IGNORE INTO texture_projection_history_dirty " +
+                "SELECT DISTINCT revision,profile,identity FROM texture_projection_rows";
+            legacy.ExecuteNonQuery();
+        }
+        using var restored = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        Assert.Equal(generation, restored.InitializeTextureProjections("legacy-options", [baseline]));
+        using var lease = restored.AcquireTextureProjectionReadLease("legacy-options");
+        var options = await lease.ReadFilterOptionsAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] { "BC1" }, options.Formats);
+        Assert.Equal(new[] { "Diffuse" }, options.VerifiedRoles);
+    }
+
+    [Fact]
+    public async Task ReadLeaseUsesProjectionsPreparedByAnotherStore()
+    {
+        using var fixture = await ProjectionFixture.CreateAsync();
+        using var writer = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        var baseline = fixture.Entry("Generated texture");
+        writer.InitializeTextureProjections("prepared", [baseline]);
+        long generation = writer.CommitTextureProjectionOwner("prepared", fixture.Checkpoint,
+            [fixture.Named(baseline, 32, 16, "BC1", "Diffuse", "Room")]);
+        using var reader = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        using var lease = reader.AcquireTextureProjectionReadLease("prepared");
+        var options = await lease.ReadFilterOptionsAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(generation, lease.Generation);
+        Assert.Equal(new[] { "BC1" }, options.Formats);
+        Assert.Equal(new[] { "Diffuse" }, options.VerifiedRoles);
+    }
+
+    [Fact]
+    public async Task PublicationBetweenSnapshotAndFacetsKeepsTheCapturedOptions()
+    {
+        using var fixture = await ProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        using var writer = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        string profile = "snapshot-" + Guid.NewGuid().ToString("N");
+        var baseline = fixture.Entry("Generated texture");
+        store.InitializeTextureProjections(profile, [baseline]);
+        long generation = store.CommitTextureProjectionOwner(profile, fixture.Checkpoint,
+            [fixture.Named(baseline, 32, 16, "BC1", "Diffuse", "Room")]);
+        int publications = 0;
+        using var observer = AssetLoadDiagnostics.Listener.Subscribe(new CounterObserver(counter =>
+        {
+            if (counter.Stage != "TextureBrowser.Store.OptionsSnapshot" || counter.Key != profile) return;
+            if (Interlocked.Increment(ref publications) != 1) return;
+            writer.CommitTextureProjectionOwner(profile, fixture.Checkpoint,
+                [fixture.Named(baseline, 64, 32, "BC3", "Normal", "Hall")]);
+        }));
+        using var lease = store.AcquireTextureProjectionReadLease(profile);
+        var options = await lease.ReadFilterOptionsAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(1, publications);
+        Assert.True(writer.CaptureTextureProjectionGeneration(profile) > generation);
+        Assert.Equal(generation, lease.Generation);
+        Assert.Equal(new[] { "BC1" }, options.Formats);
+        Assert.Equal(new[] { "Diffuse" }, options.VerifiedRoles);
+        Assert.Equal(new[] { new TextureContextOption("Room", "Room") }, options.Contexts);
+    }
+
+    private sealed class CounterObserver(Action<AssetLoadCounterMeasurement> observe)
+        : IObserver<KeyValuePair<string, object?>>
+    {
+        public void OnNext(KeyValuePair<string, object?> item)
+        { if (item.Value is AssetLoadCounterMeasurement counter) observe(counter); }
+        public void OnCompleted() { }
+        public void OnError(Exception error) { }
+    }
+
+    [Fact]
+    public async Task OptionsReadDoesNotChaseRoleBackfillWhileAnotherWriterPublishes()
+    {
+        using var fixture = await ProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        using var writer = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        var baseline = fixture.Entry("Generated texture");
+        store.InitializeTextureProjections("reader-race", [baseline]);
+        long generation = store.CommitTextureProjectionOwner("reader-race", fixture.Checkpoint,
+            [fixture.Named(baseline, 32, 16, "BC1", "Diffuse", "Room")]);
+        var ownsRead = new AsyncLocal<bool>();
+        int backfills = 0;
+        using var observer = AssetLoadDiagnostics.Listener.Subscribe(new MeasurementObserver(measurement =>
+        {
+            if (!ownsRead.Value || measurement.Stage != "TextureBrowser.Store.RoleBackfillBatch") return;
+            int next = Interlocked.Increment(ref backfills);
+            writer.CommitTextureProjectionOwner("reader-race", fixture.Checkpoint,
+                [fixture.Named(baseline, 64 + next, 32, "BC3", "Normal", "Hall")]);
+        }));
+        using var lease = store.AcquireTextureProjectionReadLease("reader-race");
+        Task<TextureDiscoveryFilterOptions> read;
+        ownsRead.Value = true;
+        try { read = lease.ReadFilterOptionsAsync(); }
+        finally { ownsRead.Value = false; }
+        var options = await read.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(0, backfills);
+        Assert.Equal(generation, lease.Generation);
+        Assert.Equal(new[] { "BC1" }, options.Formats);
+        Assert.Equal(new[] { "Diffuse" }, options.VerifiedRoles);
+    }
+
+    private sealed class MeasurementObserver(Action<AssetLoadMeasurement> observe)
+        : IObserver<KeyValuePair<string, object?>>
+    {
+        public void OnNext(KeyValuePair<string, object?> item)
+        { if (item.Value is AssetLoadMeasurement measurement) observe(measurement); }
+        public void OnCompleted() { }
+        public void OnError(Exception error) { }
+    }
+
     [Fact]
     public async Task ReaderDoesNotCaptureTheCallingSynchronizationContext()
     {
@@ -80,7 +223,7 @@ public sealed class FeatureStoreTextureReadTests
     }
 
     [Fact]
-    public async Task SessionOptionsWaitReleasesProjectionGateSoPageQueryCanStart()
+    public async Task SessionOptionsDoNotWaitForTheWriterOrBlockPageStartup()
     {
         using var fixture = DiscoveryFixture.Create();
         var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
@@ -94,7 +237,6 @@ public sealed class FeatureStoreTextureReadTests
         Assert.NotNull(store);
         var writerGate = Field<object>(store!, "gate");
         var projectionGate = Field<object>(discovery, "projectionStoreGate");
-        var leases = Field<HashSet<FeatureStore.TextureProjectionReadLease>>(store!, "textureReadLeases");
 
         using var writerHeld = new ManualResetEventSlim();
         using var releaseWriter = new ManualResetEventSlim();
@@ -115,9 +257,8 @@ public sealed class FeatureStoreTextureReadTests
 
         try
         {
-            var options = discovery.ReadFilterOptionsAsync();
-            Assert.True(SpinWait.SpinUntil(() => leases.Count > 0, TimeSpan.FromSeconds(5)));
-            Assert.False(options.IsCompleted);
+            var options = await discovery.ReadFilterOptionsAsync().WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.NotEmpty(options.Catalogs);
             Assert.True(Monitor.TryEnter(projectionGate, TimeSpan.FromSeconds(5)),
                 "The options operation retained projectionStoreGate while waiting on FeatureStore.");
             Monitor.Exit(projectionGate);
@@ -131,7 +272,6 @@ public sealed class FeatureStoreTextureReadTests
             }, TimeSpan.FromSeconds(5)), "The page query did not enter projectionStoreGate while options waited on the writer.");
             releaseWriter.Set();
             await holder.WaitAsync(TimeSpan.FromSeconds(5));
-            Assert.NotEmpty((await options.WaitAsync(TimeSpan.FromSeconds(10))).Catalogs);
             Assert.Single((await page.WaitAsync(TimeSpan.FromSeconds(10))).Entries);
         }
         finally { releaseWriter.Set(); }

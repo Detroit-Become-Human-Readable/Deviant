@@ -821,47 +821,14 @@ public partial class AudioWindow : Window, IAssetNavigator
         e.Cancel = true;
         if (closingInProgress) return;
         closingInProgress = true;
-        DisposeActivity();
-        navigationCancellation.Cancel();
-        using var closeForeground = workspacePreparation?.EnterForeground();
-        session?.CancelEnrichment();
-        CancelTextureCatalogWork();
-        sceneView.CancelActivity();
-        CloseStage = "Characters";
-        await ClearCharactersAsync();
-        CloseStage = "Dialogue";
-        await ClearAudioDialogueAsync();
-        CloseStage = "Physics";
-        await ClearPhysicsAsync();
-        relatedCancellation?.Cancel();
-        filterTimer.Stop(); playbackTimer.Stop(); seekTimer.Stop(); openCancellation?.Cancel(); queryCancellation?.Cancel(); jobCancellation?.Cancel();
-        CloseStage = "Jobs";
-        if (activeJob is not null) try { await activeJob; } catch { }
-        try{await Task.WhenAll(pendingOpens.ToArray());}catch{}
-        await StopPlaybackAsync();
-        CloseStage = "Scenes";
-        await ClearSceneSessionAsync();
-        CloseStage = "Inspectors";
-        await stringsView.DisposeAsync();
-        await ddsView.DisposeAsync();
-        await animationView.DisposeAsync();await shaderView.DisposeAsync();
-        await referencesView.DisposeAsync();
-        CloseStage = "Rendering";
-        await DisposeSceneRenderingAsync();
-        CloseStage = "Textures";
-        await ClearTextureCatalogsAsync();
-        await ClearSharedCatalogReferencesAsync();
-        var closedSession = session; session = null; admittedWorkspace = null;
-        CloseStage = "Archive";
-        if (closedSession is not null) await closedSession.DisposeAsync();
-        await textureExplorer.DisposeAsync();await familyView.DisposeAsync();await ClearBufferAsync();await bufferView.DisposeAsync();audioRelationships?.ClearBankGraphCache();
-        CloseStage = "Library";
-        await DrainLibraryTasksAsync();
-        player.PlaybackStopped-=Player_PlaybackStopped; player.Dispose();
-        WindowProcessing.Dispose();
-        closeApproved = true;
-        CloseStage = "Closed";
-        Close();
+        try { await CloseOwnedResourcesAsync(); }
+        catch (Exception error) { RecordCloseFailure("Window", error); }
+        finally
+        {
+            closeApproved = true;
+            CloseStage = closeFailures.Count == 0 ? "Closed" : "Closed with errors";
+            Close();
+        }
     }
     private async Task ClearSceneSessionAsync()
     {

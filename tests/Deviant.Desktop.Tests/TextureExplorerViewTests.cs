@@ -18,6 +18,118 @@ namespace Deviant.Desktop.Tests;
 public sealed class TextureExplorerViewTests
 {
     [Fact]
+    public void SavedFilterWaitsForTheOptionsReadThatSupersededItsOwn() => Run((view, catalog) =>
+    {
+        var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSecond = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var superseded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int calls = 0;
+        catalog.FilterQuery = () =>
+        {
+            bool first = Interlocked.Increment(ref calls) == 1;
+            (first ? firstEntered : secondEntered).TrySetResult();
+            (first ? releaseFirst : releaseSecond).Task.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+            return new TextureDiscoveryFilterOptions([new(4, 2)], ["BGRA8"], ["Diffuse"], [])
+            { Catalogs = [new("generated-catalog", "Generated catalog")] };
+        };
+        using var observer = AssetLoadDiagnostics.Listener.Subscribe(new OptionsCounterObserver(counter =>
+        {
+            if (counter.Stage == "TextureBrowser.Ui.OptionsSuperseded" && counter.Key == catalog.Revision.IndexContentId)
+                superseded.TrySetResult();
+        }));
+        var applying = view.ApplyFilterAsync(new Dictionary<string, string> { ["group"] = "generated-catalog" });
+        Task newer = Task.CompletedTask;
+        bool completedBeforeReplacement;
+        try
+        {
+            Pump(firstEntered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+            newer = (Task)Invoke(view, "RefreshOptionsAsync", CancellationToken.None)!;
+            Pump(secondEntered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+            releaseFirst.TrySetResult();
+            Pump(superseded.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+            completedBeforeReplacement = applying.IsCompleted;
+        }
+        finally { releaseFirst.TrySetResult(); releaseSecond.TrySetResult(); }
+        var replacementError = Record.Exception(() => Pump(newer));
+        var error = Record.Exception(() => Pump(applying));
+        Assert.False(completedBeforeReplacement, "The saved filter completed before its replacement options were available.");
+        Assert.Null(replacementError);
+        Assert.Null(error);
+        Assert.Equal("generated-catalog", view.CaptureFilter()["group"]);
+    });
+
+    private sealed class OptionsCounterObserver(Action<AssetLoadCounterMeasurement> observe)
+        : IObserver<KeyValuePair<string, object?>>
+    {
+        public void OnNext(KeyValuePair<string, object?> item)
+        { if (item.Value is AssetLoadCounterMeasurement counter) observe(counter); }
+        public void OnCompleted() { }
+        public void OnError(Exception error) { }
+    }
+
+    [Fact]
+    public void OlderOptionReadCannotOverwriteNewerChoices() => Run((view, catalog) =>
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int calls = 0;
+        catalog.FilterQuery = () =>
+        {
+            if (Interlocked.Increment(ref calls) == 1)
+            {
+                entered.TrySetResult();
+                release.Task.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+                return new([new(4, 2)], ["BC1"], ["Diffuse"], []);
+            }
+            return new([new(4, 2)], ["BC3"], ["Diffuse"], []);
+        };
+        var old = (Task)Invoke(view, "RefreshOptionsAsync", CancellationToken.None)!;
+        try
+        {
+            Pump(entered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+            Pump((Task)Invoke(view, "RefreshOptionsAsync", CancellationToken.None)!);
+        }
+        finally { release.TrySetResult(); }
+        Pump(old);
+        var formats = ((ComboBox)view.FindName("Formats")).Items.Cast<string>().ToArray();
+        Assert.Contains("BC3", formats);
+        Assert.DoesNotContain("BC1", formats);
+    });
+
+    [Fact]
+    public void OlderOptionsCannotClearTheRequestedCatalog() => Run((view, catalog) =>
+    {
+        const string key = "generated-catalog";
+        TextureDiscoveryQuery? requested = null;
+        catalog.QueryOverride = (query, token) =>
+        { requested = query; return Task.FromResult(catalog.Page(query, token)); };
+        Pump(view.ApplyFilterAsync(new Dictionary<string, string> { ["group"] = key, ["kind"] = "2" }));
+        Assert.Equal(key, requested!.CatalogKey);
+        catalog.FilterQuery = () => new([new(4, 2)], ["BGRA8"], ["Diffuse"], []);
+        Pump((Task)Invoke(view, "RefreshOptionsAsync", CancellationToken.None)!);
+        Assert.Equal(key, view.CaptureFilter()["group"]);
+        Pump(view.RefreshAsync());
+        Assert.Equal(key, requested!.CatalogKey);
+        ((ComboBox)view.FindName("Catalogs")).SelectedIndex = 0;
+        Assert.Equal("", view.CaptureFilter()["group"]);
+        Pump(view.RefreshAsync());
+        Assert.Null(requested!.CatalogKey);
+    }, beforeLoad: (_, catalog) => catalog.FilterQuery = () =>
+        new TextureDiscoveryFilterOptions([new(4, 2)], ["BGRA8"], ["Diffuse"], [])
+        { Catalogs = [new("generated-catalog", "Generated catalog")] });
+
+    [Fact]
+    public void UnavailableSavedCatalogKeepsItsRequestedKey() => Run((view, _) =>
+    {
+        var error = Record.Exception(() => Pump(view.ApplyFilterAsync(
+            new Dictionary<string, string> { ["group"] = "missing-generated-catalog" })));
+        Assert.IsType<InvalidOperationException>(error);
+        Assert.Equal("missing-generated-catalog", view.CaptureFilter()["group"]);
+    });
+
+    [Fact]
     public void InitialPagePublishesBeforeFilterOptionsAreRead() => Run((view, catalog) =>
     {
         Assert.NotEmpty(view.CurrentResources);

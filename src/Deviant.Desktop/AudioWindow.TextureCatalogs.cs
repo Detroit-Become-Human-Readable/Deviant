@@ -223,39 +223,7 @@ public partial class AudioWindow
         }
         if (currentView == "textures") { UpdateExplorerStatus(); RefreshActivity(); }
     }
-    private async Task ClearTextureCatalogsAsync()
-    {
-        await ClearSceneRenderingAsync();
-        textureCatalogTimer.Stop();
-        textureContextRefreshPending = false;
-        textureContextRefreshCancellation?.Cancel();
-        var catalogs = textureCatalogs; var discovery = textureDiscovery; var native = textureNative;
-        var creation = textureDiscoveryCreation; textureDiscoveryCreation = null;
-        textureCatalogs = null;
-        if (catalogs is not null) catalogs.Updated -= TextureCatalogsUpdated;
-        if (discovery is not null) discovery.Updated -= TextureDiscoveryUpdated;
-        textureExplorer.DiscoveryCancel = null;
-        discovery?.Cancel(); catalogs?.Cancel();
-        textureDependencyPause?.Dispose(); textureDependencyPause = null;
-        textureForegroundPause?.Dispose(); textureForegroundPause = null;
-        if (creation is not null)
-        {
-            var pending = await creation;
-            pending.Cancel();
-            if (!ReferenceEquals(pending, discovery)) await pending.DisposeAsync();
-        }
-        await textureExplorer.ClearAsync();
-        try { await textureContextRefresh; } catch (OperationCanceledException) { }
-        textureContextRefresh = Task.CompletedTask;
-        try { await textureNavigationDrain; } catch { }
-        textureNavigationDrain = Task.CompletedTask;
-        textureCatalogs = null; textureDiscovery = null; textureNative = null;
-        textureContextNodes.Clear(); textureNavigation.Children.Clear();
-        textureNavigation.Children.Add(ddsNavigation);
-        if (discovery is not null) await discovery.DisposeAsync();
-        if (native is not null) await native.DisposeAsync();
-        if (catalogs is not null) await catalogs.DisposeAsync();
-    }
+    private Task ClearTextureCatalogsAsync() => ClearTextureCatalogOwnersAsync();
 
     private async Task SelectTextureContextAsync(string key, long navigation, CancellationToken token)
     {

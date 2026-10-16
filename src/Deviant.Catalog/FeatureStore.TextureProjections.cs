@@ -153,6 +153,9 @@ public sealed partial class FeatureStore
                 (revision,profile,width,height,format,context_key,context_label,has_owner,identity,generation);
             """;
         using (TextureDiagnostic("TextureBrowser.Store.CurrentOptionsIndexBuild", TextureDiagnosticKey())) command.ExecuteNonQuery();
+        command.CommandText = "CREATE INDEX IF NOT EXISTS texture_history_options ON texture_projection_history_index " +
+            "(revision,profile,width,height,format,context_key,context_label,has_owner,identity,generation,next_generation)";
+        using (TextureDiagnostic("TextureBrowser.Store.HistoricalOptionsIndexBuild", TextureDiagnosticKey())) command.ExecuteNonQuery();
         transaction.Commit(); textureSchemaReady = true;
     }
 
@@ -163,14 +166,24 @@ public sealed partial class FeatureStore
         {
             EnsureTextureSchema();
             using var read = TextureCommand("SELECT generation,baseline_count FROM texture_projection_heads WHERE revision=$revision AND profile=$profile", profile);
+            long? existing = null;
             using (var rows = read.ExecuteReader())
-                if (rows.Read() && rows.GetInt32(1) == baseline.Count) return rows.GetInt64(0);
+                if (rows.Read() && rows.GetInt32(1) == baseline.Count) existing = rows.GetInt64(0);
+            if (existing is { } published)
+            {
+                using var prepare = connection.BeginTransaction();
+                RefreshTextureHistory(profile, prepare);
+                token.ThrowIfCancellationRequested();
+                prepare.Commit();
+                return published;
+            }
             using var transaction = connection.BeginTransaction();
             foreach (var table in new[] { "texture_projection_rows", "texture_projection_links", "texture_projection_evidence", "texture_projection_name_proofs", "texture_projection_owners", "texture_projection_catalog_members", "texture_projection_catalogs", "texture_projection_current_roles", "texture_projection_current_role_rows", "texture_projection_current_role_state" })
             {
                 using var clear = TextureCommand($"DELETE FROM {table} WHERE revision=$revision AND profile=$profile", profile, transaction); clear.ExecuteNonQuery();
             }
             foreach (var row in baseline) { token.ThrowIfCancellationRequested(); WriteTextureRow(profile, 1, row, false, transaction); }
+            RefreshTextureHistory(profile, transaction);
             using (var ready = TextureCommand("INSERT INTO texture_projection_current_role_state VALUES($revision,$profile,-1,'',1)", profile, transaction)) ready.ExecuteNonQuery();
             using var head = TextureCommand("INSERT OR REPLACE INTO texture_projection_heads VALUES($revision,$profile,1,$count)", profile, transaction);
             head.Parameters.AddWithValue("$count", baseline.Count); head.ExecuteNonQuery();
@@ -517,6 +530,7 @@ public sealed partial class FeatureStore
                 }
                 WriteTextureRow(profile, checked(head + 1), baseline[identity] with { Alias = null }, false, transaction);
             }
+            RefreshTextureHistory(profile, transaction);
             using (var update = TextureCommand("UPDATE texture_projection_heads SET generation=$generation WHERE revision=$revision AND profile=$profile", profile, transaction))
             { update.Parameters.AddWithValue("$generation", checked(head + 1)); update.ExecuteNonQuery(); }
             token.ThrowIfCancellationRequested();
@@ -637,6 +651,7 @@ public sealed partial class FeatureStore
             long repairedGeneration = checked(generation + 1);
             foreach (var entry in baseline.Values.Where(entry => affected.Contains(entry.Identity.Key)))
             { token.ThrowIfCancellationRequested(); WriteTextureRow(profile, repairedGeneration, entry, false, transaction); }
+            RefreshTextureHistory(profile, transaction);
             using (var head = TextureCommand("UPDATE texture_projection_heads SET generation=$generation WHERE revision=$revision AND profile=$profile", profile, transaction))
             { head.Parameters.AddWithValue("$generation", repairedGeneration); head.ExecuteNonQuery(); }
             token.ThrowIfCancellationRequested(); transaction.Commit(); return (IReadOnlyList<ResourceIdentity>)rebuild;

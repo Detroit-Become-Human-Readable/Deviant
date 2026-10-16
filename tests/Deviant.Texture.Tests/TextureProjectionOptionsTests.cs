@@ -10,7 +10,7 @@ namespace Deviant.Texture.Tests;
 public sealed class TextureProjectionOptionsTests
 {
     [Fact]
-    public async Task CurrentFiltersOnlyBuildTheCurrentCoveringIndexAndHistoryIsCreatedOnDemand()
+    public async Task PublishedProjectionsHaveBothCoveringIndexesBeforeFilterReads()
     {
         using var fixture = await Fixture.CreateAsync(); using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
         var baseline = fixture.Entry("Generated texture"); store.InitializeTextureProjections("options", [baseline]);
@@ -19,12 +19,12 @@ public sealed class TextureProjectionOptionsTests
         Assert.Equal(new[] { "BC1" }, store.TextureProjectionFilters("options", captured).Formats);
         var firstIndexes = Indexes(store);
         Assert.Contains("texture_current_options", firstIndexes);
-        Assert.DoesNotContain("texture_history_options", firstIndexes);
+        Assert.Contains("texture_history_options", firstIndexes);
         Assert.DoesNotContain("texture_options_owner_roles", firstIndexes);
         long current = store.CommitTextureProjectionOwner("options", fixture.Checkpoint,
             [fixture.Named(baseline, 64, 32, "BC3", "Normal", "Hall")]);
         Assert.Equal(new[] { "BC3" }, store.TextureProjectionFilters("options", current).Formats);
-        Assert.DoesNotContain("texture_history_options", Indexes(store));
+        Assert.Contains("texture_history_options", Indexes(store));
         Assert.Equal(new[] { "BC1" }, store.TextureProjectionFilters("options", captured).Formats);
         Assert.Contains("texture_history_options", Indexes(store));
         Assert.DoesNotContain("texture_options_owner_roles", Indexes(store));

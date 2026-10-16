@@ -20,6 +20,31 @@ namespace Deviant.Desktop.Tests;
 public sealed class TextureCatalogWorkflowTests
 {
     [Fact]
+    public void FaultedContextRefreshDoesNotPreventTextureOwnerCleanup() => WorkspaceCommitTests.Run((window, fixture) =>
+    {
+        OpenNative(window, fixture);
+        var catalogs = Field<TextureCatalogSession>(window, "textureCatalogs");
+        var fault = new InvalidDataException("Generated texture refresh failure.");
+        SetField(window, "textureContextRefresh", Task.FromException(fault));
+        Exception? error = null;
+        try { error = Record.Exception(() => Pump((Task)Invoke(window, "ClearTextureCatalogsAsync")!)); }
+        finally
+        {
+            // Let the existing window lifetime finish even when the regression fails.
+            SetField(window, "textureContextRefresh", Task.CompletedTask);
+            if (Field<TextureDiscoverySession?>(window, "textureDiscovery") is not null)
+            {
+                SetField(window, "textureCatalogs", catalogs);
+                Pump((Task)Invoke(window, "ClearTextureCatalogsAsync")!);
+            }
+        }
+        Assert.Null(error);
+        Assert.Null(Field<TextureDiscoverySession?>(window, "textureDiscovery"));
+        Assert.Null(Field<NativeTextureSession?>(window, "textureNative"));
+        Assert.Contains(Field<List<Exception>>(window, "textureBrowseFailures"), failure => ReferenceEquals(failure, fault));
+    });
+
+    [Fact]
     public void SavedCatalogKeyReadsRequestedGroupBeforeGlobalDiscoveryCompletes() => WorkspaceCommitTests.Run((window, fixture) =>
     {
         WriteManyCatalogs(fixture.Index); Pump(window.OpenArchiveAsync(fixture.Index));

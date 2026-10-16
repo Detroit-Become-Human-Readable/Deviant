@@ -33,98 +33,61 @@ public sealed partial class FeatureStore
         var cancellation = own.Token;
         await Task.Yield();
         cancellation.ThrowIfCancellationRequested();
-        for (var attempt = 0; attempt < 4; attempt++)
+        SqliteConnection? read = null;
+        SqliteTransaction? transaction = null;
+        bool registered = false;
+        try
         {
-            cancellation.ThrowIfCancellationRequested();
-            long generation;
-            lock (gate)
+            read = new SqliteConnection(new SqliteConnectionStringBuilder
+            { DataSource = path, Mode = SqliteOpenMode.ReadOnly, Pooling = false }.ToString());
+            read.Open();
+            lock (textureReadLifetimeGate)
             {
                 ObjectDisposedException.ThrowIf(textureReadDisposed, this);
-                generation = CatalogService.ExecuteInterruptible(connection, cancellation, () =>
-                {
-                    EnsureTextureSchema();
-                    using var transaction = connection.BeginTransaction(deferred: true);
-                    using var head = TextureCommand("SELECT generation FROM texture_projection_heads WHERE revision=$revision AND profile=$profile", lease.Profile, transaction);
-                    var value = Convert.ToInt64(head.ExecuteScalar() ?? 0L);
-                    transaction.Commit();
-                    return value;
-                });
+                activeTextureReadConnections.Add(read);
+                registered = true;
             }
-
-            try
+            CatalogService.ExecuteInterruptible(read, cancellation, () =>
             {
-                if (generation > 0)
-                    await PrepareCurrentTextureRolesAsync(lease.Profile, generation, cancellation).ConfigureAwait(false);
+                using var pragmas = read.CreateCommand();
+                pragmas.CommandText = "PRAGMA busy_timeout=5000; PRAGMA query_only=ON;";
+                pragmas.ExecuteNonQuery();
+                return true;
+            });
+            transaction = read.BeginTransaction(deferred: true);
+            if (!textureSchemaReady)
+            {
+                using var prepared = read.CreateCommand();
+                prepared.Transaction = transaction;
+                prepared.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE " +
+                    "(type='table' AND name='texture_projection_heads') OR (type='index' AND name='texture_history_options')";
+                long preparedObjects = CatalogService.ExecuteInterruptible(read, cancellation,
+                    () => Convert.ToInt64(prepared.ExecuteScalar()));
+                if (preparedObjects != 2)
+                    throw new ArchiveException("TextureProjectionUnavailable", "Texture projections are not prepared.");
             }
-            catch (ArchiveException error) when (error.Code == "TextureProjectionGenerationChanged")
-            { continue; }
-
-            SqliteConnection? read = null;
-            SqliteTransaction? transaction = null;
-            bool registered = false;
-            try
+            var snapshot = ReadTextureSnapshot(read, transaction, lease.Profile, cancellation);
+            lease.SetSnapshot(snapshot.Generation, snapshot.DataVersion, isCurrent: true);
+            AssetLoadDiagnostics.Counters("TextureBrowser.Store.OptionsSnapshot", lease.Profile,
+                new Dictionary<string, long> { ["Generation"] = snapshot.Generation });
+            var result = CatalogService.ExecuteInterruptible(read, cancellation, () =>
+                ReadTextureProjectionOptions(read, transaction, lease.Profile, snapshot.Generation, current: false, cancellation));
+            cancellation.ThrowIfCancellationRequested();
+            transaction.Commit();
+            return result;
+        }
+        finally
+        {
+            transaction?.Dispose();
+            if (read is not null)
             {
-                lock (gate)
-                {
-                    cancellation.ThrowIfCancellationRequested();
-                    ObjectDisposedException.ThrowIf(textureReadDisposed, this);
-                    using var prepare = connection.BeginTransaction(deferred: true);
-                    using var head = TextureCommand("SELECT generation FROM texture_projection_heads WHERE revision=$revision AND profile=$profile", lease.Profile, prepare);
-                    var writerGeneration = Convert.ToInt64(head.ExecuteScalar() ?? 0L);
-                    if (writerGeneration != generation) continue;
-
-                    bool current = writerGeneration != 0 && UseCurrentTextureProjection(lease.Profile, writerGeneration, prepare);
-                    if (!current)
-                    {
-                        RefreshTextureHistory(lease.Profile, prepare);
-                        using var historyIndex = connection.CreateCommand(); historyIndex.Transaction = prepare;
-                        historyIndex.CommandText = "CREATE INDEX IF NOT EXISTS texture_history_options ON texture_projection_history_index " +
-                            "(revision,profile,width,height,format,context_key,context_label,has_owner,identity,generation,next_generation)";
-                        historyIndex.ExecuteNonQuery();
-                    }
-                    prepare.Commit();
-                }
-
-                read = new SqliteConnection(new SqliteConnectionStringBuilder
-                { DataSource = path, Mode = SqliteOpenMode.ReadOnly, Pooling = false }.ToString());
-                read.Open();
-                lock (textureReadLifetimeGate)
-                {
-                    ObjectDisposedException.ThrowIf(textureReadDisposed, this);
-                    activeTextureReadConnections.Add(read);
-                    registered = true;
-                }
-                CatalogService.ExecuteInterruptible(read, cancellation, () =>
-                {
-                    using var pragmas = read.CreateCommand();
-                    pragmas.CommandText = "PRAGMA busy_timeout=5000; PRAGMA query_only=ON;";
-                    pragmas.ExecuteNonQuery();
-                    return true;
-                });
-                transaction = read.BeginTransaction(deferred: true);
-                var snapshot = ReadTextureSnapshot(read, transaction, lease.Profile, cancellation);
-                if (snapshot.Generation != generation || (snapshot.CurrentDirty != 0 && snapshot.HistoryDirty))
-                    continue;
-                lease.SetSnapshot(snapshot.Generation, snapshot.DataVersion, snapshot.CurrentDirty == 0);
-                var result = CatalogService.ExecuteInterruptible(read!, cancellation, () =>
-                    ReadTextureProjectionOptions(read!, transaction!, lease.Profile, generation, lease.IsCurrent, cancellation));
-                transaction!.Commit();
-                return result;
-            }
-            finally
-            {
-                transaction?.Dispose();
-                if (read is not null)
-                {
-                    if (registered) ReleaseTextureReadConnection(read);
-                    else read.Dispose();
-                }
+                if (registered) ReleaseTextureReadConnection(read);
+                else read.Dispose();
             }
         }
-        throw new ArchiveException("TextureProjectionGenerationChanged", "Texture filter options changed while they were being read.");
     }
 
-    private (long Generation, long DataVersion, int CurrentDirty, bool HistoryDirty) ReadTextureSnapshot(
+    private (long Generation, long DataVersion) ReadTextureSnapshot(
         SqliteConnection read, SqliteTransaction transaction, string profile, CancellationToken token)
         => CatalogService.ExecuteInterruptible(read, token, () =>
         {
@@ -134,13 +97,7 @@ public sealed partial class FeatureStore
             using var version = read.CreateCommand(); version.Transaction = transaction;
             version.CommandText = "PRAGMA data_version";
             var dataVersion = Convert.ToInt64(version.ExecuteScalar() ?? 0L);
-            using var dirty = ReadTextureCommand(read, transaction,
-                "SELECT EXISTS(SELECT 1 FROM texture_projection_current_dirty WHERE revision=$revision AND profile=$profile)", revision, profile);
-            var currentDirty = Convert.ToInt32(dirty.ExecuteScalar() ?? 0, System.Globalization.CultureInfo.InvariantCulture);
-            using var historyDirty = ReadTextureCommand(read, transaction,
-                "SELECT EXISTS(SELECT 1 FROM texture_projection_history_dirty WHERE revision=$revision AND profile=$profile)", revision, profile);
-            var historyPending = Convert.ToInt32(historyDirty.ExecuteScalar() ?? 0, System.Globalization.CultureInfo.InvariantCulture) != 0;
-            return (generation, dataVersion, currentDirty, historyPending);
+            return (generation, dataVersion);
         });
 
     private TextureDiscoveryFilterOptions ReadTextureProjectionOptions(SqliteConnection read,
@@ -222,6 +179,7 @@ public sealed partial class FeatureStore
         public string SourceRevision { get; }
         public long Generation { get; private set; }
         public long CurrentEpoch { get; private set; }
+        /// <summary>The generation was the published head when this read snapshot was captured.</summary>
         public bool IsCurrent { get; private set; }
         internal CancellationToken CancellationToken => cancellation.Token;
 

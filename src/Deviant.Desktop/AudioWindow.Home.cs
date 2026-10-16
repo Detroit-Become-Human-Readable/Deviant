@@ -80,6 +80,10 @@ public partial class AudioWindow
                     break;
                 default: throw new ArgumentException("Unknown home view.", nameof(view));
             }
+            await Dispatcher.InvokeAsync(() =>
+            {
+                if (navigation.Generation == navigationGeneration) SelectExplorerView(view);
+            }, DispatcherPriority.Loaded, linked.Token);
         }
         catch (OperationCanceledException) { }
         catch (Exception error) { NavigationError(error); }

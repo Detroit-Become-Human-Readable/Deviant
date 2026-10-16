@@ -11,6 +11,38 @@ namespace Deviant.Desktop.Tests;
 public sealed class WorkspaceCommitTests
 {
     [Fact]
+    public void ClosingAfterDrainFailureStillReleasesTheWorkspace() => Run((window, fixture) =>
+    {
+        Pump(window.OpenArchiveAsync(fixture.Index));
+        var fault = new InvalidDataException("Generated scene drain failure.");
+        var sceneDrain = typeof(AudioWindow).GetField("sceneNavigationDrain", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        sceneDrain.SetValue(window, Task.FromException(fault));
+        var unhandled = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dispatcher = Dispatcher.CurrentDispatcher;
+        DispatcherUnhandledExceptionEventHandler handler = (_, args) =>
+        { args.Handled = true; unhandled.TrySetResult(args.Exception); };
+        dispatcher.UnhandledException += handler;
+        bool closedWithoutUnhandled;
+        try
+        {
+            var closed = WindowTestLifetime.WaitClosedAsync(window);
+            window.Close();
+            Pump(Task.WhenAny(closed, unhandled.Task).WaitAsync(TimeSpan.FromSeconds(5)));
+            closedWithoutUnhandled = WindowTestLifetime.IsClosed(window) && !unhandled.Task.IsCompleted;
+            if (!WindowTestLifetime.IsClosed(window))
+            {
+                sceneDrain.SetValue(window, Task.CompletedTask);
+                typeof(AudioWindow).GetField("closingInProgress", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(window, false);
+                Pump(WindowTestLifetime.CloseAsync(window));
+            }
+        }
+        finally { dispatcher.UnhandledException -= handler; }
+        Assert.True(closedWithoutUnhandled, "Closing escaped to the dispatcher instead of completing cleanup.");
+        Assert.Null(window.CurrentSession);
+        Assert.Contains(Field<List<Exception>>(window, "closeFailures"), error => error.ToString().Contains(fault.Message, StringComparison.Ordinal));
+    });
+
+    [Fact]
     public void LaterWorkspaceWinsDelayedCommitAndHomeRemainsSelected()
     {
         Run((window,fixture)=>

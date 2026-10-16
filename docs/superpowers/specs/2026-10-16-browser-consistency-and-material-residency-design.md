@@ -1,6 +1,6 @@
 # Texture browser consistency and scene material residency
 
-Status: proposed specification, awaiting review.
+Status: plans confirmed; implementation in progress.
 
 ## Purpose and scope
 

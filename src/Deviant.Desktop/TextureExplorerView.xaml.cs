@@ -238,43 +238,28 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
         catch (OperationCanceledException) { }
     }
 
-    private async Task RefreshOptionsAsync(CancellationToken token = default)
+    private async Task RefreshOptionsCoreAsync(long request, CancellationToken token)
     {
-        using var diagnostic = TextureDiagnostic("TextureBrowser.Ui.Options", TextureDiagnosticKey());
         if (discovery is not { } owner) return;
         using var own = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token, workspace.Token, nativeWork.Token);
         var options = owner is TextureDiscoverySession production
             ? await production.ReadFilterOptionsAsync(own.Token)
             : await Task.Run(() => owner.FilterOptions, own.Token);
         own.Token.ThrowIfCancellationRequested();
-        if (!ReferenceEquals(owner, discovery) || suspended || cancelled) return;
-        var dimension = Dimensions.SelectedItem;
-        var format = Formats.SelectedItem as string; var role = Roles.SelectedItem as string;
-        var context = (Contexts.SelectedItem as TextureContextOption)?.Key;
-        var catalog = (Catalogs.SelectedItem as TextureContextOption)?.Key;
-        updating = true;
-        try
+        if (request != filterOptionsRequestVersion)
         {
-            Dimensions.ItemsSource = new object[] { "Any" }.Concat(options.Dimensions).ToArray();
-            Dimensions.SelectedItem = Dimensions.Items.Cast<object>().FirstOrDefault(item => Equals(item, dimension)) ?? Dimensions.Items[0];
-            Formats.ItemsSource = new[] { "Any" }.Concat(options.Formats).ToArray();
-            Formats.SelectedItem = Formats.Items.Cast<string>().FirstOrDefault(item => item == format) ?? "Any";
-            Roles.ItemsSource = new[] { "Any" }.Concat(options.VerifiedRoles).ToArray();
-            Roles.SelectedItem = Roles.Items.Cast<string>().FirstOrDefault(item => item == role) ?? "Any";
-            Contexts.ItemsSource = new[] { new TextureContextOption("", "Any") }.Concat(options.Contexts).ToArray();
-            Contexts.SelectedItem = Contexts.Items.Cast<TextureContextOption>().FirstOrDefault(item => item.Key == context) ?? Contexts.Items[0];
-            ContextFilter.Visibility = options.Contexts.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
-            Catalogs.ItemsSource = new[] { new TextureContextOption("", "Any") }.Concat(options.Catalogs).ToArray();
-            Catalogs.SelectedItem = Catalogs.Items.Cast<TextureContextOption>().FirstOrDefault(item => item.Key == catalog) ?? Catalogs.Items[0];
-            CatalogFilter.Visibility = options.Catalogs.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+            AssetLoadDiagnostics.Counters("TextureBrowser.Ui.OptionsSuperseded", owner.Revision.IndexContentId,
+                new Dictionary<string, long> { ["Request"] = request, ["Current"] = filterOptionsRequestVersion });
+            return;
         }
-        finally { updating = false; }
+        if (!ReferenceEquals(owner, discovery) || suspended || cancelled) return;
+        RenderFilterOptions(options);
     }
 
-    private TextureDiscoveryQuery Query()
+    private TextureDiscoveryQuery QueryFromControls()
     {
         var dimension = Dimensions.SelectedItem as TextureDimensionOption;
-        return new(Search.Text.Trim(), dimension?.Width, dimension?.Height,
+        return new(Search.Text, dimension?.Width, dimension?.Height,
             Formats.SelectedItem is string format && format != "Any" ? format : null,
             Roles.SelectedItem is string role && role != "Any" ? role : null,
             Relationships.SelectedIndex switch { 1 => true, 2 => false, _ => null },
@@ -347,7 +332,9 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     private void ScheduleQuery()
     {
         if (updating || discovery is null || suspended) return;
-        offset = 0; queryCancellation?.Cancel(); queryTimer.Stop(); queryTimer.Start();
+        offset = 0; ++filterInputVersion;
+        queryState = new(QueryFromControls(), selected?.Identity);
+        queryCancellation?.Cancel(); queryTimer.Stop(); queryTimer.Start();
         AssetLoadDiagnostics.Counters("TextureBrowser.Ui.DebounceScheduled", "texture-ui", new Dictionary<string, long>
         { ["QueryVersion"] = queryVersion, ["SearchLength"] = Search.Text.Length });
     }
@@ -394,7 +381,11 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
                     updating = true;
                     try
                     {
-                        if (reset) { Search.Text = ""; Dimensions.SelectedIndex = Formats.SelectedIndex = Roles.SelectedIndex = Relationships.SelectedIndex = Contexts.SelectedIndex = Catalogs.SelectedIndex = 0; Kinds.SelectedIndex = 2; }
+                        if (reset)
+                        {
+                            Search.Text = ""; Dimensions.SelectedIndex = Formats.SelectedIndex = Roles.SelectedIndex = Relationships.SelectedIndex = Contexts.SelectedIndex = Catalogs.SelectedIndex = 0; Kinds.SelectedIndex = 2;
+                            queryState = new(QueryFromControls(), selected?.Identity); ++filterInputVersion;
+                        }
                         Rows.ItemsSource = page.Entries.Select(item => new TextureExplorerCard(item)).ToArray();
                         offset = page.Offset; total = page.Total;
                         Previous.IsEnabled = offset > 0; Next.IsEnabled = offset + page.Entries.Count < total;
@@ -416,6 +407,7 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
 
     private void SetSelected(TextureDiscoveryEntry? entry, CancellationToken token = default)
     {
+        queryState = queryState with { SelectedIdentity = entry?.Identity };
         resourceSelection?.Cancel(); ++resourceRequestVersion;
         var changed = selected?.Identity != entry?.Identity;
         selected = entry;
@@ -816,52 +808,6 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
         finally { if (version == selectionVersion) ExportOriginal.IsEnabled = selected is not null && ExportOriginalAsync is not null; }
     }
 
-    public IReadOnlyDictionary<string, string> CaptureFilter()
-    {
-        var dimension = Dimensions.SelectedItem as TextureDimensionOption;
-        return new Dictionary<string, string>
-        {
-            ["search"] = Search.Text, ["width"] = dimension?.Width.ToString(CultureInfo.InvariantCulture) ?? "",
-            ["height"] = dimension?.Height.ToString(CultureInfo.InvariantCulture) ?? "",
-            ["format"] = Formats.SelectedItem as string ?? "Any", ["role"] = Roles.SelectedItem as string ?? "Any",
-            ["relationships"] = Relationships.SelectedIndex.ToString(CultureInfo.InvariantCulture),
-            ["sort"] = Sort.SelectedIndex.ToString(CultureInfo.InvariantCulture),
-            ["kind"] = Kinds.SelectedIndex.ToString(CultureInfo.InvariantCulture),
-            ["context"] = (Contexts.SelectedItem as TextureContextOption)?.Key ?? "", ["group"] = (Catalogs.SelectedItem as TextureContextOption)?.Key ?? ""
-        };
-    }
-    public async Task ApplyFilterAsync(IReadOnlyDictionary<string, string> values, CancellationToken token = default)
-    {
-        token.ThrowIfCancellationRequested(); await RefreshOptionsAsync(token);
-        object dimension = Dimensions.Items[0];
-        if (values.GetValueOrDefault("width", "").Length > 0 || values.GetValueOrDefault("height", "").Length > 0)
-        {
-            if (!int.TryParse(values.GetValueOrDefault("width"), NumberStyles.None, CultureInfo.InvariantCulture, out var width) ||
-                !int.TryParse(values.GetValueOrDefault("height"), NumberStyles.None, CultureInfo.InvariantCulture, out var height))
-                throw new InvalidOperationException("The saved dimensions are unavailable.");
-            dimension = Dimensions.Items.OfType<TextureDimensionOption>().FirstOrDefault(item => item.Width == width && item.Height == height)
-                ?? throw new InvalidOperationException("The saved dimensions are unavailable.");
-        }
-        var format = Formats.Items.Cast<string>().FirstOrDefault(item => item == values.GetValueOrDefault("format", "Any"))
-            ?? throw new InvalidOperationException("The saved format is unavailable.");
-        var role = Roles.Items.Cast<string>().FirstOrDefault(item => item == values.GetValueOrDefault("role", "Any"))
-            ?? throw new InvalidOperationException("The saved role is unavailable.");
-        var context = Contexts.Items.Cast<TextureContextOption>().FirstOrDefault(item => item.Key == values.GetValueOrDefault("context", ""))
-            ?? throw new InvalidOperationException("The saved owner is unavailable.");
-        var catalog = Catalogs.Items.Cast<TextureContextOption>().FirstOrDefault(item => item.Key == values.GetValueOrDefault("group", ""))
-            ?? throw new InvalidOperationException("The saved catalog is unavailable.");
-        if (!int.TryParse(values.GetValueOrDefault("relationships", "0"), out var relationships) || relationships < 0 || relationships > 2)
-            throw new InvalidOperationException("The saved relationship filter is unavailable.");
-        if (!int.TryParse(values.GetValueOrDefault("sort", "2"), out var sort) || sort < 0 || sort > 2)
-            throw new InvalidOperationException("The saved sort is unavailable.");
-        if (!int.TryParse(values.GetValueOrDefault("kind", "0"), out var kind) || kind < 0 || kind > 2)
-            throw new InvalidOperationException("The saved texture kind is unavailable.");
-        updating = true;
-        try { Search.Text = values.GetValueOrDefault("search", ""); Dimensions.SelectedItem = dimension; Formats.SelectedItem = format; Roles.SelectedItem = role; Contexts.SelectedItem = context; Catalogs.SelectedItem = catalog; Relationships.SelectedIndex = relationships; Sort.SelectedIndex = sort; Kinds.SelectedIndex = kind; offset = 0; }
-        finally { updating = false; }
-        queryTimer.Stop(); queryTask = Track(RefreshAsync(false, token)); await queryTask;
-    }
-
     private Task Track(Task task) { operations.Add(task); _ = ObserveAsync(task); return task; }
     private async Task ObserveAsync(Task task) { try { await task; } catch { } finally { operations.Remove(task); } }
     private async Task DrainAsync() { while (operations.Count > 0) { var batch = operations.ToArray(); try { await Task.WhenAll(batch); } catch { } foreach (var task in batch) operations.Remove(task); } }
@@ -899,6 +845,8 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
         ThumbnailsEnabled = false;
         workspace.Cancel(); await SuspendAsync();
         discovery = null; native = null; cache = null; documentReader = null;
+        queryState = TextureBrowserQueryState.Default; availableFilterOptions = null; ++filterInputVersion; ++filterOptionsRequestVersion;
+        filterOptionsPublication = Task.CompletedTask;
         nativePreviewSelection = null;
         selectedMetadataContext = null;
         workspace.Dispose(); workspace = new(); nativeWork.Dispose(); nativeWork = new();
