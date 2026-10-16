@@ -11,6 +11,135 @@ namespace Deviant.Texture.Tests;
 public sealed class TextureBrowseGenerationTests
 {
     [Fact]
+    public async Task CancelledSummaryCreationCanBeRetriedWithoutPublishingPartialOptions()
+    {
+        using var fixture = await GeneratedTextureProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        string profile = "cancel-summary-" + Guid.NewGuid().ToString("N");
+        store.InitializeTextureProjections(profile, [fixture.Entry("Generated texture")]);
+        using var pin = store.AcquireTextureBrowseReadLease(profile, fixture.Revision);
+        using var cancellation = new CancellationTokenSource();
+        int summaries = 0;
+        using var observer = AssetLoadDiagnostics.Listener.Subscribe(new CounterObserver(value =>
+        {
+            if (value.Stage == "TextureBrowser.Store.BrowseSummary" && value.Key == profile &&
+                Interlocked.Increment(ref summaries) == 1) cancellation.Cancel();
+        }));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pin.ReadAsync(new(), cancellation.Token));
+        var response = await pin.ReadAsync(new());
+        Assert.Equal(1, response.Coverage.Resources); Assert.Single(response.Page.Entries);
+        Assert.Equal(2, Volatile.Read(ref summaries));
+    }
+
+    [Fact]
+    public async Task ConcurrentSummaryReadersShareWorkAndCancelIndependently()
+    {
+        using var fixture = await GeneratedTextureProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        string profile = "shared-summary-" + Guid.NewGuid().ToString("N");
+        store.InitializeTextureProjections(profile, [fixture.Entry("Generated texture")]);
+        using var first = store.AcquireTextureBrowseReadLease(profile, fixture.Revision);
+        using var second = store.AcquireTextureBrowseReadLease(profile, fixture.Revision);
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        using var cancellation = new CancellationTokenSource(); int summaries = 0, waiters = 0;
+        using var waiting = new ManualResetEventSlim();
+        using var observer = AssetLoadDiagnostics.Listener.Subscribe(new CounterObserver(value =>
+        {
+            if (value.Key != profile) return;
+            if (value.Stage == "TextureBrowser.Store.BrowseSummaryWait" && Interlocked.Increment(ref waiters) == 2)
+                waiting.Set();
+            if (value.Stage != "TextureBrowser.Store.BrowseSummary") return;
+            Interlocked.Increment(ref summaries); entered.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(5)), "The summary barrier was not released.");
+        }));
+        var original = first.ReadAsync(new()); Task<TextureBrowseResponse>? other = null;
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            other = second.ReadAsync(new(), cancellation.Token);
+            Assert.True(waiting.Wait(TimeSpan.FromSeconds(5)), "The second reader must reach the occupied summary gate.");
+            cancellation.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => other.WaitAsync(TimeSpan.FromSeconds(2)));
+        }
+        finally { release.Set(); }
+        var response = await original;
+        var retry = await second.ReadAsync(new(Search: "Generated"));
+        Assert.Same(response.Options, retry.Options); Assert.Same(response.Coverage, retry.Coverage);
+        Assert.Equal(1, Volatile.Read(ref summaries));
+        Assert.Throws<NotSupportedException>(() => ((IList<string>)retry.Options.Formats).Add("BC7"));
+    }
+
+    [Fact]
+    public async Task SummaryEvictionKeepsAnActiveReaderAndBoundsIdleEntries()
+    {
+        using var fixture = await GeneratedTextureProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        using var writer = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        string profile = "active-summary-" + Guid.NewGuid().ToString("N");
+        store.InitializeTextureProjections(profile, [fixture.Entry("Generated texture")]);
+        using var pin = store.AcquireTextureBrowseReadLease(profile, fixture.Revision);
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        using var observer = AssetLoadDiagnostics.Listener.Subscribe(new CounterObserver(value =>
+        {
+            if (value.Stage != "TextureBrowser.Store.BrowseSummary" || value.Key != profile) return;
+            entered.Set(); Assert.True(release.Wait(TimeSpan.FromSeconds(5)));
+        }));
+        var pending = pin.ReadAsync(new());
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            for (int index = 0; index < 6; index++)
+            {
+                string other = profile + "/" + index;
+                writer.InitializeTextureProjections(other, [fixture.Entry("Other texture")]);
+                using var read = store.AcquireTextureBrowseReadLease(other, fixture.Revision);
+                Assert.Single((await read.ReadAsync(new())).Page.Entries);
+            }
+            Assert.True(Field<System.Collections.IDictionary>(store, "textureBrowseSummaries").Count <= 4);
+        }
+        finally { release.Set(); }
+        var response = await pending;
+        Assert.Single(response.Page.Entries);
+        Assert.Same(response.Options, (await pin.ReadAsync(new())).Options);
+        Assert.True(Field<System.Collections.IDictionary>(store, "textureBrowseSummaries").Count <= 4);
+    }
+
+    [Fact]
+    public async Task RepeatedQueriesReuseOnlyTheSamePublishedGenerationSummary()
+    {
+        using var fixture = await GeneratedTextureProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        using var writer = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        string profile = "summary-" + Guid.NewGuid().ToString("N");
+        var first = fixture.Entry("Texture A"); var second = fixture.Entry("Texture B", 2);
+        store.InitializeTextureProjections(profile, [first, second]);
+        int summaries = 0;
+        using var observer = AssetLoadDiagnostics.Listener.Subscribe(new CounterObserver(value =>
+        {
+            if (value.Stage == "TextureBrowser.Store.BrowseSummary" && value.Key == profile)
+                Interlocked.Increment(ref summaries);
+        }));
+        using var original = store.AcquireTextureBrowseReadLease(profile, fixture.Revision);
+        var page = await original.ReadAsync(new(Limit: 1));
+        using var search = store.AcquireTextureBrowseReadLease(profile, fixture.Revision);
+        var filtered = await search.ReadAsync(new(Search: "Texture B"));
+        Assert.Equal(1, Volatile.Read(ref summaries));
+        Assert.Equal(2, filtered.Coverage.Resources); Assert.Equal(1, filtered.Page.Total);
+        Assert.Equal(second.Identity, Assert.Single(filtered.Page.Entries).Identity);
+        Assert.Same(page.Options, filtered.Options); Assert.Same(page.Coverage, filtered.Coverage);
+        writer.CommitTextureProjectionOwner(profile, fixture.Checkpoint,
+            [fixture.Named(first, 32, 16, "BC1", "Diffuse", "Room")]);
+        using var replacement = store.AcquireTextureBrowseReadLease(profile, fixture.Revision);
+        var newer = await replacement.ReadAsync(new());
+        Assert.Equal(2, Volatile.Read(ref summaries));
+        Assert.Equal(new[] { "Diffuse" }, newer.Options.VerifiedRoles);
+        Assert.Empty(page.Options.VerifiedRoles);
+        var pinned = await original.ReadAsync(new(Offset: 1, Limit: 1));
+        Assert.Equal(page.Token, pinned.Token); Assert.Same(page.Options, pinned.Options);
+        Assert.Equal(2, Volatile.Read(ref summaries));
+    }
+
+    [Fact]
     public async Task UnpublishedSessionRebindsWithinItsFirstReadSnapshot()
     {
         using var fixture = await GeneratedTextureProjectionFixture.CreateAsync();

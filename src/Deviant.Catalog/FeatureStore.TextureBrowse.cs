@@ -175,6 +175,73 @@ public sealed partial class FeatureStore
             if (invalid.Count > 0) throw new TextureBrowseEvidenceException(entries.Where(entry => invalid.Contains(entry.Identity.Key))
                 .Select(entry => entry.Identity).ToArray(), pin.Generation);
         }
+        var summary = ReadTextureBrowseSummary(pin, read, transaction, cancellation);
+        return new(pin, new(entries, total, query.Offset), summary.Options, summary.Coverage);
+    }
+
+    private readonly object textureBrowseSummaryGate = new();
+    private readonly Dictionary<TextureBrowseToken, TextureBrowseSummarySlot> textureBrowseSummaries = [];
+    private long textureBrowseSummaryUse;
+    private const int MaximumTextureBrowseSummaries = 4;
+    private sealed record TextureBrowseSummary(TextureDiscoveryFilterOptions Options, TextureBrowseIndexCoverage Coverage);
+    private sealed class TextureBrowseSummarySlot
+    {
+        public readonly SemaphoreSlim Gate = new(1, 1);
+        public TextureBrowseSummary? Value;
+        public long LastUse;
+        public int Readers;
+    }
+
+    private TextureBrowseSummary ReadTextureBrowseSummary(TextureBrowseToken pin, SqliteConnection read,
+        SqliteTransaction transaction, CancellationToken cancellation)
+    {
+        TextureBrowseSummarySlot slot;
+        lock (textureBrowseSummaryGate)
+        {
+            if (!textureBrowseSummaries.TryGetValue(pin, out slot!))
+                textureBrowseSummaries.Add(pin, slot = new());
+            slot.LastUse = ++textureBrowseSummaryUse;
+            slot.Readers++;
+        }
+        bool entered = false;
+        try
+        {
+            AssetLoadDiagnostics.Counters("TextureBrowser.Store.BrowseSummaryWait", pin.Profile,
+                new Dictionary<string, long> { ["Generation"] = pin.Generation });
+            slot.Gate.Wait(cancellation); entered = true;
+            cancellation.ThrowIfCancellationRequested();
+            if (slot.Value is { } cached) return cached;
+            AssetLoadDiagnostics.Counters("TextureBrowser.Store.BrowseSummary", pin.Profile,
+                new Dictionary<string, long> { ["Generation"] = pin.Generation });
+            var summary = BuildTextureBrowseSummary(pin, read, transaction, cancellation);
+            lock (textureBrowseSummaryGate) slot.Value = summary;
+            return summary;
+        }
+        finally
+        {
+            if (entered) slot.Gate.Release();
+            lock (textureBrowseSummaryGate)
+            {
+                slot.Readers--;
+                if (slot.Readers == 0 && slot.Value is null)
+                {
+                    textureBrowseSummaries.Remove(pin);
+                    slot.Gate.Dispose();
+                }
+                foreach (var item in textureBrowseSummaries.Where(item => item.Value.Readers == 0)
+                    .OrderBy(item => item.Value.LastUse).Take(Math.Max(0, textureBrowseSummaries.Count - MaximumTextureBrowseSummaries))
+                    .ToArray())
+                {
+                    textureBrowseSummaries.Remove(item.Key);
+                    item.Value.Gate.Dispose();
+                }
+            }
+        }
+    }
+
+    private TextureBrowseSummary BuildTextureBrowseSummary(TextureBrowseToken pin, SqliteConnection read,
+        SqliteTransaction transaction, CancellationToken cancellation)
+    {
         var catalogs = new List<TextureContextOption>();
         using (var choices = ReadTextureCommand(read, transaction,
             "SELECT c.catalog,c.label FROM texture_projection_catalogs c WHERE c.revision=$revision AND c.profile=$profile " +
@@ -204,7 +271,15 @@ public sealed partial class FeatureStore
         var indexed = new TextureBrowseIndexCoverage(values.GetInt64(0), values.GetInt64(1), values.GetInt64(2), values.GetInt64(3),
             values.GetInt64(4), values.GetInt64(5), values.GetInt64(6), values.GetInt64(7), values.GetInt64(8), values.GetInt64(9),
             values.GetInt64(10), values.GetInt64(11));
-        return new(pin, new(entries, total, query.Offset), options, indexed);
+        cancellation.ThrowIfCancellationRequested();
+        return new(options with
+        {
+            Dimensions = Array.AsReadOnly(options.Dimensions.ToArray()),
+            Formats = Array.AsReadOnly(options.Formats.ToArray()),
+            VerifiedRoles = Array.AsReadOnly(options.VerifiedRoles.ToArray()),
+            Contexts = Array.AsReadOnly(options.Contexts.ToArray()),
+            Catalogs = Array.AsReadOnly(options.Catalogs.ToArray())
+        }, indexed);
     }
 
     private long? FindTextureBrowseOffset(TextureBrowseToken pin, ResourceIdentity identity, TextureDiscoveryQuery query,

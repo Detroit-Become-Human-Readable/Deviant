@@ -170,6 +170,11 @@ public sealed partial class FeatureStore
         {
             while (activeTextureReadConnections.Count != 0) Monitor.Wait(textureReadLifetimeGate);
         }
+        lock (textureBrowseSummaryGate)
+        {
+            foreach (var slot in textureBrowseSummaries.Values) slot.Gate.Dispose();
+            textureBrowseSummaries.Clear();
+        }
         textureReadLifetime.Dispose();
     }
 
