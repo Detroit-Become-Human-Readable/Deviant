@@ -153,8 +153,25 @@ public sealed partial class FeatureStore
                 (revision,profile,width,height,format,context_key,context_label,has_owner,identity,generation);
             """;
         using (TextureDiagnostic("TextureBrowser.Store.CurrentOptionsIndexBuild", TextureDiagnosticKey())) command.ExecuteNonQuery();
+        EnsureTextureAliasSchema(transaction);
+        using (var columns = connection.CreateCommand())
+        {
+            columns.Transaction = transaction;
+            columns.CommandText = "SELECT COUNT(*) FROM pragma_table_info('texture_projection_heads') WHERE name='minimum_generation'";
+            if (Convert.ToInt64(columns.ExecuteScalar()) == 0)
+            {
+                columns.CommandText = "ALTER TABLE texture_projection_heads ADD COLUMN minimum_generation INTEGER NOT NULL DEFAULT 1";
+                columns.ExecuteNonQuery();
+            }
+            columns.CommandText = "SELECT COUNT(*) FROM pragma_table_info('texture_projection_catalogs') WHERE name='label'";
+            if (Convert.ToInt64(columns.ExecuteScalar()) == 0)
+            {
+                columns.CommandText = "ALTER TABLE texture_projection_catalogs ADD COLUMN label TEXT";
+                columns.ExecuteNonQuery();
+            }
+        }
         command.CommandText = "CREATE INDEX IF NOT EXISTS texture_history_options ON texture_projection_history_index " +
-            "(revision,profile,width,height,format,context_key,context_label,has_owner,identity,generation,next_generation)";
+            "(revision,profile,width,height,format,context_key,context_label,has_owner,identity,generation,next_generation,data_generation)";
         using (TextureDiagnostic("TextureBrowser.Store.HistoricalOptionsIndexBuild", TextureDiagnosticKey())) command.ExecuteNonQuery();
         transaction.Commit(); textureSchemaReady = true;
     }
@@ -167,8 +184,13 @@ public sealed partial class FeatureStore
             EnsureTextureSchema();
             using var read = TextureCommand("SELECT generation,baseline_count FROM texture_projection_heads WHERE revision=$revision AND profile=$profile", profile);
             long? existing = null;
+            long previousGeneration = 0;
             using (var rows = read.ExecuteReader())
-                if (rows.Read() && rows.GetInt32(1) == baseline.Count) existing = rows.GetInt64(0);
+                if (rows.Read())
+                {
+                    previousGeneration = rows.GetInt64(0);
+                    if (rows.GetInt32(1) == baseline.Count) existing = previousGeneration;
+                }
             if (existing is { } published)
             {
                 using var prepare = connection.BeginTransaction();
@@ -182,12 +204,14 @@ public sealed partial class FeatureStore
             {
                 using var clear = TextureCommand($"DELETE FROM {table} WHERE revision=$revision AND profile=$profile", profile, transaction); clear.ExecuteNonQuery();
             }
-            foreach (var row in baseline) { token.ThrowIfCancellationRequested(); WriteTextureRow(profile, 1, row, false, transaction); }
+            long baselineGeneration = checked(previousGeneration + 1);
+            foreach (var row in baseline) { token.ThrowIfCancellationRequested(); WriteTextureRow(profile, baselineGeneration, row, false, transaction); }
             RefreshTextureHistory(profile, transaction);
             using (var ready = TextureCommand("INSERT INTO texture_projection_current_role_state VALUES($revision,$profile,-1,'',1)", profile, transaction)) ready.ExecuteNonQuery();
-            using var head = TextureCommand("INSERT OR REPLACE INTO texture_projection_heads VALUES($revision,$profile,1,$count)", profile, transaction);
+            using var head = TextureCommand("INSERT OR REPLACE INTO texture_projection_heads(revision,profile,generation,baseline_count,minimum_generation) VALUES($revision,$profile,$generation,$count,$generation)", profile, transaction);
+            head.Parameters.AddWithValue("$generation", baselineGeneration);
             head.Parameters.AddWithValue("$count", baseline.Count); head.ExecuteNonQuery();
-            token.ThrowIfCancellationRequested(); transaction.Commit(); return 1L;
+            token.ThrowIfCancellationRequested(); transaction.Commit(); return baselineGeneration;
         });
     }
 
@@ -203,6 +227,10 @@ public sealed partial class FeatureStore
     /// <summary>Publishes verified direct RAWL/RAW catalog membership independently of owner texture metadata.</summary>
     public long CommitTextureProjectionCatalog(string profile, SourceRevision sourceRevision, ResourceIdentity catalog,
         string tableSha256, IReadOnlyList<ResourceIdentity> members, CancellationToken token = default)
+        => CommitTextureProjectionCatalogCore(profile, sourceRevision, catalog, tableSha256, members, "Catalog " + catalog.Ordinal, token);
+
+    private long CommitTextureProjectionCatalogCore(string profile, SourceRevision sourceRevision, ResourceIdentity catalog,
+        string tableSha256, IReadOnlyList<ResourceIdentity> members, string label, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         if (revision != SourceIdentity.DerivedCacheKey(sourceRevision.IndexContentId, sourceRevision.PhysicalSourceStamp) ||
@@ -224,16 +252,18 @@ public sealed partial class FeatureStore
             EnsureTextureSchema(); using var transaction = connection.BeginTransaction();
             using var head = TextureCommand("SELECT generation FROM texture_projection_heads WHERE revision=$revision AND profile=$profile", profile, transaction);
             long current = Convert.ToInt64(head.ExecuteScalar() ?? throw new InvalidOperationException("Texture projection baseline is unavailable."));
-            using (var read = TextureCommand("SELECT table_sha256,members_sha256,member_count FROM texture_projection_catalogs WHERE revision=$revision AND profile=$profile AND catalog=$catalog ORDER BY generation DESC LIMIT 1", profile, transaction))
+            using (var read = TextureCommand("SELECT table_sha256,members_sha256,member_count,label FROM texture_projection_catalogs WHERE revision=$revision AND profile=$profile AND catalog=$catalog ORDER BY generation DESC LIMIT 1", profile, transaction))
             {
                 read.Parameters.AddWithValue("$catalog", catalog.Key); using var row = read.ExecuteReader();
-                if (row.Read() && row.GetString(0) == tableSha256 && row.GetString(1) == fingerprint && row.GetInt32(2) == keys.Count) return current;
+                if (row.Read() && row.GetString(0) == tableSha256 && row.GetString(1) == fingerprint && row.GetInt32(2) == keys.Count &&
+                    !row.IsDBNull(3) && row.GetString(3) == label) return current;
             }
             long generation = checked(current + 1);
-            using (var write = TextureCommand("INSERT INTO texture_projection_catalogs VALUES($revision,$profile,$catalog,$generation,$table,$members,$count)", profile, transaction))
+            using (var write = TextureCommand("INSERT INTO texture_projection_catalogs(revision,profile,catalog,generation,table_sha256,members_sha256,member_count,label) VALUES($revision,$profile,$catalog,$generation,$table,$members,$count,$label)", profile, transaction))
             {
                 write.Parameters.AddWithValue("$catalog", catalog.Key); write.Parameters.AddWithValue("$generation", generation);
                 write.Parameters.AddWithValue("$table", tableSha256); write.Parameters.AddWithValue("$members", fingerprint);
+                write.Parameters.AddWithValue("$label", label);
                 write.Parameters.AddWithValue("$count", keys.Count); write.ExecuteNonQuery();
             }
             foreach (string key in keys)
@@ -531,7 +561,7 @@ public sealed partial class FeatureStore
                 WriteTextureRow(profile, checked(head + 1), baseline[identity] with { Alias = null }, false, transaction);
             }
             RefreshTextureHistory(profile, transaction);
-            using (var update = TextureCommand("UPDATE texture_projection_heads SET generation=$generation WHERE revision=$revision AND profile=$profile", profile, transaction))
+            using (var update = TextureCommand("UPDATE texture_projection_heads SET generation=$generation,minimum_generation=$generation WHERE revision=$revision AND profile=$profile", profile, transaction))
             { update.Parameters.AddWithValue("$generation", checked(head + 1)); update.ExecuteNonQuery(); }
             token.ThrowIfCancellationRequested();
             using (TextureDiagnostic("TextureBrowser.Store.QuarantineCommit", diagnosticKey)) transaction.Commit();
@@ -541,16 +571,18 @@ public sealed partial class FeatureStore
 
     private HashSet<string> InvalidTextureProjectionRows(string profile, long generation,
         IReadOnlyList<ResourceIdentity> identities, Func<TextureEvidence, bool>? validEvidence,
-        bool damagedDetailEvidence, CancellationToken token)
+        bool damagedDetailEvidence, CancellationToken token, SqliteConnection? readConnection = null, SqliteTransaction? transaction = null)
     {
         var diagnosticKey = TextureDiagnosticKey();
         using var diagnostic = TextureDiagnostic("TextureBrowser.Store.Proof", diagnosticKey);
         var invalid = new HashSet<string>(StringComparer.Ordinal);
-        using var read = TextureCommand(TextureLatest + "SELECT p.identity,length(n.payload)," +
+        string sql = TextureLatest + "SELECT p.identity,length(n.payload)," +
             "CASE WHEN length(n.payload)<=$maximum THEN n.payload ELSE NULL END,n.sha256,n.evidence_sha256,e.sha256,p.thin,p.label,p.name_kind,p.search FROM latest p " +
             "LEFT JOIN texture_projection_name_proofs n ON n.revision=p.revision AND n.profile=p.profile AND n.identity=p.identity AND n.generation=p.generation " +
             "LEFT JOIN texture_projection_evidence e ON e.revision=p.revision AND e.profile=p.profile AND e.identity=p.identity AND e.generation=p.generation WHERE p.identity IN(" +
-            string.Join(',', identities.Select((_, index) => "$identity" + index)) + ") AND (e.identity IS NOT NULL OR p.has_metadata=1 OR p.has_owner=1 OR p.name_kind!=4)", profile);
+            string.Join(',', identities.Select((_, index) => "$identity" + index)) + ") AND (e.identity IS NOT NULL OR p.has_metadata=1 OR p.has_owner=1 OR p.name_kind!=4)";
+        using var read = readConnection is null ? TextureCommand(sql, profile, transaction) :
+            ReadTextureCommand(readConnection, transaction!, sql, revision, profile);
         read.Parameters.AddWithValue("$generation", generation); read.Parameters.AddWithValue("$maximum", MaximumTextureNameProofBytes);
         for (int i = 0; i < identities.Count; i++) read.Parameters.AddWithValue("$identity" + i, identities[i].Key);
         SqliteDataReader reader;
@@ -652,7 +684,7 @@ public sealed partial class FeatureStore
             foreach (var entry in baseline.Values.Where(entry => affected.Contains(entry.Identity.Key)))
             { token.ThrowIfCancellationRequested(); WriteTextureRow(profile, repairedGeneration, entry, false, transaction); }
             RefreshTextureHistory(profile, transaction);
-            using (var head = TextureCommand("UPDATE texture_projection_heads SET generation=$generation WHERE revision=$revision AND profile=$profile", profile, transaction))
+            using (var head = TextureCommand("UPDATE texture_projection_heads SET generation=$generation,minimum_generation=$generation WHERE revision=$revision AND profile=$profile", profile, transaction))
             { head.Parameters.AddWithValue("$generation", repairedGeneration); head.ExecuteNonQuery(); }
             token.ThrowIfCancellationRequested(); transaction.Commit(); return (IReadOnlyList<ResourceIdentity>)rebuild;
         });
@@ -768,7 +800,7 @@ public sealed partial class FeatureStore
     private static string TexturePageColumns(bool current)
     {
         string projection = TexturePageProjection.Replace("a.alias", "p.alias", StringComparison.Ordinal);
-        return current ? projection : projection.Replace("p.thin", "(SELECT r.thin FROM texture_projection_rows r WHERE r.revision=p.revision AND r.profile=p.profile AND r.identity=p.identity AND r.generation=p.generation)", StringComparison.Ordinal);
+        return current ? projection : projection.Replace("p.thin", "(SELECT r.thin FROM texture_projection_rows r WHERE r.revision=p.revision AND r.profile=p.profile AND r.identity=p.identity AND r.generation=" + HistoricalTextureDataGeneration + ")", StringComparison.Ordinal);
     }
 
     private void RefreshTextureHistory(string profile, SqliteTransaction transaction)
@@ -779,15 +811,30 @@ public sealed partial class FeatureStore
         using var refresh = TextureCommand("""
             DELETE FROM texture_projection_history_index AS h WHERE h.revision=$revision AND h.profile=$profile
                 AND h.identity IN(SELECT identity FROM texture_projection_history_dirty WHERE revision=$revision AND profile=$profile);
+            WITH events AS (
+                SELECT r.revision,r.profile,r.identity,r.generation FROM texture_projection_rows r
+                    JOIN texture_projection_history_dirty d ON d.revision=r.revision AND d.profile=r.profile AND d.identity=r.identity
+                    WHERE r.revision=$revision AND r.profile=$profile
+                UNION
+                SELECT a.revision,a.profile,a.identity,a.generation FROM texture_projection_alias_versions a
+                    JOIN texture_projection_history_dirty d ON d.revision=a.revision AND d.profile=a.profile AND d.identity=a.identity
+                    WHERE a.revision=$revision AND a.profile=$profile
+            ), timeline AS (
+                SELECT e.*,LEAD(e.generation) OVER(PARTITION BY e.revision,e.profile,e.identity ORDER BY e.generation) AS next_generation,
+                    (SELECT MAX(r.generation) FROM texture_projection_rows r WHERE r.revision=e.revision AND r.profile=e.profile
+                        AND r.identity=e.identity AND r.generation<=e.generation) AS data_generation FROM events e
+            )
             INSERT INTO texture_projection_history_index(revision,profile,identity,generation,next_generation,ordinal,name_kind,kind,label,sort_key,search,
-                width,height,format,context_key,context_label,has_owner,has_conflict,has_metadata,alias,name_rank,effective_sort,search_fold)
-            SELECT p.revision,p.profile,p.identity,p.generation,
-                LEAD(p.generation) OVER(PARTITION BY p.identity ORDER BY p.generation),p.ordinal,p.name_kind,p.kind,p.label,p.sort_key,p.search,
+                width,height,format,context_key,context_label,has_owner,has_conflict,has_metadata,alias,name_rank,effective_sort,search_fold,data_generation)
+            SELECT p.revision,p.profile,p.identity,t.generation,t.next_generation,p.ordinal,p.name_kind,p.kind,p.label,p.sort_key,p.search,
                 p.width,p.height,p.format,p.context_key,p.context_label,p.has_owner,p.has_conflict,p.has_metadata,a.alias,
                 CASE WHEN p.name_kind IN(0,1) THEN 0 WHEN p.name_kind=2 THEN 1 WHEN p.name_kind=3 THEN 2 WHEN a.alias IS NOT NULL THEN 3 ELSE 4 END,
-                CASE WHEN a.alias IS NULL THEN p.sort_key ELSE deviant_natural(a.alias) END,deviant_texture_fold(p.search||char(10)||COALESCE(a.alias,''))
-            FROM texture_projection_rows p JOIN texture_projection_history_dirty d ON d.revision=p.revision AND d.profile=p.profile AND d.identity=p.identity
-            LEFT JOIN texture_projection_aliases a ON a.revision=p.revision AND a.profile=p.profile AND a.identity=p.identity
+                CASE WHEN a.alias IS NULL THEN p.sort_key ELSE deviant_natural(a.alias) END,deviant_texture_fold(p.search||char(10)||COALESCE(a.alias,'')),p.generation
+            FROM timeline t JOIN texture_projection_rows p ON p.revision=t.revision AND p.profile=t.profile
+                AND p.identity=t.identity AND p.generation=t.data_generation
+            LEFT JOIN texture_projection_alias_versions a ON a.revision=p.revision AND a.profile=p.profile AND a.identity=p.identity
+                AND a.generation=(SELECT MAX(v.generation) FROM texture_projection_alias_versions v WHERE v.revision=p.revision
+                    AND v.profile=p.profile AND v.identity=p.identity AND v.generation<=t.generation)
             WHERE p.revision=$revision AND p.profile=$profile;
             DELETE FROM texture_projection_history_dirty WHERE revision=$revision AND profile=$profile;
             """, profile, transaction);
@@ -798,7 +845,7 @@ public sealed partial class FeatureStore
     {
         command.CommandText += current ?
             " AND p.identity IN(SELECT l.identity FROM texture_projection_links l JOIN texture_projection_current c ON c.revision=l.revision AND c.profile=l.profile AND c.identity=l.identity AND c.generation=l.generation WHERE l.revision=$revision AND l.profile=$profile AND l.relation=0 AND l.verified=1 AND l.link_key=$ownerKey)" :
-            " AND EXISTS(SELECT 1 FROM texture_projection_links l WHERE l.revision=p.revision AND l.profile=p.profile AND l.identity=p.identity AND l.generation=p.generation AND l.relation=0 AND l.verified=1 AND l.link_key=$ownerKey)";
+            " AND EXISTS(SELECT 1 FROM texture_projection_links l WHERE l.revision=p.revision AND l.profile=p.profile AND l.identity=p.identity AND l.generation=" + HistoricalTextureDataGeneration + " AND l.relation=0 AND l.verified=1 AND l.link_key=$ownerKey)";
         command.Parameters.AddWithValue("$ownerKey", owner);
     }
 
@@ -887,28 +934,14 @@ public sealed partial class FeatureStore
             bool current = UseCurrentTextureProjection(profile, generation, transaction);
             using var command = TextureCommand((current ? TextureCurrentLatest : TextureHistoricalLatest) + "SELECT COUNT(*),COALESCE(SUM(has_metadata),0)," +
                 "COALESCE(SUM(name_kind IN (0,1)),0),COALESCE(SUM(name_kind=2),0),COALESCE(SUM(name_kind=3),0),COALESCE(SUM(name_kind=4),0)," +
-                "(SELECT COUNT(*) FROM texture_projection_aliases WHERE revision=$revision AND profile=$profile),COALESCE(SUM(has_conflict),0)," +
+                "COALESCE(SUM(alias IS NOT NULL),0),COALESCE(SUM(has_conflict),0)," +
                 "COALESCE(SUM(kind=0),0),COALESCE(SUM(kind=1),0),COALESCE(SUM(kind=2),0)," +
-                "(SELECT COUNT(DISTINCT l.link_key) FROM latest p JOIN texture_projection_links l ON l.revision=p.revision AND l.profile=p.profile AND l.identity=p.identity AND l.generation=p.generation WHERE l.relation=3) FROM latest", profile, transaction);
+                "(SELECT COUNT(DISTINCT l.link_key) FROM latest p JOIN texture_projection_links l ON l.revision=p.revision AND l.profile=p.profile AND l.identity=p.identity AND l.generation=" +
+                (current ? "p.generation" : HistoricalTextureDataGeneration) + " WHERE l.relation=3) FROM latest", profile, transaction);
             command.Parameters.AddWithValue("$generation", generation); using var reader = command.ExecuteReader(); reader.Read();
             var result = new TextureProjectionStatistics(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2), reader.GetInt64(3),
                 reader.GetInt64(4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7), reader.GetInt64(8), reader.GetInt64(9), reader.GetInt64(10), reader.GetInt64(11));
             reader.Close(); token.ThrowIfCancellationRequested(); transaction.Commit(); return result;
-        });
-    }
-
-    public void ReplaceTextureProjectionAliases(string profile, IReadOnlyDictionary<ResourceIdentity, string> aliases, CancellationToken token = default)
-    {
-        lock (gate) CatalogService.ExecuteInterruptible(connection, token, () =>
-        {
-            EnsureTextureSchema(); using var transaction = connection.BeginTransaction();
-            using var clear = TextureCommand("DELETE FROM texture_projection_aliases WHERE revision=$revision AND profile=$profile", profile, transaction); clear.ExecuteNonQuery();
-            foreach (var pair in aliases)
-            {
-                token.ThrowIfCancellationRequested(); using var command = TextureCommand("INSERT INTO texture_projection_aliases VALUES($revision,$profile,$identity,$alias)", profile, transaction);
-                command.Parameters.AddWithValue("$identity", pair.Key.Key); command.Parameters.AddWithValue("$alias", pair.Value); command.ExecuteNonQuery();
-            }
-            token.ThrowIfCancellationRequested(); transaction.Commit(); return true;
         });
     }
 
@@ -933,18 +966,6 @@ public sealed partial class FeatureStore
         });
     }
 
-    public void SetTextureProjectionAlias(string profile, ResourceIdentity identity, string? alias, CancellationToken token = default)
-    {
-        lock (gate) CatalogService.ExecuteInterruptible(connection, token, () =>
-        {
-            EnsureTextureSchema(); using var command = TextureCommand(alias is null ?
-                "DELETE FROM texture_projection_aliases WHERE revision=$revision AND profile=$profile AND identity=$identity" :
-                "INSERT OR REPLACE INTO texture_projection_aliases VALUES($revision,$profile,$identity,$alias)", profile);
-            command.Parameters.AddWithValue("$identity", identity.Key); if (alias is not null) command.Parameters.AddWithValue("$alias", alias);
-            command.ExecuteNonQuery(); return true;
-        });
-    }
-
     public TextureDiscoveryFilterOptions TextureProjectionFilters(string profile, long generation, CancellationToken token = default)
     {
         if (generation == CaptureTextureProjectionGeneration(profile, token))
@@ -963,7 +984,7 @@ public sealed partial class FeatureStore
                 using var indexDiagnostic = TextureDiagnostic("TextureBrowser.Store.HistoricalOptionsIndexBuild", diagnosticKey);
                 using var index = connection.CreateCommand(); index.Transaction = transaction;
                 index.CommandText = "CREATE INDEX IF NOT EXISTS texture_history_options ON texture_projection_history_index " +
-                    "(revision,profile,width,height,format,context_key,context_label,has_owner,identity,generation,next_generation)";
+                "(revision,profile,width,height,format,context_key,context_label,has_owner,identity,generation,next_generation,data_generation)";
                 index.ExecuteNonQuery();
             }
             var dimensions = new List<TextureDimensionOption>(); var formats = new List<string>(); var roles = new List<string>(); var contexts = new List<TextureContextOption>();
@@ -1003,7 +1024,7 @@ public sealed partial class FeatureStore
                 "JOIN texture_projection_current_role_rows p ON p.revision=l.revision AND p.profile=l.profile AND p.identity=l.identity AND p.generation=l.generation " +
                 "WHERE l.revision=$revision AND l.profile=$profile ORDER BY l.role",
             "roles" => "SELECT DISTINCT l.role" + from + " CROSS JOIN texture_projection_links l INDEXED BY sqlite_autoindex_texture_projection_links_1 WHERE " + scope +
-                " AND l.revision=p.revision AND l.profile=p.profile AND l.identity=p.identity AND l.generation=p.generation" +
+                " AND l.revision=p.revision AND l.profile=p.profile AND l.identity=p.identity AND l.generation=" + HistoricalTextureDataGeneration +
                 " AND l.relation=0 AND l.verified=1 AND l.role!='' ORDER BY l.role",
             _ => throw new ArgumentOutOfRangeException(nameof(facet))
         };
@@ -1018,7 +1039,7 @@ public sealed partial class FeatureStore
     }
 
     private SqliteCommand TextureFilter(string profile, long generation, TextureDiscoveryQuery query, string projection,
-        bool current = false, SqliteTransaction? transaction = null)
+        bool current = false, SqliteTransaction? transaction = null, SqliteConnection? readConnection = null)
     {
         var terms = (query.Search ?? "").Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         bool trigram = terms.Any(term => term.EnumerateRunes().Count() >= 3);
@@ -1031,9 +1052,11 @@ public sealed partial class FeatureStore
             (!query.SortByName ? "ordinal" : !query.NamedFirst ? "name" :
                 query.Kind != TextureKindFilter.All ? "kind_named" :
                 !query.IncludeLodBuffers ? "visible_named" : "named");
-        var command = TextureCommand("SELECT " + projection + " FROM " + table + " p" + index +
+        string sql = "SELECT " + projection + " FROM " + table + " p" + index +
             " WHERE p.revision=$revision AND p.profile=$profile" + (current ? "" :
-                " AND p.generation<=$generation AND (p.next_generation IS NULL OR p.next_generation>$generation)"), profile, transaction);
+                " AND p.generation<=$generation AND (p.next_generation IS NULL OR p.next_generation>$generation)");
+        var command = readConnection is null ? TextureCommand(sql, profile, transaction) :
+            ReadTextureCommand(readConnection, transaction!, sql, revision, profile);
         command.Parameters.AddWithValue("$generation", generation);
         if (!query.IncludeLodBuffers) command.CommandText += " AND p.kind!=2";
         if (query.Kind != TextureKindFilter.All) { command.CommandText += " AND p.kind=$kind"; command.Parameters.AddWithValue("$kind", query.Kind == TextureKindFilter.Images ? 0 : 1); }
@@ -1056,7 +1079,7 @@ public sealed partial class FeatureStore
             command.CommandText += current ?
                 " AND (p.identity IN(SELECT l.identity FROM texture_projection_links l JOIN texture_projection_current c ON c.revision=l.revision AND c.profile=l.profile AND c.identity=l.identity AND c.generation=l.generation WHERE l.revision=$revision AND l.profile=$profile AND l.relation=2 AND l.verified=1 AND l.link_key=$catalog) OR " +
                 "p.identity IN(SELECT m.identity FROM texture_projection_catalog_members m WHERE m.revision=$revision AND m.profile=$profile AND m.catalog=$catalog AND m.generation=(SELECT MAX(c.generation) FROM texture_projection_catalogs c WHERE c.revision=$revision AND c.profile=$profile AND c.catalog=$catalog AND c.generation<=$generation)))" :
-                " AND (EXISTS(SELECT 1 FROM texture_projection_links l WHERE l.revision=p.revision AND l.profile=p.profile AND l.identity=p.identity AND l.generation=p.generation AND l.relation=2 AND l.verified=1 AND l.link_key=$catalog) OR EXISTS(" +
+                " AND (EXISTS(SELECT 1 FROM texture_projection_links l WHERE l.revision=p.revision AND l.profile=p.profile AND l.identity=p.identity AND l.generation=" + HistoricalTextureDataGeneration + " AND l.relation=2 AND l.verified=1 AND l.link_key=$catalog) OR EXISTS(" +
                 "SELECT 1 FROM texture_projection_catalog_members m WHERE " + TextureDirectMembership + " AND m.catalog=$catalog))";
             command.Parameters.AddWithValue("$catalog", catalog);
         }
@@ -1066,7 +1089,7 @@ public sealed partial class FeatureStore
             string parameter = "$relation" + relation;
             command.CommandText += current ?
                 " AND p.identity IN(SELECT l.identity FROM texture_projection_links l JOIN texture_projection_current c ON c.revision=l.revision AND c.profile=l.profile AND c.identity=l.identity AND c.generation=l.generation WHERE l.revision=$revision AND l.profile=$profile AND l.relation=" + relation + " AND l.verified=1 AND l." + column + "=" + parameter + ")" :
-                " AND EXISTS(SELECT 1 FROM texture_projection_links l WHERE l.revision=p.revision AND l.profile=p.profile AND l.identity=p.identity AND l.generation=p.generation AND l.relation=" + relation + " AND l.verified=1 AND l." + column + "=" + parameter + ")";
+                " AND EXISTS(SELECT 1 FROM texture_projection_links l WHERE l.revision=p.revision AND l.profile=p.profile AND l.identity=p.identity AND l.generation=" + HistoricalTextureDataGeneration + " AND l.relation=" + relation + " AND l.verified=1 AND l." + column + "=" + parameter + ")";
             command.Parameters.AddWithValue(parameter, value);
         }
         return command;

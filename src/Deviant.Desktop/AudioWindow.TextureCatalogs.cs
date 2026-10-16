@@ -204,14 +204,18 @@ public partial class AudioWindow
         }
     }
 
-    private async Task RefreshTextureCatalogsCoreAsync(CancellationToken token)
+    private Task RefreshTextureCatalogsCoreAsync(CancellationToken token)
     {
         var current = textureDiscovery;
-        if (currentView != "textures" || current is null || session is null || !ReferenceEquals(current.Snapshot, session.Snapshot)) return;
-        var navigation = navigationGeneration;
-        var options = await current.ReadFilterOptionsAsync(token);
-        if (navigation != navigationGeneration || currentView != "textures" || !ReferenceEquals(current, textureDiscovery)) return;
-        var contexts = options.Contexts;
+        if (currentView != "textures" || current is null || session is null || !ReferenceEquals(current.Snapshot, session.Snapshot)) return Task.CompletedTask;
+        token.ThrowIfCancellationRequested();
+        if (textureExplorer.PublishedBrowseResponse is not { } response || response.Token.Revision != current.Revision) return Task.CompletedTask;
+        ApplyTextureContexts(response.Options.Contexts);
+        return Task.CompletedTask;
+    }
+
+    private void ApplyTextureContexts(IReadOnlyList<TextureContextOption> contexts)
+    {
         var available = contexts.Select(context => context.Key).ToHashSet(StringComparer.Ordinal);
         foreach (var key in textureContextNodes.Keys.Where(key => !available.Contains(key)).ToArray())
         { textureNavigation.Children.Remove(textureContextNodes[key]); textureContextNodes.Remove(key); }
@@ -228,11 +232,6 @@ public partial class AudioWindow
     private async Task SelectTextureContextAsync(string key, long navigation, CancellationToken token)
     {
         var current = textureDiscovery ?? throw new InvalidOperationException("Open textures first.");
-        if (!current.FilterOptions.Contexts.Any(context => context.Key == key))
-        {
-            await current.EnrichmentTask.WaitAsync(token);
-            if (!current.FilterOptions.Contexts.Any(context => context.Key == key)) throw new InvalidOperationException("The saved owner is unavailable.");
-        }
         token.ThrowIfCancellationRequested();
         if (navigation != navigationGeneration || current != textureDiscovery) return;
         var values = new Dictionary<string, string>(textureExplorer.CaptureFilter()) { ["context"] = key, ["kind"] = "1" };

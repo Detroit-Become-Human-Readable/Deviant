@@ -9,6 +9,7 @@ public sealed partial class FeatureStore
     private readonly object textureReadLifetimeGate = new();
     private readonly CancellationTokenSource textureReadLifetime = new();
     private readonly HashSet<TextureProjectionReadLease> textureReadLeases = [];
+    private readonly HashSet<TextureBrowseReadLease> textureBrowseLeases = [];
     private readonly HashSet<SqliteConnection> activeTextureReadConnections = [];
     private volatile bool textureReadDisposed;
 
@@ -135,10 +136,13 @@ public sealed partial class FeatureStore
     {
         lock (textureReadLifetimeGate)
         {
-            activeTextureReadConnections.Remove(read);
-            Monitor.PulseAll(textureReadLifetimeGate);
+            try { read.Dispose(); }
+            finally
+            {
+                activeTextureReadConnections.Remove(read);
+                Monitor.PulseAll(textureReadLifetimeGate);
+            }
         }
-        read.Dispose();
     }
 
     private void ReleaseTextureReadLease(TextureProjectionReadLease lease)
@@ -149,16 +153,19 @@ public sealed partial class FeatureStore
     private void DisposeTextureProjectionReaders()
     {
         TextureProjectionReadLease[] leases;
+        TextureBrowseReadLease[] browseLeases;
         lock (textureReadLifetimeGate)
         {
             if (textureReadDisposed) return;
             textureReadDisposed = true;
             textureReadLifetime.Cancel();
             foreach (var read in activeTextureReadConnections)
-                SQLitePCL.raw.sqlite3_interrupt(read.Handle);
+                if (read.State == System.Data.ConnectionState.Open) SQLitePCL.raw.sqlite3_interrupt(read.Handle);
             leases = textureReadLeases.ToArray();
+            browseLeases = textureBrowseLeases.ToArray();
         }
         foreach (var lease in leases) lease.CancelAndDrain();
+        foreach (var lease in browseLeases) lease.Dispose();
         lock (textureReadLifetimeGate)
         {
             while (activeTextureReadConnections.Count != 0) Monitor.Wait(textureReadLifetimeGate);

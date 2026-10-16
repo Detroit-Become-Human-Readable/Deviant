@@ -16,6 +16,11 @@ public partial class AudioWindow
     {
         AssetsHost.Content = textureExplorer;
         textureExplorer.SelectedResourceChanged += (_, _) => SelectionForLibraryChanged();
+        textureExplorer.BrowsePublished += (_, _) =>
+        {
+            if (currentView == "textures" && textureExplorer.PublishedBrowseResponse is { } response &&
+                response.Token.Revision == textureDiscovery?.Revision) ApplyTextureContexts(response.Options.Contexts);
+        };
         textureExplorer.NativeImageBrowser.ExportStemProvider = source => textureExplorer.SelectedEntry is { } entry && entry.Identity == source.SelectedIdentity ? entry.ExportStem : null;
         textureExplorer.NativeImageBrowser.NamingEntryProvider = source => textureExplorer.SelectedEntry is { } entry && entry.Identity == source.SelectedIdentity ? entry : null;
         textureExplorer.NativeImageBrowser.ValidateNamingAsync = async (source, token) =>

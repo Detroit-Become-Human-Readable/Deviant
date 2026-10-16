@@ -18,7 +18,7 @@ public sealed record TextureDiscoverySessionOptions(int MaximumContainers = int.
 public sealed record TextureDiscoveryProgress(bool IsRunning, int Completed, int Total, int ImagesRead);
 
 /// <summary>Searchable texture metadata and relationships for one archive revision.</summary>
-public sealed class TextureDiscoverySession : ITextureDiscoveryCatalog
+public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
 {
     public const string Version = "texture-discovery-v8-mesh-slot-names";
     private const string MeshOwnerVersion = "meshdata41-material-shadcust91-v1";
@@ -426,11 +426,12 @@ public sealed class TextureDiscoverySession : ITextureDiscoveryCatalog
         return (TextureOwnerQueryState.Pending, true, "Texture discovery is pending for this container.");
     }
 
-    private TextureDiscoveryEntry[] OrderedEntries(TextureDiscoveryQuery query, CancellationToken token)
+    private TextureDiscoveryEntry[] OrderedEntries(TextureDiscoveryQuery query, CancellationToken token,
+        TextureDiscoveryEntry[]? captured = null, IReadOnlyList<TextureCatalogGroup>? capturedGroups = null)
     {
         TextureDiscoveryEntry[] all;
-        lock (gate) all = entries.Values.ToArray();
-        var groups = catalogs.Groups;
+        lock (gate) all = captured ?? entries.Values.ToArray();
+        var groups = capturedGroups ?? catalogs.Groups;
         if (query.CatalogKey is not null && !groups.Any(group => group.CatalogIdentity.Key == query.CatalogKey))
             throw new ArchiveException("UnknownTextureCatalog", "The selected texture catalog is unavailable.");
         var catalogKeys = groups.SelectMany(group => group.UniqueTextureMembers.Select(identity => (identity, group.CatalogIdentity.Key)))
@@ -443,8 +444,8 @@ public sealed class TextureDiscoverySession : ITextureDiscoveryCatalog
             if (!query.IncludeLodBuffers && item.Kind == TextureKind.LodBuffer) continue;
             if (query.Kind == TextureKindFilter.Images && item.Kind != TextureKind.Image) continue;
             if (query.Kind == TextureKindFilter.Lighting && item.Kind != TextureKind.Lighting) continue;
-            var alias = aliases.Get(item.Identity);
-            var entry = item with { Alias = alias, SearchText = alias is null ? item.SearchText : item.SearchText + "\n" + alias,
+            var alias = captured is null ? aliases.Get(item.Identity) : item.Alias;
+            var entry = item with { Alias = alias, SearchText = alias is null || captured is not null ? item.SearchText : item.SearchText + "\n" + alias,
                 CatalogKeys = item.CatalogKeys.Concat(catalogKeys.GetValueOrDefault(item.Identity) ?? []).Distinct(StringComparer.Ordinal).ToArray() };
             if (searchTerms.Any(term => !entry.SearchText.Contains(term, StringComparison.OrdinalIgnoreCase))) continue;
             if (query.Width.HasValue && entry.Width != query.Width || query.Height.HasValue && entry.Height != query.Height) continue;
@@ -1354,8 +1355,8 @@ public sealed class TextureDiscoverySession : ITextureDiscoveryCatalog
         {
             verified.EnsureUnchanged(); token.ThrowIfCancellationRequested();
             if (!projectionReady || features is not { } store) return;
-            store.CommitTextureProjectionCatalog(ProjectionProfile, Revision, group.CatalogIdentity,
-                group.ReferenceTableSha256, group.UniqueTextureMembers, token);
+            store.CommitNamedTextureProjectionCatalog(ProjectionProfile, Revision, group.CatalogIdentity,
+                group.ReferenceTableSha256, group.UniqueTextureMembers, group.Label, token);
             directCatalogProjections[group.CatalogIdentity] = group;
         }
     }
@@ -1569,8 +1570,9 @@ public sealed class TextureDiscoverySession : ITextureDiscoveryCatalog
 
     public async ValueTask DisposeAsync()
     {
-        if (disposed) return;
-        disposed = true; catalogs.Updated -= CatalogUpdated; lifetime.Cancel();
+        lock (gate) { if (disposed) return; disposed = true; }
+        catalogs.Updated -= CatalogUpdated; lifetime.Cancel();
+        await DrainBrowseSessionsAsync().ConfigureAwait(false);
         try { await enrichment.ConfigureAwait(false); } catch (OperationCanceledException) { }
         await enrichmentGate.WaitAsync().ConfigureAwait(false); enrichmentGate.Release();
         await detailsGate.WaitAsync().ConfigureAwait(false); detailsGate.Release();

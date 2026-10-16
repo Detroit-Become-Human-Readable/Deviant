@@ -11,6 +11,31 @@ namespace Deviant.Texture.Tests;
 
 public sealed class FeatureStoreTextureReadTests
 {
+    [Fact]
+    public async Task ReadConnectionStaysRegisteredUntilItsCloseFinishes()
+    {
+        using var fixture = await ProjectionFixture.CreateAsync();
+        using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
+        string profile = "close-" + Guid.NewGuid().ToString("N");
+        store.InitializeTextureProjections(profile, [fixture.Entry("Generated texture")]);
+        bool sawClose = false, registeredWhileClosing = false;
+        using var subscription = AssetLoadDiagnostics.Listener.Subscribe(new CounterObserver(counter =>
+        {
+            if (counter.Stage != "TextureBrowser.Store.OptionsSnapshot" || counter.Key != profile) return;
+            var active = Field<HashSet<SqliteConnection>>(store, "activeTextureReadConnections");
+            var connection = Assert.Single(active);
+            connection.StateChange += (_, state) =>
+            {
+                if (state.CurrentState != System.Data.ConnectionState.Closed) return;
+                sawClose = true; registeredWhileClosing = active.Contains(connection);
+            };
+        }));
+        using var lease = store.AcquireTextureProjectionReadLease(profile);
+        await lease.ReadFilterOptionsAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(sawClose);
+        Assert.True(registeredWhileClosing, "The owner reported no active connection before its close completed.");
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

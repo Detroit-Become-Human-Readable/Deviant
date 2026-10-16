@@ -11,6 +11,8 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
     private readonly string revision;
     private readonly string path;
     private readonly object gate = new();
+    private readonly object disposalGate = new();
+    private bool disposed;
     private volatile bool characterProjectionWritesEnabled;
     private volatile bool characterProjectionReady;
     private readonly Dictionary<Deviant.Assets.AssetQuery,long> counts = [];
@@ -425,5 +427,18 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
         if (query.MaximumDuration is { } max) { command.CommandText += " AND duration <= $maximum"; command.Parameters.AddWithValue("$maximum", max); }
         return command;
     }
-    public void Dispose() { DisposeTextureProjectionReaders(); DisposeCharacterReadConnection(); lock (gate) { Checkpoint(); connection.Dispose(); } }
+    public void Dispose()
+    {
+        lock (disposalGate)
+        {
+            if (disposed) return;
+            DisposeTextureProjectionReaders();
+            DisposeCharacterReadConnection();
+            lock (gate)
+            {
+                try { Checkpoint(); }
+                finally { connection.Dispose(); disposed = true; }
+            }
+        }
+    }
 }

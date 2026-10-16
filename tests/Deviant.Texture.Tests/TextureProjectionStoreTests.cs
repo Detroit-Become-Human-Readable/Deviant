@@ -174,10 +174,13 @@ public sealed class TextureProjectionStoreTests(ITestOutputHelper output)
         using var fixture = await Fixture.CreateAsync(); using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
         long generation = store.InitializeTextureProjections("profile", [fixture.Entry("C"), fixture.Entry("B", 2)]);
         store.SetTextureProjectionAlias("profile", fixture.Entry("C").Identity, "A saved alias");
-        Assert.Equal("A saved alias", Assert.Single(store.QueryTextureProjections("profile", generation, new(Search: "saved alias")).Entries).Alias);
-        Assert.Equal(fixture.Entry("C").Identity, store.QueryTextureProjections("profile", generation, new()).Entries[0].Identity);
-        store.SetTextureProjectionAlias("profile", fixture.Entry("C").Identity, null);
+        long aliased = store.CaptureTextureProjectionGeneration("profile");
         Assert.Empty(store.QueryTextureProjections("profile", generation, new(Search: "saved alias")).Entries);
+        Assert.Equal("A saved alias", Assert.Single(store.QueryTextureProjections("profile", aliased, new(Search: "saved alias")).Entries).Alias);
+        Assert.Equal(fixture.Entry("C").Identity, store.QueryTextureProjections("profile", aliased, new()).Entries[0].Identity);
+        store.SetTextureProjectionAlias("profile", fixture.Entry("C").Identity, null);
+        Assert.Empty(store.QueryTextureProjections("profile", store.CaptureTextureProjectionGeneration("profile"), new(Search: "saved alias")).Entries);
+        Assert.Single(store.QueryTextureProjections("profile", aliased, new(Search: "saved alias")).Entries);
     }
 
     [Fact]
@@ -212,26 +215,33 @@ public sealed class TextureProjectionStoreTests(ITestOutputHelper output)
         foreach (string search in new[] { "écr", "FUSE", "100%", "fu", "%" })
             Assert.Equal(first.Identity, Assert.Single(store.QueryTextureProjections("profile", generation, new(Search: search)).Entries).Identity);
         store.SetTextureProjectionAlias("profile", second.Identity, "Saved diffuse");
-        Assert.Equal(2, store.QueryTextureProjections("profile", generation, new(Search: "diffuse")).Total);
-        Assert.Equal(second.Identity, Assert.Single(store.QueryTextureProjections("profile", generation, new(Search: "saved diffuse")).Entries).Identity);
-        store.SetTextureProjectionAlias("profile", second.Identity, "Changed normal");
+        long aliased = store.CaptureTextureProjectionGeneration("profile");
         Assert.Equal(1, store.QueryTextureProjections("profile", generation, new(Search: "diffuse")).Total);
-        Assert.Empty(store.QueryTextureProjections("profile", generation, new(Search: "saved")).Entries);
+        Assert.Equal(2, store.QueryTextureProjections("profile", aliased, new(Search: "diffuse")).Total);
+        Assert.Equal(second.Identity, Assert.Single(store.QueryTextureProjections("profile", aliased, new(Search: "saved diffuse")).Entries).Identity);
+        store.SetTextureProjectionAlias("profile", second.Identity, "Changed normal");
+        long changed = store.CaptureTextureProjectionGeneration("profile");
+        Assert.Equal(1, store.QueryTextureProjections("profile", changed, new(Search: "diffuse")).Total);
+        Assert.Empty(store.QueryTextureProjections("profile", changed, new(Search: "saved")).Entries);
+        Assert.Equal(2, store.QueryTextureProjections("profile", aliased, new(Search: "diffuse")).Total);
     }
 
     [Fact]
-    public async Task CachedCountsAndCurrentAliasIndexesNoticeAnotherStoreWithoutGenerationChanges()
+    public async Task CachedCountsAndAliasIndexesNoticeAnotherStoresPublishedGeneration()
     {
         using var fixture = await Fixture.CreateAsync(); using var first = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
         long generation = first.InitializeTextureProjections("profile", [fixture.Entry("A"), fixture.Entry("B", 2)]);
         Assert.Equal(0, first.QueryTextureProjections("profile", generation, new(Search: "saved")).Total);
         using var second = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
         second.SetTextureProjectionAlias("profile", fixture.Entry("B", 2).Identity, "Saved alias");
-        Assert.Equal(generation, first.CaptureTextureProjectionGeneration("profile"));
-        Assert.Equal(1, first.QueryTextureProjections("profile", generation, new(Search: "saved", Offset: 100)).Total);
-        Assert.Equal("Saved alias", Assert.Single(first.QueryTextureProjections("profile", generation, new(Search: "saved")).Entries).Alias);
-        second.ReplaceTextureProjectionAliases("profile", new Dictionary<ResourceIdentity, string>());
+        long aliased = first.CaptureTextureProjectionGeneration("profile");
+        Assert.True(aliased > generation);
         Assert.Equal(0, first.QueryTextureProjections("profile", generation, new(Search: "saved")).Total);
+        Assert.Equal(1, first.QueryTextureProjections("profile", aliased, new(Search: "saved", Offset: 100)).Total);
+        Assert.Equal("Saved alias", Assert.Single(first.QueryTextureProjections("profile", aliased, new(Search: "saved")).Entries).Alias);
+        second.ReplaceTextureProjectionAliases("profile", new Dictionary<ResourceIdentity, string>());
+        Assert.Equal(0, first.QueryTextureProjections("profile", first.CaptureTextureProjectionGeneration("profile"), new(Search: "saved")).Total);
+        Assert.Equal(1, first.QueryTextureProjections("profile", aliased, new(Search: "saved")).Total);
     }
 
     [Fact]
@@ -319,7 +329,7 @@ public sealed class TextureProjectionStoreTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public async Task HistoricalIndexUpdatesAliasesWithoutChangingCapturedTextureVersions()
+    public async Task HistoricalGenerationsPreserveAliasesAndTextureVersions()
     {
         using var fixture = await Fixture.CreateAsync(); using var store = FeatureStore.Open(fixture.Snapshot, fixture.Cache);
         var first = fixture.Entry("Diffuse"); var second = fixture.Entry("Normal", 2);
@@ -327,12 +337,15 @@ public sealed class TextureProjectionStoreTests(ITestOutputHelper output)
         store.PrepareTextureProjectionIndexes("history");
         long current = store.CommitTextureProjectionOwner("history", fixture.Checkpoint, [second with { Label = "Renamed", SearchText = "Renamed" }]);
         store.SetTextureProjectionAlias("history", second.Identity, "A saved alias");
-        var historical = Assert.Single(store.QueryTextureProjections("history", captured, new(Search: "saved")).Entries);
-        Assert.Equal("Normal", historical.Label); Assert.Equal("A saved alias", historical.Alias);
-        Assert.Equal(second.Identity, store.QueryTextureProjections("history", captured, new()).Entries[0].Identity);
-        Assert.Equal("Renamed", Assert.Single(store.QueryTextureProjections("history", current, new(Search: "saved")).Entries).Label);
-        store.SetTextureProjectionAlias("history", second.Identity, null);
+        long aliased = store.CaptureTextureProjectionGeneration("history");
         Assert.Empty(store.QueryTextureProjections("history", captured, new(Search: "saved")).Entries);
+        Assert.Empty(store.QueryTextureProjections("history", current, new(Search: "saved")).Entries);
+        var historical = Assert.Single(store.QueryTextureProjections("history", aliased, new(Search: "saved")).Entries);
+        Assert.Equal("Renamed", historical.Label); Assert.Equal("A saved alias", historical.Alias);
+        Assert.Equal(second.Identity, store.QueryTextureProjections("history", aliased, new()).Entries[0].Identity);
+        store.SetTextureProjectionAlias("history", second.Identity, null);
+        Assert.Empty(store.QueryTextureProjections("history", store.CaptureTextureProjectionGeneration("history"), new(Search: "saved")).Entries);
+        Assert.Equal("A saved alias", Assert.Single(store.QueryTextureProjections("history", aliased, new(Search: "saved")).Entries).Alias);
         Assert.Equal(new[] { "Diffuse", "Normal" }, store.QueryTextureProjections("history", captured, new()).Entries.Select(entry => entry.Label));
     }
 

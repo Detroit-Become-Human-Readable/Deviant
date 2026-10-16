@@ -1,5 +1,7 @@
 using System.Windows;
 using Deviant.Assets;
+using Deviant.Browser;
+using Deviant.Core;
 
 namespace Deviant.Desktop;
 
@@ -10,6 +12,54 @@ public partial class TextureExplorerView
     private long filterInputVersion;
     private long filterOptionsRequestVersion;
     private Task filterOptionsPublication = Task.CompletedTask;
+    public TextureBrowseResponse? PublishedBrowseResponse { get; private set; }
+    public event EventHandler? BrowsePublished;
+    private ITextureBrowseSession? browseSession;
+    private TextureDiscoverySession? browseOwner;
+    private TextureDiscoveryQuery? browseKey;
+
+    private async Task<TextureBrowseResponse> ReadBrowseResponseAsync(TextureDiscoverySession owner,
+        TextureDiscoveryQuery query, long version, CancellationToken token, bool refreshGeneration = false)
+    {
+        var current = await GetBrowseSessionAsync(owner, query, version, token, refreshGeneration);
+        try { return await current.ReadAsync(query, token); }
+        catch (ArchiveException error) when (error.Code == "TextureBrowseGenerationUnavailable")
+        {
+            token.ThrowIfCancellationRequested();
+            if (version != queryVersion) throw new OperationCanceledException(token);
+            current = await GetBrowseSessionAsync(owner, query, version, token, refreshGeneration: true);
+            return await current.ReadAsync(query, token);
+        }
+    }
+
+    private async Task<ITextureBrowseSession> GetBrowseSessionAsync(TextureDiscoverySession owner,
+        TextureDiscoveryQuery query, long version, CancellationToken token, bool refreshGeneration = false)
+    {
+        var key = query with { Offset = 0, Limit = 1 };
+        ITextureBrowseSession current;
+        if (browseSession is null || browseOwner != owner || browseKey != key || refreshGeneration)
+        {
+            var opened = await owner.OpenBrowseAsync(query, token);
+            if (token.IsCancellationRequested || version != queryVersion || owner != discovery || suspended || disposed)
+            {
+                await opened.DisposeAsync();
+                throw new OperationCanceledException(token);
+            }
+            var previous = browseSession;
+            browseSession = opened; browseOwner = owner; browseKey = key;
+            current = opened;
+            if (previous is not null) await previous.DisposeAsync();
+        }
+        else current = browseSession;
+        return current;
+    }
+
+    private async Task ReleaseBrowseSessionAsync()
+    {
+        var previous = browseSession;
+        browseSession = null; browseOwner = null; browseKey = null;
+        if (previous is not null) await previous.DisposeAsync();
+    }
 
     private async Task RefreshOptionsAsync(CancellationToken token = default)
     {
@@ -82,6 +132,29 @@ public partial class TextureExplorerView
         queryState = requested;
         long request = ++filterInputVersion;
         queryCancellation?.Cancel(); queryTimer.Stop();
+        offset = 0;
+        if (discovery is TextureDiscoverySession)
+        {
+            try
+            {
+                queryTask = Track(RefreshAsync(false, token, throwOnError: true, refreshGeneration: true));
+                await queryTask;
+                token.ThrowIfCancellationRequested();
+                if (request != filterInputVersion) throw new OperationCanceledException();
+                requested.EnsureAvailable(availableFilterOptions ?? throw new InvalidOperationException("Texture filters are unavailable."));
+            }
+            catch (ArchiveException error) when (error.Code == "UnknownTextureCatalog")
+            {
+                if (request == filterInputVersion) ShowUnavailableFilter(error.Message);
+                throw new InvalidOperationException(error.Message, error);
+            }
+            catch (InvalidOperationException error)
+            {
+                if (request == filterInputVersion) ShowUnavailableFilter(error.Message);
+                throw;
+            }
+            return;
+        }
         try
         {
             await RefreshOptionsAsync(token);
@@ -93,15 +166,49 @@ public partial class TextureExplorerView
         catch (InvalidOperationException error)
         {
             if (request == filterInputVersion)
-            {
-                Rows.ItemsSource = Array.Empty<TextureExplorerCard>();
-                SetSelected(null); total = offset = 0;
-                Previous.IsEnabled = Next.IsEnabled = false;
-                Page.Text = "0"; Status.Text = error.Message; Empty.Visibility = Visibility.Visible;
-            }
+                ShowUnavailableFilter(error.Message);
             throw;
         }
         queryTask = Track(RefreshAsync(false, token));
         await queryTask;
+    }
+
+    private void ShowUnavailableFilter(string message)
+    {
+        Rows.ItemsSource = Array.Empty<TextureExplorerCard>();
+        SetSelected(null); total = offset = 0; PublishedBrowseResponse = null;
+        Previous.IsEnabled = Next.IsEnabled = false;
+        Page.Text = "0"; Status.Text = message; Empty.Visibility = Visibility.Visible;
+    }
+
+    private void PublishBrowseResult(TextureDiscoveryPage result, TextureBrowseResponse? response, long version,
+        bool preserveSelection, string diagnosticKey)
+    {
+        total = result.Total; offset = result.Offset;
+        if (response is not null) RenderFilterOptions(response.Options);
+        var previous = selected?.Identity; var cards = result.Entries.Select(entry => new TextureExplorerCard(entry)).ToArray();
+        updating = true;
+        try
+        {
+            Rows.ItemsSource = cards;
+            var same = cards.FirstOrDefault(card => card.Identity == previous);
+            Rows.SelectedItem = same;
+            if (same is not null) { if (nativePreviewSelection is null) selected = same.Entry; RenderDetails(false); }
+            else if (!preserveSelection) SetSelected(null);
+        }
+        finally { updating = false; }
+        var visible = cards.Select(card => card.Identity).ToHashSet();
+        foreach (var identity in nativeThumbnails.Keys.Where(identity => !visible.Contains(identity)).ToArray())
+        { nativeThumbnails.Remove(identity); thumbnailBindings.Remove(identity); thumbnailVersions.Remove(identity); }
+        Previous.IsEnabled = offset > 0; Next.IsEnabled = offset + cards.Length < total;
+        Page.Text = total == 0 ? "0" : $"{offset + 1:N0}–{offset + cards.Length:N0} of {total:N0}";
+        Status.Text = $"{total:N0} images";
+        publishedQueryVersion = version;
+        PublishedBrowseResponse = response;
+        AssetLoadDiagnostics.Counters("TextureBrowser.Ui.Published", diagnosticKey, new Dictionary<string, long>
+        { ["QueryVersion"] = version, ["Rows"] = cards.Length, ["Total"] = total, ["Offset"] = offset });
+        Empty.Visibility = total == 0 ? Visibility.Visible : Visibility.Collapsed;
+        BrowsePublished?.Invoke(this, EventArgs.Empty);
+        StartVisibleThumbnails();
     }
 }

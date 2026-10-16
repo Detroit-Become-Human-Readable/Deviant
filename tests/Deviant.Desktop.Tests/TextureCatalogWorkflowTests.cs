@@ -20,6 +20,58 @@ namespace Deviant.Desktop.Tests;
 public sealed class TextureCatalogWorkflowTests
 {
     [Fact]
+    public void ProductionBrowseKeepsOneTokenAcrossPagingAndPublishesCoverage() => WorkspaceCommitTests.Run((window, fixture) =>
+    {
+        DiscoveryFixture.WriteIndex(fixture.Index, Enumerable.Range(0, 205)
+            .Select(_ => (2229u, new byte[] { 1 })).ToArray());
+        Pump(window.OpenArchiveAsync(fixture.Index)); Pump(window.ShowTexturesAsync());
+        var discovery = Field<TextureDiscoverySession>(window, "textureDiscovery");
+        Pump(discovery.EnrichmentTask); Pump(window.TextureBrowser.RefreshAsync());
+        var first = Assert.IsType<TextureBrowseResponse>(window.TextureBrowser.PublishedBrowseResponse);
+        Assert.Equal(205, first.Page.Total); Assert.Equal(205, first.Coverage.Resources);
+        Assert.Equal(100, first.Page.Entries.Count); Assert.Equal(0, first.Page.Offset);
+        var store = Field<FeatureStore>(discovery, "features");
+        store.SetTextureProjectionAlias(first.Token.Profile, new(first.Token.Revision.IndexContentId, 200), "Saved alias");
+        Invoke(window.TextureBrowser, "Next_Click", window.TextureBrowser, new RoutedEventArgs());
+        Pump(Field<Task>(window.TextureBrowser, "queryTask"));
+        var second = Assert.IsType<TextureBrowseResponse>(window.TextureBrowser.PublishedBrowseResponse);
+        Assert.Equal(first.Token, second.Token); Assert.Equal(100, second.Page.Offset);
+        Assert.Equal(0, second.Coverage.Aliases);
+        Assert.DoesNotContain(first.Page.Entries, entry => second.Page.Entries.Any(next => next.Identity == entry.Identity));
+        Assert.Equal(second.Page.Entries.Select(entry => entry.Identity), window.TextureBrowser.CurrentResources.Select(card => card.Identity));
+        Invoke(window.TextureBrowser, "Previous_Click", window.TextureBrowser, new RoutedEventArgs());
+        Pump(Field<Task>(window.TextureBrowser, "queryTask"));
+        var previous = Assert.IsType<TextureBrowseResponse>(window.TextureBrowser.PublishedBrowseResponse);
+        Assert.Equal(first.Token, previous.Token);
+        Assert.Equal(first.Page.Entries.Select(entry => entry.Identity), previous.Page.Entries.Select(entry => entry.Identity));
+        Pump(window.TextureBrowser.RefreshAsync());
+        var latest = Assert.IsType<TextureBrowseResponse>(window.TextureBrowser.PublishedBrowseResponse);
+        Assert.True(latest.Token.Generation > first.Token.Generation); Assert.Equal(1, latest.Coverage.Aliases);
+    });
+
+    [Fact]
+    public void OffPageSelectionPublishesRowsAndOptionsFromTheExistingPin() => WorkspaceCommitTests.Run((window, fixture) =>
+    {
+        DiscoveryFixture.WriteIndex(fixture.Index, Enumerable.Range(0, 205).Select(_ => (2229u, new byte[] { 1 })).ToArray());
+        Pump(window.OpenArchiveAsync(fixture.Index)); Pump(window.ShowTexturesAsync());
+        var discovery = Field<TextureDiscoverySession>(window, "textureDiscovery");
+        Pump(discovery.EnrichmentTask); Pump(window.TextureBrowser.RefreshAsync());
+        var first = Assert.IsType<TextureBrowseResponse>(window.TextureBrowser.PublishedBrowseResponse);
+        var store = Field<FeatureStore>(discovery, "features");
+        store.SetTextureProjectionAlias(first.Token.Profile, new(first.Token.Revision.IndexContentId, 200), "Saved alias");
+        Pump(window.TextureBrowser.SelectResourceAsync(new(first.Token.Revision.IndexContentId, 150)));
+        var selected = Assert.IsType<TextureBrowseResponse>(window.TextureBrowser.PublishedBrowseResponse);
+        Assert.Equal(first.Token, selected.Token); Assert.Equal(100, selected.Page.Offset);
+        Assert.Equal(selected.Page.Entries.Select(entry => entry.Identity), window.TextureBrowser.CurrentResources.Select(card => card.Identity));
+        Assert.Equal(0, selected.Coverage.Aliases);
+        Invoke(window.TextureBrowser, "Next_Click", window.TextureBrowser, new RoutedEventArgs());
+        Pump(Field<Task>(window.TextureBrowser, "queryTask"));
+        var next = Assert.IsType<TextureBrowseResponse>(window.TextureBrowser.PublishedBrowseResponse);
+        Assert.Equal(first.Token, next.Token); Assert.Equal(200, next.Page.Offset); Assert.Equal(0, next.Coverage.Aliases);
+        Assert.Null(next.Page.Entries.Single(entry => entry.Identity.Ordinal == 200).Alias);
+    });
+
+    [Fact]
     public void FaultedContextRefreshDoesNotPreventTextureOwnerCleanup() => WorkspaceCommitTests.Run((window, fixture) =>
     {
         OpenNative(window, fixture);

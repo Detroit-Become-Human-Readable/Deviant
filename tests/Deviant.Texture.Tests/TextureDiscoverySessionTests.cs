@@ -17,6 +17,179 @@ namespace Deviant.Texture.Tests;
 public sealed class TextureDiscoverySessionTests
 {
     [Fact]
+    public async Task CorruptEntryRepairDoesNotPublishMixedGenerations()
+    {
+        using var fixture = new DiscoveryFixture();
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        await using var native = new NativeTextureSession(catalogs);
+        var cache = new CacheManager(fixture.Settings, new(fixture.Cache));
+        await using var discovery = new TextureDiscoverySession(catalogs, native, new AliasStore(fixture.Library), cache);
+        await discovery.EnrichmentTask;
+        discovery.Cancel();
+        await using var browse = await discovery.OpenBrowseAsync(new());
+        await using var secondPin = await discovery.OpenBrowseAsync(new());
+        var before = await browse.ReadAsync(new());
+        var entry = Assert.Single(before.Page.Entries);
+        Assert.Equal("environment.dds", entry.Label);
+        using (var db = new SqliteConnection(new SqliteConnectionStringBuilder
+            { DataSource = Directory.GetFiles(fixture.Cache, "catalog-*.sqlite3").Single(), Pooling = false }.ToString()))
+        {
+            db.Open(); using var corrupt = db.CreateCommand();
+            corrupt.CommandText = "UPDATE texture_projection_name_proofs SET payload=x'0001' WHERE identity=$identity";
+            corrupt.Parameters.AddWithValue("$identity", entry.Identity.Key); Assert.True(corrupt.ExecuteNonQuery() > 0);
+        }
+        var repaired = await browse.ReadAsync(new());
+        Assert.True(repaired.Token.Generation > before.Token.Generation);
+        Assert.Equal(TextureNameKind.Fallback, Assert.Single(repaired.Page.Entries).NameKind);
+        Assert.Empty(repaired.Options.Formats); Assert.Empty(repaired.Options.Contexts);
+        Assert.Equal(0, repaired.Coverage.TexturesWithMetadata); Assert.Equal(0, repaired.Coverage.OriginalNames);
+        Assert.Equal(1, repaired.Coverage.FallbackNames);
+        var invalidated = await Assert.ThrowsAsync<ArchiveException>(() => secondPin.ReadAsync(new()));
+        Assert.Equal("TextureBrowseGenerationUnavailable", invalidated.Code);
+    }
+
+    [Fact]
+    public async Task CatalogPreparationAndBackendSelectionUseTheSameSnapshot()
+    {
+        using var fixture = new DiscoveryFixture();
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        await using var native = new NativeTextureSession(catalogs);
+        var cache = new CacheManager(fixture.Settings, new(fixture.Cache));
+        await using var discovery = new TextureDiscoverySession(catalogs, native, new AliasStore(fixture.Library), cache);
+        await discovery.EnrichmentTask; discovery.Cancel();
+        var type = typeof(TextureDiscoverySession);
+        var ready = type.GetField("projectionReady", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var store = (FeatureStore)type.GetField("features", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(discovery)!;
+        var baseline = (Dictionary<ResourceIdentity, TextureDiscoveryEntry>)type.GetField("projectionBaseline", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(discovery)!;
+        string profile = (string)type.GetProperty("ProjectionProfile", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(discovery)!;
+        var entry = Assert.Single(baseline.Values);
+        store.InitializeTextureProjections(profile, [entry, entry with { Identity = new(snapshot.IndexContentId, 99) }]);
+        store.InitializeTextureProjections(profile, [entry]);
+        var direct = (Dictionary<ResourceIdentity, TextureCatalogGroup>)type.GetField("directCatalogProjections", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(discovery)!;
+        direct.Clear(); ready.SetValue(discovery, false);
+        int switches = 0;
+        using var observer = AssetLoadDiagnostics.Listener.Subscribe(new BrowseCounterObserver(value =>
+        {
+            if (value.Stage != "TextureBrowser.Browse.BackendSnapshot" || value.Key != snapshot.IndexContentId) return;
+            Interlocked.Increment(ref switches); ready.SetValue(discovery, true);
+        }));
+        var group = catalogs.Groups.Single(group => group.UniqueTextureMembers.Count > 0);
+        var query = new TextureDiscoveryQuery(CatalogKey: group.CatalogIdentity.Key);
+        await using var browse = await discovery.OpenBrowseAsync(query);
+        var response = await browse.ReadAsync(query);
+        Assert.Equal(1, switches); Assert.Equal(1, response.Page.Total);
+        Assert.Contains(response.Options.Catalogs, option => option.Key == group.CatalogIdentity.Key);
+    }
+
+    private sealed class BrowseCounterObserver(Action<AssetLoadCounterMeasurement> observe) : IObserver<KeyValuePair<string, object?>>
+    {
+        public void OnNext(KeyValuePair<string, object?> value)
+        { if (value.Value is AssetLoadCounterMeasurement counter) observe(counter); }
+        public void OnCompleted() { }
+        public void OnError(Exception error) { }
+    }
+
+    [Fact]
+    public async Task SourceReplacementInvalidatesBrowseSession()
+    {
+        using var fixture = new DiscoveryFixture();
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        string volume = snapshot.Volumes.Single().FilePath;
+        var bytes = await File.ReadAllBytesAsync(volume);
+        bytes[(int)snapshot.Records[2].Offset] ^= 1;
+        await File.WriteAllBytesAsync(volume, bytes);
+        File.SetLastWriteTimeUtc(volume, new DateTime(snapshot.Volumes.Single().Stamp.LastWriteUtcTicks, DateTimeKind.Utc).AddSeconds(2));
+        await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        await using var native = new NativeTextureSession(catalogs);
+        await using var discovery = new TextureDiscoverySession(catalogs, native, new AliasStore(fixture.Library));
+        var error = await Assert.ThrowsAsync<ArchiveException>(() => discovery.OpenBrowseAsync(new()));
+        Assert.Equal("SourceChanged", error.Code);
+    }
+
+    [Fact]
+    public async Task DirectCatalogCanPublishBeforeGlobalDiscoveryEnds()
+    {
+        using var fixture = new DiscoveryFixture(secondTextureCatalog: true);
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        await using var source = new CatalogReferenceProvider(snapshot, new AssetMemoryBudget());
+        var delayed = new DelayedCatalogProvider(source);
+        await using var catalogs = new TextureCatalogSession(snapshot, source.Revision, referenceProvider: delayed);
+        await delayed.FirstEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await using var native = new NativeTextureSession(catalogs);
+        var cache = new CacheManager(fixture.Settings, new(fixture.Cache));
+        await using var discovery = new TextureDiscoverySession(catalogs, native, new AliasStore(fixture.Library), cache);
+        try
+        {
+            delayed.FirstRelease.TrySetResult();
+            await delayed.SecondEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await WaitForNameAsync(discovery);
+            var group = Assert.Single(catalogs.Groups);
+            var query = new TextureDiscoveryQuery(CatalogKey: group.CatalogIdentity.Key);
+            await using var browse = await discovery.OpenBrowseAsync(query).WaitAsync(TimeSpan.FromSeconds(5));
+            var response = await browse.ReadAsync(query).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(1, response.Page.Total);
+            Assert.Equal(new TextureContextOption(group.CatalogIdentity.Key, group.Label), Assert.Single(response.Options.Catalogs));
+            Assert.False(catalogs.EnrichmentTask.IsCompleted);
+            delayed.SecondRelease.TrySetResult();
+            await catalogs.EnrichmentTask.WaitAsync(TimeSpan.FromSeconds(10));
+            await discovery.EnrichmentTask.WaitAsync(TimeSpan.FromSeconds(10));
+            var repeat = await browse.ReadAsync(query);
+            Assert.Equal(response.Token, repeat.Token);
+            Assert.Single(Assert.Single(repeat.Page.Entries).CatalogKeys);
+            await using var current = await discovery.OpenBrowseAsync(query);
+            var updated = await current.ReadAsync(query);
+            Assert.True(updated.Token.Generation > response.Token.Generation);
+            Assert.Equal(2, Assert.Single(updated.Page.Entries).CatalogKeys.Count);
+        }
+        finally { delayed.FirstRelease.TrySetResult(); delayed.SecondRelease.TrySetResult(); }
+    }
+
+    [Fact]
+    public async Task BrowsePagesDoNotWaitForTheProjectionWriter()
+    {
+        using var fixture = new DiscoveryFixture();
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        await using var native = new NativeTextureSession(catalogs);
+        var cache = new CacheManager(fixture.Settings, new(fixture.Cache));
+        await using var discovery = new TextureDiscoverySession(catalogs, native, new AliasStore(fixture.Library), cache);
+        await discovery.EnrichmentTask;
+        var store = (FeatureStore)typeof(TextureDiscoverySession).GetField("features", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(discovery)!;
+        var gate = typeof(FeatureStore).GetField("gate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(store)!;
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        var writer = Task.Run(() => { lock (gate) { entered.Set(); release.Wait(); } });
+        try
+        {
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            await using var browse = await discovery.OpenBrowseAsync(new()).WaitAsync(TimeSpan.FromSeconds(5));
+            var response = await browse.ReadAsync(new()).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal("environment.dds", Assert.Single(response.Page.Entries).Label);
+        }
+        finally { release.Set(); await writer.WaitAsync(TimeSpan.FromSeconds(5)); }
+    }
+
+    [Fact]
+    public async Task BrowseRejectsChangedFiltersAndDrainsOnOwnerDisposal()
+    {
+        using var fixture = new DiscoveryFixture(additionalTextures: 2);
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        await using var native = new NativeTextureSession(catalogs);
+        await using var discovery = new TextureDiscoverySession(catalogs, native, new AliasStore(fixture.Library));
+        await discovery.EnrichmentTask;
+        await using var browse = await discovery.OpenBrowseAsync(new(Limit: 1));
+        var first = await browse.ReadAsync(new(Limit: 1));
+        var second = await browse.ReadAsync(new(Offset: 1, Limit: 1));
+        Assert.Equal(first.Token, second.Token); Assert.Equal(3, second.Page.Total);
+        Assert.NotEqual(first.Page.Entries[0].Identity, second.Page.Entries[0].Identity);
+        await Assert.ThrowsAsync<ArgumentException>(() => browse.ReadAsync(new(Search: "changed", Limit: 1)));
+        await discovery.DisposeAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => browse.ReadAsync(new(Limit: 1)));
+    }
+
+    [Fact]
     public async Task DetailsStreamLargeEvidenceRangesWithoutAllocatingTheRangeInTheAssetBudget()
     {
         using var fixture = new DiscoveryFixture(rawSuffixBytes: 17 * 1024 * 1024);
