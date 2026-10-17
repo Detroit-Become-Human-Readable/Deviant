@@ -349,6 +349,117 @@ public sealed class TextureDiscoverySessionTests
         Assert.Equal(1, discovery.Coverage.MetadataInspected);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InterruptedQuarantineRebuildsFromSourceInsteadOfAStoredFeatureRecord(bool missingCheckpoint)
+    {
+        using var fixture = new DiscoveryFixture();
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        var budget = new AssetMemoryBudget();
+        await using var references = new CatalogReferenceProvider(snapshot, budget);
+        await using var catalogs = new TextureCatalogSession(snapshot, references.Revision, referenceProvider: references);
+        await using var native = new NativeTextureSession(catalogs);
+        var cache = new CacheManager(fixture.Settings, new(fixture.Cache)); var aliases = new AliasStore(fixture.Library);
+        string profile;
+        await using (var discovery = new TextureDiscoverySession(catalogs, native, aliases, cache))
+        {
+            await discovery.EnrichmentTask; discovery.Cancel();
+            var type = typeof(TextureDiscoverySession); const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            var store = (FeatureStore)type.GetField("features", flags)!.GetValue(discovery)!;
+            profile = (string)type.GetProperty("ProjectionProfile", flags)!.GetValue(discovery)!;
+            var entry = Assert.Single((await discovery.QueryAsync(new())).Entries);
+            var checkpoint = Assert.Single(store.LoadTextureProjectionOwners(profile));
+            var bindings = (System.Collections.IDictionary)type.GetField("metadataBindings", flags)!.GetValue(discovery)!;
+            var bindingArray = Array.CreateInstance(type.GetNestedType("Binding", BindingFlags.NonPublic)!, 1);
+            bindingArray.SetValue(((System.Collections.IEnumerable)bindings[entry.Identity]!).Cast<object>().First(), 0);
+            var derivedType = type.GetNestedType("ContainerFeatures", BindingFlags.NonPublic)!;
+            var derived = Activator.CreateInstance(derivedType, checkpoint.MetadataExtent.PayloadSha256!, bindingArray,
+                Array.CreateInstance(type.GetNestedType("Owner", BindingFlags.NonPublic)!, 0), Array.Empty<string>())!;
+            string hash = Convert.ToHexString(SHA256.HashData(System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(derived, derivedType))).ToLowerInvariant();
+            var row = snapshot.Records.Single(row => row.Ordinal == checkpoint.Identity.Ordinal);
+            var recordType = type.GetNestedType("NameIndexRecord", BindingFlags.NonPublic)!;
+            var record = Activator.CreateInstance(recordType, discovery.Revision, row.StoredSize, row.AlternativeSize,
+                checkpoint.MetadataExtent, checkpoint.MembershipKey, derived, hash)!;
+            string key = (string)type.GetMethod("NameIndexKey", flags)!.Invoke(discovery, [checkpoint.Identity])!;
+            string version = (string)type.GetProperty("NameIndexVersion", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
+            typeof(FeatureStore).GetMethod("Save")!.MakeGenericMethod(recordType).Invoke(store, [key, version, record, CancellationToken.None]);
+            Assert.NotNull(type.GetMethod("LoadNameIndex", flags)!.Invoke(discovery, [checkpoint.Identity, row, CancellationToken.None]));
+            using (var db = new SqliteConnection(new SqliteConnectionStringBuilder
+                { DataSource = Directory.GetFiles(fixture.Cache, "catalog-*.sqlite3").Single(), Pooling = false }.ToString()))
+            {
+                db.Open(); using var corrupt = db.CreateCommand();
+                corrupt.CommandText = "UPDATE texture_projection_name_proofs SET payload=x'00' WHERE identity=$identity";
+                corrupt.Parameters.AddWithValue("$identity", entry.Identity.Key); Assert.True(corrupt.ExecuteNonQuery() > 0);
+            }
+            await using var browse = await discovery.OpenBrowseAsync(new());
+            Assert.Equal(TextureNameKind.Fallback, Assert.Single((await browse.ReadAsync(new())).Page.Entries).NameKind);
+            Assert.NotEmpty(store.LoadTextureProjectionOwnerRebuilds(profile));
+            if (missingCheckpoint)
+            {
+                using var db = new SqliteConnection(new SqliteConnectionStringBuilder
+                    { DataSource = Directory.GetFiles(fixture.Cache, "catalog-*.sqlite3").Single(), Pooling = false }.ToString());
+                db.Open(); using var remove = db.CreateCommand(); remove.CommandText = "DELETE FROM texture_projection_owners";
+                remove.ExecuteNonQuery();
+            }
+        }
+        if (missingCheckpoint)
+        {
+            using var held = budget.Reserve(budget.MaximumBytes - budget.UsedBytes, "Generated foreground asset use");
+            await using var blocked = new TextureDiscoverySession(catalogs, native, aliases, cache);
+            await blocked.EnrichmentTask.WaitAsync(TimeSpan.FromSeconds(5));
+            var pending = Assert.Single((await blocked.QueryAsync(new())).Entries);
+            Assert.Null(pending.Width); Assert.Empty(pending.MetadataIdentities);
+        }
+        await using var resumed = new TextureDiscoverySession(catalogs, native, aliases, cache);
+        await resumed.EnrichmentTask.WaitAsync(TimeSpan.FromSeconds(5));
+        var actual = Assert.Single((await resumed.QueryAsync(new())).Entries);
+        Assert.Equal("environment.dds", actual.Label); Assert.Equal(TextureNameKind.OriginalPath, actual.NameKind);
+        using var reopened = FeatureStore.Open(snapshot, fixture.Cache);
+        Assert.Empty(reopened.LoadTextureProjectionOwnerRebuilds(profile));
+    }
+
+    [Fact]
+    public async Task HydrationDoesNotRestoreAnOlderVersionAfterRejectingTheCurrentProof()
+    {
+        using var fixture = new DiscoveryFixture();
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        await using var native = new NativeTextureSession(catalogs);
+        var cache = new CacheManager(fixture.Settings, new(fixture.Cache));
+        await using var discovery = new TextureDiscoverySession(catalogs, native, new AliasStore(fixture.Library), cache);
+        await discovery.EnrichmentTask; discovery.Cancel();
+        var type = typeof(TextureDiscoverySession); const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var store = (FeatureStore)type.GetField("features", flags)!.GetValue(discovery)!;
+        string profile = (string)type.GetProperty("ProjectionProfile", flags)!.GetValue(discovery)!;
+        var entry = Assert.Single((await discovery.QueryAsync(new())).Entries);
+        var checkpoint = Assert.Single(store.LoadTextureProjectionOwners(profile));
+        var bindings = (System.Collections.IDictionary)type.GetField("metadataBindings", flags)!.GetValue(discovery)!;
+        var bindingType = type.GetNestedType("Binding", BindingFlags.NonPublic)!;
+        var bindingArray = Array.CreateInstance(bindingType, 1);
+        bindingArray.SetValue(((System.Collections.IEnumerable)bindings[entry.Identity]!).Cast<object>().First(), 0);
+        var derivedType = type.GetNestedType("ContainerFeatures", BindingFlags.NonPublic)!;
+        var derived = Activator.CreateInstance(derivedType, checkpoint.MetadataExtent.PayloadSha256!, bindingArray,
+            Array.CreateInstance(type.GetNestedType("Owner", BindingFlags.NonPublic)!, 0), Array.Empty<string>())!;
+        store.CommitTextureProjectionOwner(profile, checkpoint, [entry with { Label = "Older cached texture" }]);
+        long rejected = store.CommitTextureProjectionOwner(profile, checkpoint, [entry]);
+        using (var db = new SqliteConnection(new SqliteConnectionStringBuilder
+            { DataSource = Directory.GetFiles(fixture.Cache, "catalog-*.sqlite3").Single(), Pooling = false }.ToString()))
+        {
+            db.Open(); using var corrupt = db.CreateCommand();
+            corrupt.CommandText = "UPDATE texture_projection_name_proofs SET payload=x'00' WHERE generation=$generation";
+            corrupt.Parameters.AddWithValue("$generation", rejected); Assert.Equal(1, corrupt.ExecuteNonQuery());
+        }
+        var entries = (Dictionary<ResourceIdentity, TextureDiscoveryEntry>)type.GetField("entries", flags)!.GetValue(discovery)!;
+        var baseline = (Dictionary<ResourceIdentity, TextureDiscoveryEntry>)type.GetField("projectionBaseline", flags)!.GetValue(discovery)!;
+        entries[entry.Identity] = baseline[entry.Identity];
+        type.GetMethod("HydrateProjectionTargets", flags)!.Invoke(discovery, [derived, CancellationToken.None]);
+        Assert.True(store.CaptureTextureProjectionGeneration(profile) > rejected);
+        Assert.Equal(TextureNameKind.Fallback, entries[entry.Identity].NameKind);
+        Assert.Empty(entries[entry.Identity].MetadataIdentities);
+        Assert.NotNull(store.LoadTextureProjectionOwner(profile, checkpoint.Identity));
+    }
+
     [Fact]
     public async Task FailedSummaryPreparationRetainsAnUpdateQueuedDuringTheFailure()
     {

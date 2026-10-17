@@ -174,6 +174,7 @@ public sealed partial class FeatureStore
             "(revision,profile,width,height,format,context_key,context_label,has_owner,identity,generation,next_generation,data_generation)";
         using (TextureDiagnostic("TextureBrowser.Store.HistoricalOptionsIndexBuild", TextureDiagnosticKey())) command.ExecuteNonQuery();
         EnsureTextureSummarySchema(transaction);
+        EnsureTextureRebuildSchema(transaction);
         transaction.Commit(); textureSchemaReady = true;
     }
 
@@ -201,7 +202,7 @@ public sealed partial class FeatureStore
                 return published;
             }
             using var transaction = connection.BeginTransaction();
-            foreach (var table in new[] { "texture_projection_rows", "texture_projection_links", "texture_projection_evidence", "texture_projection_name_proofs", "texture_projection_owners", "texture_projection_catalog_members", "texture_projection_catalogs", "texture_projection_current_roles", "texture_projection_current_role_rows", "texture_projection_current_role_state", "texture_browse_summary_state", "texture_browse_summary_members", "texture_browse_summary_values", "texture_browse_summary_dirty" })
+            foreach (var table in new[] { "texture_projection_rows", "texture_projection_links", "texture_projection_evidence", "texture_projection_name_proofs", "texture_projection_owners", "texture_projection_catalog_members", "texture_projection_catalogs", "texture_projection_current_roles", "texture_projection_current_role_rows", "texture_projection_current_role_state", "texture_browse_summary_state", "texture_browse_summary_members", "texture_browse_summary_values", "texture_browse_summary_dirty", "texture_projection_owner_rebuilds" })
             {
                 using var clear = TextureCommand($"DELETE FROM {table} WHERE revision=$revision AND profile=$profile", profile, transaction); clear.ExecuteNonQuery();
             }
@@ -321,9 +322,10 @@ public sealed partial class FeatureStore
     }
 
     public long CommitTextureProjectionOwner(string profile, TextureProjectionOwnerCheckpoint checkpoint,
-        IReadOnlyList<TextureDiscoveryEntry> rows, CancellationToken token = default)
+        IReadOnlyList<TextureDiscoveryEntry> rows, CancellationToken token = default, long? completedRebuildRequest = null)
     {
         ArgumentNullException.ThrowIfNull(checkpoint); ArgumentNullException.ThrowIfNull(rows);
+        if (completedRebuildRequest is < 1) throw new ArgumentOutOfRangeException(nameof(completedRebuildRequest));
         if (revision != SourceIdentity.DerivedCacheKey(checkpoint.Revision.IndexContentId, checkpoint.Revision.PhysicalSourceStamp) ||
             checkpoint.Identity.IndexContentId != checkpoint.Revision.IndexContentId || checkpoint.Identity.MemberPath is not null ||
             checkpoint.MetadataExtent.Length < 1 || checkpoint.MetadataExtent.PayloadSha256 is not { Length: 64 } digest || !digest.All(Uri.IsHexDigit))
@@ -355,6 +357,7 @@ public sealed partial class FeatureStore
             head.Parameters.AddWithValue("$generation", generation); head.ExecuteNonQuery();
             RefreshTextureHistory(profile, transaction);
             token.ThrowIfCancellationRequested();
+            CompleteTextureOwnerRebuild(profile, checkpoint.Identity, completedRebuildRequest, transaction);
             using (TextureDiagnostic("TextureBrowser.Store.OwnerCommit", diagnosticKey)) transaction.Commit();
             return generation;
         });
@@ -506,7 +509,8 @@ public sealed partial class FeatureStore
     public TextureProjectionQuarantine QuarantineTextureProjectionEvidence(string profile,
         IReadOnlyDictionary<ResourceIdentity, TextureDiscoveryEntry> baseline,
         IReadOnlyList<ResourceIdentity> identities, Func<TextureEvidence, bool>? validEvidence = null,
-        CancellationToken token = default, bool damagedDetailEvidence = false, long? validationGeneration = null)
+        CancellationToken token = default, bool damagedDetailEvidence = false, long? validationGeneration = null,
+        Func<ResourceIdentity, bool>? canRebuildOwner = null)
     {
         if (identities.Count > 1000) throw new ArgumentOutOfRangeException(nameof(identities));
         if (identities.Count == 0) return new([], []);
@@ -541,15 +545,20 @@ public sealed partial class FeatureStore
                 using var version = TextureCommand("SELECT MAX(generation) FROM texture_projection_rows WHERE revision=$revision AND profile=$profile AND identity=$identity AND generation<=$generation", profile, transaction);
                 version.Parameters.AddWithValue("$identity", identity.Key); version.Parameters.AddWithValue("$generation", validationGeneration ?? head);
                 long damagedGeneration = Convert.ToInt64(version.ExecuteScalar());
-                using (var links = TextureCommand("SELECT DISTINCT link_key FROM texture_projection_links WHERE revision=$revision AND profile=$profile AND identity=$identity AND relation IN(0,1,3,4) AND generation=$generation LIMIT 129", profile, transaction))
+                // Read publisher provenance independently; related resources must not hide the source owner.
+                foreach (string relations in new[] { "relation=4", "relation IN(0,1,3)" })
+                using (var links = TextureCommand("SELECT DISTINCT link_key FROM texture_projection_links WHERE revision=$revision AND profile=$profile " +
+                    "AND identity=$identity AND " + relations + " AND generation=$generation", profile, transaction))
                 {
                     links.Parameters.AddWithValue("$identity", identity.Key); links.Parameters.AddWithValue("$generation", damagedGeneration);
                     using var reader = links.ExecuteReader();
                     while (reader.Read())
                     {
                         token.ThrowIfCancellationRequested(); var parts = reader.GetString(0).Split(':');
-                        if (parts.Length == 3 && parts[0] == identity.IndexContentId && long.TryParse(parts[1], out long ordinal) && ordinal >= 0)
-                            owners.Add(new(identity.IndexContentId, ordinal));
+                        if (parts.Length != 3 || parts[0] != identity.IndexContentId || !long.TryParse(parts[1],
+                            System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long ordinal)) continue;
+                        var owner = new ResourceIdentity(identity.IndexContentId, ordinal);
+                        if (!owners.Contains(owner) && CanQueueTextureOwnerRebuild(profile, owner, canRebuildOwner, transaction)) owners.Add(owner);
                     }
                 }
                 // This identity alone is damaged; do not traverse its connected owner/texture graph.
@@ -561,6 +570,7 @@ public sealed partial class FeatureStore
                 }
                 WriteTextureRow(profile, checked(head + 1), baseline[identity] with { Alias = null }, false, transaction);
             }
+            QueueTextureOwnerRebuilds(profile, owners, transaction, token);
             RefreshTextureHistory(profile, transaction);
             using (var update = TextureCommand("UPDATE texture_projection_heads SET generation=$generation,minimum_generation=$generation WHERE revision=$revision AND profile=$profile", profile, transaction))
             { update.Parameters.AddWithValue("$generation", checked(head + 1)); update.ExecuteNonQuery(); }

@@ -723,6 +723,8 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
                     projectionStore.PrepareTextureProjectionIndexes(ProjectionProfile, token);
                     projectionReady = true;
                 }
+                foreach (var request in projectionStore.LoadTextureProjectionOwnerRebuilds(ProjectionProfile, token))
+                    if (CanRebuildTextureOwner(request.Identity)) lock (gate) projectionRebuildOwners.Add(request.Identity);
                 foreach (var checkpoint in projectionStore.LoadTextureProjectionOwners(ProjectionProfile, token))
                 {
                     token.ThrowIfCancellationRequested();
@@ -743,20 +745,32 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
             {
                 token.ThrowIfCancellationRequested();
                 var identity = new ResourceIdentity(Snapshot.IndexContentId, row.Ordinal);
-                if (projectionReady && inspectedContainers.Contains(identity)) continue;
+                lock (gate)
+                    if (projectionReady && (inspectedContainers.Contains(identity) || projectionRebuildOwners.Contains(identity))) continue;
                 NameIndexRecord? saved;
                 using (TextureDiagnostic("TextureBrowser.Restore.LoadIndex", TextureDiagnosticKey())) saved = LoadNameIndex(identity, row, token);
                 if (saved is null) continue;
                 using var restoreDiagnostic = TextureDiagnostic("TextureBrowser.Restore.Owner", TextureDiagnosticKey());
-                HydrateProjectionTargets(saved.Features, token);
-                lock (gate)
+                lock (projectionStoreGate)
                 {
-                    ApplyContainer(saved.Features);
-                    ownerContainers[identity] = new(saved.Features.SourceSha256, saved.Features.DirectoryParsed,
-                        saved.Features.Bindings.Count > 0, saved.Features.Diagnostics.FirstOrDefault());
-                    if (inspectedContainers.Add(identity)) containersInspected++;
+                    bool PendingRebuild()
+                    {
+                        if (!projectionReady || features?.TextureProjectionOwnerRebuildRequest(ProjectionProfile, identity, token) is null) return false;
+                        lock (gate) projectionRebuildOwners.Add(identity);
+                        return true;
+                    }
+                    if (PendingRebuild()) continue;
+                    HydrateProjectionTargets(saved.Features, token);
+                    if (PendingRebuild()) continue;
+                    lock (gate)
+                    {
+                        ApplyContainer(saved.Features);
+                        ownerContainers[identity] = new(saved.Features.SourceSha256, saved.Features.DirectoryParsed,
+                            saved.Features.Bindings.Count > 0, saved.Features.Diagnostics.FirstOrDefault());
+                        if (inspectedContainers.Add(identity)) containersInspected++;
+                    }
+                    PersistTextureProjection(identity, row, saved.MetadataExtent, saved.MembershipKey, saved.Features, false, token);
                 }
-                PersistTextureProjection(identity, row, saved.MetadataExtent, saved.MembershipKey, saved.Features, false, token);
                 if ((containersInspected & 63) == 0) PublishUpdate();
             }
             PublishUpdate();
@@ -830,6 +844,9 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
                                 completedStore.CompleteTextureProjectionOwner(ProjectionProfile, identity, memberKey, token);
                         continue;
                     }
+                    long? repairRequest = null;
+                    if (rebuilding) lock (projectionStoreGate)
+                        repairRequest = features?.TextureProjectionOwnerRebuildRequest(ProjectionProfile, identity, token);
                     if (!permittedContainers.Contains(identity))
                     {
                         if (permittedContainers.Count >= options.MaximumContainers)
@@ -841,7 +858,7 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
                     try
                     {
                         NameIndexRecord? saved;
-                        using (TextureDiagnostic("TextureBrowser.Restore.LoadIndex", TextureDiagnosticKey())) saved = LoadNameIndex(identity, row, token);
+                        using (TextureDiagnostic("TextureBrowser.Restore.LoadIndex", TextureDiagnosticKey())) saved = rebuilding ? null : LoadNameIndex(identity, row, token);
                         ContainerFeatures? derived = saved?.MembershipKey == memberKey ? saved.Features : null;
                         string sourceHash;
                         SourceExtent metadataExtent;
@@ -872,8 +889,7 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
                                 derived?.Diagnostics.FirstOrDefault());
                             if (inspectedContainers.Add(identity)) containersInspected++;
                         }
-                        if (derived is not null) PersistTextureProjection(identity, row, metadataExtent, memberKey, derived, catalogPassComplete, token);
-                        if (derived is not null) lock (gate) projectionRebuildOwners.Remove(identity);
+                        if (derived is not null) PersistTextureProjection(identity, row, metadataExtent, memberKey, derived, catalogPassComplete, token, repairRequest);
                         PublishUpdate();
                     }
                     catch (OperationCanceledException) { throw; }
@@ -1401,6 +1417,10 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
         checkpoint.MetadataExtent.PayloadSha256 is { Length: 64 } digest && digest.All(Uri.IsHexDigit);
 
     // Called under projectionStoreGate. Only compact proofs for the returned page are read; source repair runs in enrichment.
+    private bool CanRebuildTextureOwner(ResourceIdentity identity) => identity.IndexContentId == Snapshot.IndexContentId &&
+        identity.MemberPath is null && resources.TryGetValue(identity.Ordinal, out var row) &&
+        row.Type == 29 && row.Validity == ResourceValidity.Valid;
+
     private bool RepairProjectedPage(FeatureStore store, IReadOnlyList<ResourceIdentity> identities, CancellationToken token,
         bool damagedDetailEvidence = false, long? validationGeneration = null)
     {
@@ -1417,7 +1437,7 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
             return ValidProjectionEvidence(evidence, checkpoints);
         }
         var quarantine = store.QuarantineTextureProjectionEvidence(ProjectionProfile, projectionBaseline, identities,
-            Valid, token, damagedDetailEvidence, validationGeneration);
+            Valid, token, damagedDetailEvidence, validationGeneration, CanRebuildTextureOwner);
         if (quarantine.InvalidRows.Count == 0) return false;
         var diagnosticKey = TextureDiagnosticKey();
         using var waitDiagnostic = TextureDiagnostic("TextureBrowser.Browse.QuarantineApplyWait", diagnosticKey);
@@ -1521,7 +1541,7 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
     }
 
     private void PersistTextureProjection(ResourceIdentity identity, ResourceRecord row, SourceExtent extent,
-        string membershipKey, ContainerFeatures derived, bool complete, CancellationToken token)
+        string membershipKey, ContainerFeatures derived, bool complete, CancellationToken token, long? repairRequest = null)
     {
         var diagnosticKey = TextureDiagnosticKey();
         using var waitDiagnostic = TextureDiagnostic("TextureBrowser.Restore.PublishWait", diagnosticKey);
@@ -1535,7 +1555,16 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
                 .Select(key => entries[key] with { Alias = null, CatalogKeys = entries[key].CatalogKeys.Concat(
                     supportingCatalogs.GetValueOrDefault(key)?.Select(catalog => catalog.Key) ?? []).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray() }).ToArray();
             store.CommitTextureProjectionOwner(ProjectionProfile, new(Revision, identity, row.StoredSize, row.AlternativeSize,
-                extent, membershipKey, derived.DirectoryParsed, derived.Bindings.Count > 0, derived.Diagnostics.FirstOrDefault(), complete), updated, token);
+                extent, membershipKey, derived.DirectoryParsed, derived.Bindings.Count > 0, derived.Diagnostics.FirstOrDefault(), complete), updated, token, repairRequest);
+            bool pending = store.TextureProjectionOwnerRebuildRequest(ProjectionProfile, identity, token) is not null;
+            lock (gate)
+            {
+                if (pending)
+                {
+                    projectionRebuildOwners.Add(identity); processedMemberships.Remove(identity); enrichmentRequested = true;
+                }
+                else projectionRebuildOwners.Remove(identity);
+            }
         }
     }
 
@@ -1549,13 +1578,14 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
             using var holdDiagnostic = TextureDiagnostic("TextureBrowser.Restore.HydrateHold", diagnosticKey);
             AssetLoadDiagnostics.Counters("TextureBrowser.Restore.Bindings", diagnosticKey, new Dictionary<string, long> { ["Bindings"] = derived.Bindings.Count });
             if (!projectionReady || features is not { } store) return;
-            long generation = store.CaptureTextureProjectionGeneration(ProjectionProfile, token);
             foreach (var key in derived.Bindings.Select(binding => binding.Texture).Distinct())
             {
                 bool needsEvidence;
                 lock (gate) needsEvidence = entries.TryGetValue(key, out var current) && current.MetadataIdentities.Count == 0;
                 if (!needsEvidence) continue;
-                using (TextureDiagnostic("TextureBrowser.Restore.Proof", diagnosticKey)) RepairProjectedPage(store, [key], token);
+                using (TextureDiagnostic("TextureBrowser.Restore.Proof", diagnosticKey))
+                    if (RepairProjectedPage(store, [key], token)) continue;
+                long generation = store.CaptureTextureProjectionGeneration(ProjectionProfile, token);
                 TextureDiscoveryEntry? previous;
                 using (TextureDiagnostic("TextureBrowser.Restore.Evidence", diagnosticKey))
                     previous = store.LoadTextureProjectionDetails(ProjectionProfile, generation, key, token);
