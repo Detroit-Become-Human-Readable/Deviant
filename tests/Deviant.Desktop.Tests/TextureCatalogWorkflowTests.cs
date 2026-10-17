@@ -19,6 +19,8 @@ namespace Deviant.Desktop.Tests;
 [Collection("WPF")]
 public sealed class TextureCatalogWorkflowTests
 {
+    private const int ManyCatalogCount = 205;
+    private const int RequestedCatalogOrdinal = 200;
     [Fact]
     public void ProductionBrowseKeepsOneTokenAcrossPagingAndPublishesCoverage() => WorkspaceCommitTests.Run((window, fixture) =>
     {
@@ -102,15 +104,20 @@ public sealed class TextureCatalogWorkflowTests
         WriteManyCatalogs(fixture.Index); Pump(window.OpenArchiveAsync(fixture.Index));
         using var held = new HeldDiscovery(window); Pump(window.ShowTexturesAsync());
         var catalogs = held.Session; Assert.False(catalogs.EnrichmentTask.IsCompleted);
-        var target = new ResourceIdentity(window.CurrentSession!.Snapshot.IndexContentId, 8000);
+        using var backgroundPause = catalogs.PauseBackgroundDiscovery();
+        Assert.Equal(ManyCatalogCount, catalogs.Progress.CatalogsAvailable);
+        Assert.Equal(0, catalogs.Progress.CatalogsVisited);
+        var target = new ResourceIdentity(window.CurrentSession!.Snapshot.IndexContentId, RequestedCatalogOrdinal);
         var library = new LibraryStore(fixture.Library); var workspace = Pump(library.ReadAsync()).Workspaces.Single();
         var saved = Pump(library.SaveFilterAsync(workspace.Id, "textures", "Requested catalog", new Dictionary<string, string> { ["group"] = target.Key }));
         Pump((Task)Invoke(window, "RefreshLibraryAsync")!); SelectSaved(window, "filters", "Filter", saved.Id);
         var pending = (Task)Invoke(window, "OpenLibrarySelectionAsync")!; Pump(Task.Delay(20)); Assert.False(pending.IsCompleted);
         held.Release(); Pump(pending.WaitAsync(TimeSpan.FromSeconds(5)));
         Assert.Equal(target.Key, window.TextureBrowser.CaptureFilter()["group"]);
-        Assert.Equal(new[] { 8192L }, window.TextureBrowser.CurrentResources.Select(choice => choice.Identity.Ordinal));
+        Assert.Equal(new[] { (long)ManyCatalogCount }, window.TextureBrowser.CurrentResources.Select(choice => choice.Identity.Ordinal));
         Assert.Contains(catalogs.Groups, group => group.CatalogIdentity == target);
+        Assert.False(catalogs.EnrichmentTask.IsCompleted);
+        Assert.True(catalogs.Progress.CatalogsVisited < ManyCatalogCount);
         Assert.Null(window.AssetBrowser.NativeSession);
         var textureRoot = Field<object>(window, "textureNavigation");
         var children = (IEnumerable)textureRoot.GetType().GetProperty("Children")!.GetValue(textureRoot)!;
@@ -247,13 +254,20 @@ public sealed class TextureCatalogWorkflowTests
     {
         WriteManyCatalogs(fixture.Index); Pump(window.OpenArchiveAsync(fixture.Index));
         using var held = new HeldDiscovery(window); Pump(window.ShowTexturesAsync()); var catalogs = held.Session;
+        Assert.False(catalogs.EnrichmentTask.IsCompleted); Assert.Equal(0, catalogs.Progress.CatalogsVisited);
         var library = new LibraryStore(fixture.Library); var workspace = Pump(library.ReadAsync()).Workspaces.Single();
-        var key = new ResourceIdentity(window.CurrentSession!.Snapshot.IndexContentId, 8000).Key;
+        var key = new ResourceIdentity(window.CurrentSession!.Snapshot.IndexContentId, RequestedCatalogOrdinal).Key;
         var saved = Pump(library.SaveFilterAsync(workspace.Id, "textures", "Pending group", new Dictionary<string, string> { ["group"] = key }));
         Pump((Task)Invoke(window, "RefreshLibraryAsync")!); SelectSaved(window, "filters", "Filter", saved.Id);
         var pending = (Task)Invoke(window, "OpenLibrarySelectionAsync")!; Pump(Task.Delay(30)); Assert.False(pending.IsCompleted);
         Invoke(window, "Home_Click", window, new RoutedEventArgs()); Pump(pending);
-        held.Release(); Pump(catalogs.EnrichmentTask); Pump(Task.Delay(300)); Assert.Equal(Visibility.Visible, ((FrameworkElement)window.FindName("HomeHost")).Visibility);
+        Assert.False(catalogs.EnrichmentTask.IsCompleted); Assert.Equal(0, catalogs.Progress.CatalogsVisited);
+        held.Release(); Pump(catalogs.EnrichmentTask);
+        Assert.Equal(TextureCatalogSessionState.Completed, catalogs.Progress.State);
+        Assert.Equal(ManyCatalogCount, catalogs.Progress.CatalogsVisited);
+        Assert.Contains(catalogs.Groups, group => group.CatalogIdentity.Key == key);
+        Pump(Field<TextureDiscoverySession>(window, "textureDiscovery").EnrichmentTask);
+        Pump(Task.Delay(300)); Assert.Equal(Visibility.Visible, ((FrameworkElement)window.FindName("HomeHost")).Visibility);
     });
 
     [Fact]
@@ -319,7 +333,8 @@ public sealed class TextureCatalogWorkflowTests
         DiscoveryFixture.WriteIndex(path, [(3u, Container((2229, 3), (2229, 4), (2229, 999), (2230, 6))), (3u, "BAD!"u8.ToArray()), (2229u, new byte[] { 1, 2, 3, 4 }), (2229u, new byte[] { 5 }), (2229u, new byte[] { 6 }), (2230u, new byte[] { 7, 8 }), (3u, Container((2229, 4), (2229, 999)))]);
         var index = File.ReadAllBytes(path); BinaryPrimitives.WriteUInt32BigEndian(index.AsSpan(105 + 4 * 28 + 8), 4); File.WriteAllBytes(path, index);
     }
-    private static void WriteManyCatalogs(string path) => DiscoveryFixture.WriteIndex(path, Enumerable.Range(0, 8192).Select(_ => (3u, Container((2229, 8193)))).Append((2229u, new byte[] { 1 })).ToArray());
+    // Retain a saved group beyond the 100-row browse page; gates control the race, not archive size.
+    private static void WriteManyCatalogs(string path) => DiscoveryFixture.WriteIndex(path, Enumerable.Range(0, ManyCatalogCount).Select(_ => (3u, Container((2229, (uint)ManyCatalogCount + 1)))).Append((2229u, new byte[] { 1 })).ToArray());
     private static byte[] Container(params (uint Type, uint Id)[] references)
     { var bytes = new byte[20 + references.Length * 9]; "COM_CONT"u8.CopyTo(bytes); BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(8), 6); BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(12), (uint)(bytes.Length - 16)); BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(16), (uint)references.Length); for (var row = 0; row < references.Length; row++) { BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(20 + row * 9), references[row].Type); BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(24 + row * 9), references[row].Id); } return bytes; }
     private static void OpenSaved(AudioWindow window, string view, string property, Guid id) { SelectSaved(window, view, property, id); Pump((Task)Invoke(window, "OpenLibrarySelectionAsync")!); }

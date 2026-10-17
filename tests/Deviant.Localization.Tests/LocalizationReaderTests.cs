@@ -4,6 +4,7 @@ using System.Text.Json;
 using Deviant.Assets;
 using Deviant.Browser;
 using Deviant.Catalog;
+using Deviant.Core;
 using Deviant.Export.Localization;
 using Deviant.Formats.Localization;
 using Deviant.Formats.Localization.Model;
@@ -228,6 +229,10 @@ public sealed class LocalizationReaderTests
         var data = await File.ReadAllBytesAsync(fixture.VolumePath);
         data[^1] ^= 0x4;
         await File.WriteAllBytesAsync(fixture.VolumePath, data);
+        // A same-length write may share the captured timestamp on a fast filesystem.
+        var expectedStamp = snapshot.Volumes.Single(volume => volume.FilePath == fixture.VolumePath).Stamp;
+        File.SetLastWriteTimeUtc(fixture.VolumePath, new DateTime(expectedStamp.LastWriteUtcTicks, DateTimeKind.Utc).AddMinutes(1));
+        Assert.False(SourceIdentity.SameStamp(expectedStamp, new FileRevisionProvider().Capture(fixture.VolumePath)));
 
         var error = await Assert.ThrowsAsync<Deviant.Core.ArchiveException>(() =>
             new LocalizationSnapshotReader().ReadResourceAsync(snapshot, Assert.Single(snapshot.Records)));

@@ -51,6 +51,45 @@ public sealed class TextureMetadataChoiceTests
         });
 
     [Fact]
+    public void StaleRelationshipDetailsAreRereadWithoutOverwritingARenamedSelection()
+        => Run(false, (view, owner, cache, catalog, decoded) =>
+        {
+            Pump(view.SelectResourceAsync(catalog.Entry.Identity)); WaitReady(view);
+            var source = view.NativeImageBrowser.CurrentSource;
+            var surface = view.NativeImageBrowser.ImageBrowser.CurrentDisplaySurface;
+            Pump((Task)typeof(TextureExplorerView).GetMethod("DrainAsync", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(view, null)!);
+            var captured = new TaskCompletionSource<TextureDiscoveryEntry>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource<TextureDiscoveryEntry?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var detailReads = 0;
+            catalog.ReadDetails = entry =>
+            {
+                if (Interlocked.Increment(ref detailReads) == 1) { captured.TrySetResult(entry); return release.Task; }
+                return Task.FromResult<TextureDiscoveryEntry?>(entry with
+                {
+                    Related = [new(entry.Identity, "Refreshed related texture", TextureRelationshipKind.RelatedTexture, true, true, [])]
+                });
+            };
+            var pending = (Task)typeof(TextureExplorerView).GetMethod("LoadSelectionRelationshipEvidenceAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(view, [catalog, owner, catalog.Entry.Identity, Field<long>(view, "nativeVersion"), CancellationToken.None])!;
+            var stale = Pump(captured.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+            try
+            {
+                Assert.Equal("Panel texture", stale.Label);
+                Assert.False(pending.IsCompleted);
+                catalog.Rename("Updated panel texture"); Pump(view.RefreshAsync());
+                Assert.Equal("Updated panel texture", view.SelectedLabel);
+                release.TrySetResult(stale); Pump(pending.WaitAsync(TimeSpan.FromSeconds(5)));
+                Assert.Equal(2, Volatile.Read(ref detailReads));
+                Assert.Equal("Updated panel texture", view.SelectedLabel);
+                Assert.Equal("Refreshed related texture", Assert.Single(view.SelectedEntry!.Related).Label);
+                Assert.Single(((ListBox)view.FindName("RelatedRows")).Items.Cast<object>());
+                Assert.Same(source, view.NativeImageBrowser.CurrentSource);
+                Assert.Same(surface, view.NativeImageBrowser.ImageBrowser.CurrentDisplaySurface);
+                Assert.Equal(1, decoded());
+            }
+            finally { release.TrySetResult(stale); }
+        });
+    [Fact]
     public void NavigationCancelsAQueuedRecordChoiceAndDrainsItsLeases()
         => Run(true, (view, owner, cache, catalog, decoded) =>
         {
@@ -146,7 +185,9 @@ public sealed class TextureMetadataChoiceTests
         public TextureNamingCoverage Coverage => new(1, 1, 0, 0, 0, 1, 0, 0, 1, 1, false, [], []);
         public event EventHandler? Updated;
         public Task<TextureDiscoveryPage> QueryAsync(TextureDiscoveryQuery query, CancellationToken token = default) => Task.FromResult(new TextureDiscoveryPage([Entry], 1, 0));
-        public Task<TextureDiscoveryEntry?> GetDetailsAsync(ResourceIdentity identity, CancellationToken token = default) => Task.FromResult<TextureDiscoveryEntry?>(Entry);
+        public Func<TextureDiscoveryEntry, Task<TextureDiscoveryEntry?>>? ReadDetails { get; set; }
+        public Task<TextureDiscoveryEntry?> GetDetailsAsync(ResourceIdentity identity, CancellationToken token = default)
+            => ReadDetails?.Invoke(Entry) ?? Task.FromResult<TextureDiscoveryEntry?>(Entry);
         public Task SetAliasAsync(ResourceIdentity identity, string? alias, CancellationToken token = default) => Task.CompletedTask;
         public void Rename(string label) => Replace(Entry with { Label = label, SearchText = label });
         public void Replace(TextureDiscoveryEntry entry) { Entry = entry; Updated?.Invoke(this, EventArgs.Empty); }

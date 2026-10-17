@@ -136,6 +136,10 @@ public sealed class SnapshotReaderTests
         var bytes = await File.ReadAllBytesAsync(packagePath);
         bytes[0] ^= 0x7F;
         await File.WriteAllBytesAsync(packagePath, bytes);
+        // Fast same-length writes can retain the original filesystem timestamps.
+        var expectedStamp = snapshot.Volumes.Single(volume => volume.FilePath == packagePath).Stamp;
+        File.SetLastWriteTimeUtc(packagePath, new DateTime(expectedStamp.LastWriteUtcTicks, DateTimeKind.Utc).AddMinutes(1));
+        Assert.False(SourceIdentity.SameStamp(expectedStamp, new FileRevisionProvider().Capture(packagePath)));
 
         var error = await Assert.ThrowsAsync<ArchiveException>(() =>
             new DetroitAudioSnapshotReader().ReadSnapshotAsync(snapshot));

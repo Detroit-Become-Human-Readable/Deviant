@@ -140,8 +140,17 @@ public sealed class GmkInspectionLeaseTests
         var bytes = await File.ReadAllBytesAsync(volume);
         bytes[^1] ^= 0x5A;
         await File.WriteAllBytesAsync(volume, bytes);
+        // Fast same-length writes can retain the original filesystem timestamps.
+        var expectedStamp = snapshot.Volumes.Single(source => source.FilePath == volume).Stamp;
+        File.SetLastWriteTimeUtc(volume, new DateTime(expectedStamp.LastWriteUtcTicks, DateTimeKind.Utc).AddMinutes(1));
+        Assert.False(SourceIdentity.SameStamp(expectedStamp, new FileRevisionProvider().Capture(volume)));
 
-        var error = await Assert.ThrowsAsync<ArchiveException>(() => OpenAsync(snapshot, Member(snapshot), budget));
+        var error = await Assert.ThrowsAsync<ArchiveException>(async () =>
+        {
+            // Preserve cleanup even if the expected source-change rejection regresses.
+            var unexpectedLease = await OpenAsync(snapshot, Member(snapshot), budget);
+            Dispose(unexpectedLease);
+        });
         Assert.Equal("SourceChanged", error.Code);
         Assert.Equal(0, budget.UsedBytes);
     }

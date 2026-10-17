@@ -54,6 +54,24 @@ public sealed class ArchiveReferenceNavigationTests
         Assert.Single(windows.Cast<object>());
         var item=windows[0]!;var controller=(Deviant.Browser.BrowserController)item.GetType().GetField("Item2")!.GetValue(item)!;
         Assert.Equal(3,controller.State.Focused?.Ordinal);Assert.Equal(index,controller.State.Snapshot!.IndexContentId);
+        var pendingClose = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var activities = (HashSet<Task>)typeof(Deviant.Browser.BrowserController)
+            .GetField("activities", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(controller)!;
+        activities.Add(pendingClose.Task);
+        try
+        {
+            window.Close();
+            Pump(Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle).Task);
+            Assert.False(WindowTestLifetime.IsClosed(window), "The owner closed before its advanced browser drained.");
+        }
+        finally { pendingClose.TrySetResult(); }
+        Pump(WindowTestLifetime.WaitClosedAsync(window));
+        Assert.True(controller.State.IsClosing);
+        Assert.Null(typeof(Deviant.Browser.BrowserController).GetField("session", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(controller));
+        foreach (var catalog in System.IO.Directory.EnumerateFiles(fixture.Cache, "*.sqlite3", System.IO.SearchOption.AllDirectories))
+        {
+            using var exclusive = System.IO.File.Open(catalog, System.IO.FileMode.Open, System.IO.FileAccess.ReadWrite, System.IO.FileShare.None);
+        }
     });
 
     private static void Select(AudioWindow window,long ordinal)

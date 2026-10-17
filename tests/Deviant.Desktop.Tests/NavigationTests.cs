@@ -23,6 +23,11 @@ public sealed class NavigationTests
         Pump(window.OpenArchiveAsync(fixture.Index));
         var initialization = (Lazy<Task>)typeof(AudioExplorerSession).GetField("audioInitialization", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window.CurrentSession!)!;
         Assert.False(initialization.IsValueCreated);
+        ((TextBox)window.FindName("SearchBox")).Text = "Hidden audio filter";
+        var debounce = (DispatcherTimer)typeof(AudioWindow).GetField("filterTimer", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+        Assert.False(debounce.IsEnabled);
+        Pump(Task.Delay(debounce.Interval + TimeSpan.FromMilliseconds(100)));
+        Assert.False(initialization.IsValueCreated);
     });
 
     [Theory]

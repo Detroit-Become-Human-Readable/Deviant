@@ -456,7 +456,9 @@ public sealed class TextureBrowseGenerationTests
         {
             Assert.True(entered.Wait(TimeSpan.FromSeconds(5)), "Both independent reads must reach the snapshot barrier.");
             var started = Stopwatch.GetTimestamp();
-            closing = Task.Run(store.Dispose);
+            // The readers deliberately block pool workers; disposal must not queue behind them.
+            closing = Task.Factory.StartNew(store.Dispose, CancellationToken.None,
+                TaskCreationOptions.LongRunning, TaskScheduler.Default);
             Assert.True(cancellationObserved.Wait(TimeSpan.FromMilliseconds(250)), "Cancellation acknowledgement exceeded 250 ms.");
             release.Set();
             await closing.WaitAsync(TimeSpan.FromSeconds(2));
