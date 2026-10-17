@@ -349,6 +349,67 @@ public sealed class TextureDiscoverySessionTests
         Assert.Equal(1, discovery.Coverage.MetadataInspected);
     }
 
+    [Fact]
+    public async Task FailedSummaryPreparationRetainsAnUpdateQueuedDuringTheFailure()
+    {
+        using var fixture = new DiscoveryFixture();
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        await using var native = new NativeTextureSession(catalogs);
+        var cache = new CacheManager(fixture.Settings, new(fixture.Cache));
+        await using var discovery = new TextureDiscoverySession(catalogs, native, new AliasStore(fixture.Library), cache);
+        await discovery.EnrichmentTask;
+        var type = typeof(TextureDiscoverySession);
+        var preparation = type.GetField("summaryPreparation", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await ((Task)preparation.GetValue(discovery)!).WaitAsync(TimeSpan.FromSeconds(2));
+        var publish = type.GetMethod("PublishUpdate", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var retried = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously); int batches = 0;
+        using var observer = AssetLoadDiagnostics.Listener.Subscribe(new BrowseCounterObserver(value =>
+        {
+            if (value.Stage != "TextureBrowser.Store.SummaryBackfillBatch") return;
+            if (Interlocked.Increment(ref batches) != 1) { retried.TrySetResult(); return; }
+            using var db = new SqliteConnection(new SqliteConnectionStringBuilder
+                { DataSource = Directory.GetFiles(fixture.Cache, "catalog-*.sqlite3").Single(), Pooling = false }.ToString());
+            db.Open(); using var change = db.CreateCommand();
+            change.CommandText = "INSERT OR IGNORE INTO texture_browse_summary_dirty SELECT revision,profile,identity FROM texture_projection_rows";
+            change.ExecuteNonQuery();
+            publish.Invoke(discovery, null);
+            throw new IOException("Generated transient summary failure");
+        }));
+        publish.Invoke(discovery, null);
+        await retried.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await ((Task)preparation.GetValue(discovery)!).WaitAsync(TimeSpan.FromSeconds(2));
+        using var check = new SqliteConnection(new SqliteConnectionStringBuilder
+            { DataSource = Directory.GetFiles(fixture.Cache, "catalog-*.sqlite3").Single(), Pooling = false }.ToString());
+        check.Open(); using var pending = check.CreateCommand(); pending.CommandText = "SELECT COUNT(*) FROM texture_browse_summary_dirty";
+        Assert.Equal(0L, Convert.ToInt64(pending.ExecuteScalar()));
+    }
+
+    [Fact]
+    public async Task BrowserPreparesAndDrainsItsPersistedSummaryWork()
+    {
+        using var fixture = new DiscoveryFixture();
+        var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
+        await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        await using var native = new NativeTextureSession(catalogs);
+        var cache = new CacheManager(fixture.Settings, new(fixture.Cache));
+        var discovery = new TextureDiscoverySession(catalogs, native, new AliasStore(fixture.Library), cache);
+        try
+        {
+            await discovery.EnrichmentTask;
+            var field = typeof(TextureDiscoverySession).GetField("summaryPreparation", BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.NotNull(field);
+            await ((Task)field.GetValue(discovery)!).WaitAsync(TimeSpan.FromSeconds(2));
+            int prepared = 0;
+            using var observer = AssetLoadDiagnostics.Listener.Subscribe(new BrowseCounterObserver(value =>
+            { if (value.Stage == "TextureBrowser.Store.PreparedSummaryRead") Interlocked.Increment(ref prepared); }));
+            await using var browse = await discovery.OpenBrowseAsync(new());
+            Assert.Equal("environment.dds", Assert.Single((await browse.ReadAsync(new())).Page.Entries).Label);
+            Assert.Equal(1, Volatile.Read(ref prepared));
+        }
+        finally { await discovery.DisposeAsync(); }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -1077,4 +1138,3 @@ public sealed class TextureDiscoverySessionTests
         public void Dispose() { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }
 }
-

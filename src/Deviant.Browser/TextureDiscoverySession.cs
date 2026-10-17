@@ -1321,6 +1321,7 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
 
     private void PublishUpdate()
     {
+        ScheduleSummaryPreparation();
         if (disposed || Interlocked.Exchange(ref updatePending, 1) != 0) return;
         _ = Task.Run(async () =>
         {
@@ -1574,6 +1575,8 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
         catalogs.Updated -= CatalogUpdated; lifetime.Cancel();
         await DrainBrowseSessionsAsync().ConfigureAwait(false);
         try { await enrichment.ConfigureAwait(false); } catch (OperationCanceledException) { }
+        Task summary; lock (gate) summary = summaryPreparation;
+        await summary.ConfigureAwait(false);
         await enrichmentGate.WaitAsync().ConfigureAwait(false); enrichmentGate.Release();
         await detailsGate.WaitAsync().ConfigureAwait(false); detailsGate.Release();
         lock (projectionStoreGate) { projectionReady = false; features?.Dispose(); features = null; }

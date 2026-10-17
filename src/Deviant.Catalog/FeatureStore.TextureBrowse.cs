@@ -256,6 +256,8 @@ public sealed partial class FeatureStore
                 catalogs.Add(new(rows.GetString(0), rows.IsDBNull(1) ? "Catalog " + IdentityOrdinal(rows.GetString(0)) : rows.GetString(1)));
             }
         }
+        if (TryReadPreparedTextureBrowseSummary(pin, read, transaction, cancellation) is { } prepared)
+            return prepared with { Options = prepared.Options with { Catalogs = Array.AsReadOnly(catalogs.ToArray()) } };
         var options = ReadTextureProjectionOptions(read, transaction, pin.Profile, pin.Generation, false, cancellation)
             with { Catalogs = catalogs };
         using var coverage = ReadTextureCommand(read, transaction, TextureHistoricalLatest +

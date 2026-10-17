@@ -173,6 +173,7 @@ public sealed partial class FeatureStore
         command.CommandText = "CREATE INDEX IF NOT EXISTS texture_history_options ON texture_projection_history_index " +
             "(revision,profile,width,height,format,context_key,context_label,has_owner,identity,generation,next_generation,data_generation)";
         using (TextureDiagnostic("TextureBrowser.Store.HistoricalOptionsIndexBuild", TextureDiagnosticKey())) command.ExecuteNonQuery();
+        EnsureTextureSummarySchema(transaction);
         transaction.Commit(); textureSchemaReady = true;
     }
 
@@ -200,7 +201,7 @@ public sealed partial class FeatureStore
                 return published;
             }
             using var transaction = connection.BeginTransaction();
-            foreach (var table in new[] { "texture_projection_rows", "texture_projection_links", "texture_projection_evidence", "texture_projection_name_proofs", "texture_projection_owners", "texture_projection_catalog_members", "texture_projection_catalogs", "texture_projection_current_roles", "texture_projection_current_role_rows", "texture_projection_current_role_state" })
+            foreach (var table in new[] { "texture_projection_rows", "texture_projection_links", "texture_projection_evidence", "texture_projection_name_proofs", "texture_projection_owners", "texture_projection_catalog_members", "texture_projection_catalogs", "texture_projection_current_roles", "texture_projection_current_role_rows", "texture_projection_current_role_state", "texture_browse_summary_state", "texture_browse_summary_members", "texture_browse_summary_values", "texture_browse_summary_dirty" })
             {
                 using var clear = TextureCommand($"DELETE FROM {table} WHERE revision=$revision AND profile=$profile", profile, transaction); clear.ExecuteNonQuery();
             }
@@ -814,11 +815,15 @@ public sealed partial class FeatureStore
             AND a.revision=d.revision AND a.profile=d.profile AND a.identity=d.identity
         """;
 
-    private void RefreshTextureHistory(string profile, SqliteTransaction transaction)
+    private void RefreshTextureHistory(string profile, SqliteTransaction transaction, bool prepareSummary = true)
     {
         using var diagnostic = TextureDiagnostic("TextureBrowser.Store.HistoryIndex", TextureDiagnosticKey());
         using var pending = TextureCommand("SELECT 1 FROM texture_projection_history_dirty WHERE revision=$revision AND profile=$profile LIMIT 1", profile, transaction);
-        if (pending.ExecuteScalar() is null) return;
+        if (pending.ExecuteScalar() is null)
+        {
+            if (prepareSummary) RefreshTextureSummaryDirty(profile, transaction);
+            return;
+        }
         using var refresh = TextureCommand($$"""
             DELETE FROM texture_projection_history_index AS h WHERE h.revision=$revision AND h.profile=$profile
                 AND h.identity IN(SELECT identity FROM texture_projection_history_dirty WHERE revision=$revision AND profile=$profile);
@@ -846,6 +851,7 @@ public sealed partial class FeatureStore
             DELETE FROM texture_projection_history_dirty WHERE revision=$revision AND profile=$profile;
             """, profile, transaction);
         refresh.ExecuteNonQuery();
+        if (prepareSummary) RefreshTextureSummaryDirty(profile, transaction);
     }
 
     private static void AddTextureOwnerFilter(SqliteCommand command, string owner, bool current)
