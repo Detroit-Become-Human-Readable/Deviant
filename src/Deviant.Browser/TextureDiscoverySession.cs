@@ -1580,11 +1580,11 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
             if (!projectionReady || features is not { } store) return;
             foreach (var key in derived.Bindings.Select(binding => binding.Texture).Distinct())
             {
+                using (TextureDiagnostic("TextureBrowser.Restore.Proof", diagnosticKey))
+                    if (RepairProjectedPage(store, [key], token)) continue;
                 bool needsEvidence;
                 lock (gate) needsEvidence = entries.TryGetValue(key, out var current) && current.MetadataIdentities.Count == 0;
                 if (!needsEvidence) continue;
-                using (TextureDiagnostic("TextureBrowser.Restore.Proof", diagnosticKey))
-                    if (RepairProjectedPage(store, [key], token)) continue;
                 long generation = store.CaptureTextureProjectionGeneration(ProjectionProfile, token);
                 TextureDiscoveryEntry? previous;
                 using (TextureDiagnostic("TextureBrowser.Restore.Evidence", diagnosticKey))

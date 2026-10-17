@@ -419,8 +419,10 @@ public sealed class TextureDiscoverySessionTests
         Assert.Empty(reopened.LoadTextureProjectionOwnerRebuilds(profile));
     }
 
-    [Fact]
-    public async Task HydrationDoesNotRestoreAnOlderVersionAfterRejectingTheCurrentProof()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HydrationDoesNotRestoreAnOlderVersionAfterRejectingTheCurrentProof(bool alreadyHydrated)
     {
         using var fixture = new DiscoveryFixture();
         var snapshot = await new ArchiveReader().OpenAsync(fixture.Index);
@@ -452,7 +454,7 @@ public sealed class TextureDiscoverySessionTests
         }
         var entries = (Dictionary<ResourceIdentity, TextureDiscoveryEntry>)type.GetField("entries", flags)!.GetValue(discovery)!;
         var baseline = (Dictionary<ResourceIdentity, TextureDiscoveryEntry>)type.GetField("projectionBaseline", flags)!.GetValue(discovery)!;
-        entries[entry.Identity] = baseline[entry.Identity];
+        entries[entry.Identity] = alreadyHydrated ? entry : baseline[entry.Identity];
         type.GetMethod("HydrateProjectionTargets", flags)!.Invoke(discovery, [derived, CancellationToken.None]);
         Assert.True(store.CaptureTextureProjectionGeneration(profile) > rejected);
         Assert.Equal(TextureNameKind.Fallback, entries[entry.Identity].NameKind);
