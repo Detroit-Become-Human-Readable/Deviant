@@ -137,8 +137,10 @@ This tool is not affiliated with Quantic Dream. We don't provide any of *Detroit
   <img
     src="https://github.com/user-attachments/assets/992b242b-2b5c-405b-8af5-3354b98c0455"
     alt="Processing animation"
-    width="512"
-    height="512"
+    width="256"
   />
+</p>
+
+<p align="center">
   <i><b>Designed by</b> Cyber<b>Life</b>, disassembled by <b>Deviants.</b></i>
 </p>
