@@ -186,6 +186,73 @@ public sealed class SceneProgressTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public void StreamedGeometryKeepsRemainingProgressVisibleWithoutBlockingTheViewport(bool cancel) => Run(() =>
+    {
+        var session = new DiscoverySession(1, 1);
+        using var snapshot = ProgressSnapshot(session.Revision);
+        using var service = new AssetViewportService();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        IProgress<RenderLoadProgress>? progress = null;
+        var published = false;
+        var view = new SceneView
+        {
+            RenderProvider = (_, _, _) => Task.FromResult(snapshot),
+            StreamingRenderProvider = async (_, updates, publish, token) =>
+            {
+                await publish(snapshot, token);
+                progress = updates;
+                published = true;
+                await release.Task.WaitAsync(token);
+                return snapshot;
+            }
+        };
+        view.SetViewportService(service);
+        try
+        {
+            Pump(view.LoadAsync(session)); Pump(view.SelectResourceAsync(session.LoadedSection.Result.Identity));
+            var loading = view.LoadRegionAsync();
+            PumpUntil(() => published);
+            var overlay = (Grid)view.FindName("ViewportLoadingOverlay");
+            var animation = (ProcessingAnimation)view.FindName("ViewportProcessing");
+            var bar = (ProgressBar)view.FindName("ViewportLoadingProgress");
+            Assert.True(view.Viewport.VisiblePartCount > 0);
+            foreach (var update in new[] { new RenderLoadProgress("Materials", 2, 5, 0), new("Textures", 3, 8, 0), new("Loading", 4, 9, 0) })
+            {
+                progress!.Report(update);
+                PumpUntil(() => view.ActivityProgress.Completed == update.Completed);
+                Assert.Equal(Visibility.Visible, overlay.Visibility);
+                Assert.False(overlay.IsHitTestVisible);
+                Assert.Equal(VerticalAlignment.Bottom, overlay.VerticalAlignment);
+                Assert.True(view.Viewport.IsEnabled);
+                Assert.False(animation.IsActive);
+                Assert.Equal(Visibility.Collapsed, animation.Visibility);
+                Assert.False(bar.IsIndeterminate);
+                Assert.Equal((double)update.Total, bar.Maximum);
+                Assert.Equal((double)update.Completed, bar.Value);
+                Assert.Equal(view.ActivityProgress.Stage, ((TextBlock)view.FindName("ViewportLoadingStage")).Text);
+                Assert.Equal($"{update.Completed:N0} / {update.Total:N0}", ((TextBlock)view.FindName("ViewportLoadingCount")).Text);
+            }
+            if (cancel)
+            {
+                Pump(view.SuspendAsync());
+                Assert.True(loading.IsCanceled);
+            }
+            else
+            {
+                release.SetResult();
+                Pump(loading);
+            }
+            Assert.False(view.ActivityProgress.IsActive);
+            Assert.Equal(Visibility.Collapsed, overlay.Visibility);
+            Assert.False(animation.IsActive);
+            Assert.True(view.Viewport.IsEnabled);
+        }
+        finally { release.TrySetResult(); Pump(view.DisposeAsync().AsTask()); }
+    });
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public void SceneOverlayTracksRegionDiscoveryAndClearsOnCompletionOrFailure(bool fail) => Run(() =>
     {
         IProgress<RenderLoadProgress>? progress = null;
@@ -264,6 +331,21 @@ public sealed class SceneProgressTests
         }
         finally { snapshot.Dispose(); Pump(view.DisposeAsync().AsTask()); }
     });
+
+    private static RenderAssetSnapshot ProgressSnapshot(SourceRevision revision)
+    {
+        ResourceIdentity Identity(int value) => new(revision.IndexContentId, value);
+        var bounds = new GeometryBounds(Vector3.Zero, new(1, 1, 0));
+        var primitive = new MeshPrimitive("primitive", PrimitiveTopology.Triangles, [Vector3.Zero, Vector3.UnitX, Vector3.UnitY],
+            [0, 1, 2], IndexElementFormat.UInt16, [], Bounds: bounds);
+        var mesh = new RenderMesh(Identity(2), 0, new(new("generated", "1"), [], [primitive], new Dictionary<string, string>()));
+        var occurrence = new RenderOccurrence("occurrence", Identity(3), Identity(4), "Object", mesh.Key,
+            Matrix4x4.Identity, bounds, [Identity(5)]);
+        var hierarchy = new RenderHierarchyNode(occurrence.Key, null, occurrence.Node, occurrence.Label,
+            Matrix4x4.Identity, occurrence.World, occurrence.Key, []);
+        return new(revision, new Dictionary<string, RenderMesh> { [mesh.Key] = mesh }, [occurrence],
+            new Dictionary<ResourceIdentity, RenderMaterial>(), bounds, [], [hierarchy], new(1, 1, 0, 1, 1, 1), [], new());
+    }
 
     private sealed class DiscoverySession : ISceneCatalogSession
     {

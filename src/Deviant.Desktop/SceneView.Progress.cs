@@ -124,12 +124,14 @@ public partial class SceneView
         else if (largeLoadDecision is not null) { stage = "Continue loading this scene?"; known = false; }
         var update = new SceneActivityProgress(IsLoading, stage, completed, known ? total : 0);
         var viewportLoading = sectionLoadingActive || renderLoadingActive || scenePipelineActive || regionsLoadingActive;
-        var showOverlay = viewportLoading && SceneViewport.VisiblePartCount == 0;
-        ViewportLoadingOverlay.Visibility = showOverlay ? Visibility.Visible : Visibility.Collapsed;
+        var hasGeometry = SceneViewport.VisiblePartCount > 0;
+        ViewportLoadingOverlay.Visibility = viewportLoading ? Visibility.Visible : Visibility.Collapsed;
+        ViewportLoadingOverlay.VerticalAlignment = hasGeometry ? VerticalAlignment.Bottom : VerticalAlignment.Stretch;
         ViewportLoadingOverlay.IsHitTestVisible = false;
-        SceneViewport.IsEnabled = !viewportLoading || SceneViewport.VisiblePartCount > 0;
-        ViewportProcessing.IsActive = showOverlay && largeLoadDecision is null;
-        ViewportProcessing.Visibility = largeLoadDecision is null ? Visibility.Visible : Visibility.Collapsed;
+        SceneViewport.IsEnabled = !viewportLoading || hasGeometry;
+        var showAnimation = viewportLoading && !hasGeometry && largeLoadDecision is null;
+        ViewportProcessing.IsActive = showAnimation;
+        ViewportProcessing.Visibility = showAnimation ? Visibility.Visible : Visibility.Collapsed;
         ViewportLoadingProgress.Visibility = largeLoadDecision is null ? Visibility.Visible : Visibility.Collapsed;
         ViewportLoadingProgress.IsIndeterminate = viewportLoading && !known;
         ViewportLoadingProgress.Maximum = Math.Max(1, update.Total);

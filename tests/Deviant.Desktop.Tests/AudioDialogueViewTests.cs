@@ -99,7 +99,7 @@ public sealed class AudioDialogueViewTests
     });
 
     [Fact]
-    public void EmptyResultAndClearShowTheTrueEmptyStateAndResetSelectionAndStatus() => RunSta(() =>
+    public void CompletedEmptyResultShowsNoDialogueAndClearResetsTheView() => RunSta(() =>
     {
         var view = ShowView(out var window);
         try
@@ -116,9 +116,77 @@ public sealed class AudioDialogueViewTests
             Assert.Null(view.CurrentResult);
             Assert.Null(view.SelectedOccurrence);
             Assert.Null(Named<ListView>(view, "Occurrences").ItemsSource);
-            Assert.Equal("No dialogue linked.", Named<TextBlock>(view, "EmptyMessage").Text);
+            Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "EmptyMessage").Visibility);
             Assert.Equal(string.Empty, Named<TextBlock>(view, "Status").Text);
             Assert.False(Named<Button>(view, "OpenText").IsEnabled);
+        }
+        finally
+        {
+            window.Close();
+            Pump();
+        }
+    });
+
+    [Theory]
+    [InlineData("Looking up dialogue…")]
+    [InlineData("Dialogue lookup cancelled.")]
+    [InlineData("Unable to look up dialogue.")]
+    public void LookupStatusDoesNotShowACompletedEmptyMessage(string message) => RunSta(() =>
+    {
+        var view = ShowView(out var window);
+        try
+        {
+            Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "EmptyMessage").Visibility);
+            view.SetResult(CreateResult(occurrences: []));
+            view.SetStatus(message);
+
+            Assert.Equal(message, Named<TextBlock>(view, "Status").Text);
+            Assert.Equal(Visibility.Visible, Named<TextBlock>(view, "Status").Visibility);
+            Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "EmptyMessage").Visibility);
+
+            view.Clear();
+            view.SetStatus(message);
+            Assert.Null(view.CurrentResult);
+            Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "EmptyMessage").Visibility);
+
+            view.SetStatus(string.Empty);
+            Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "EmptyMessage").Visibility);
+            view.SetResult(CreateResult(occurrences: []));
+            Assert.Equal(Visibility.Visible, Named<TextBlock>(view, "EmptyMessage").Visibility);
+            Assert.Equal("No dialogue linked.", Named<TextBlock>(view, "EmptyMessage").Text);
+            Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "Status").Visibility);
+        }
+        finally
+        {
+            window.Close();
+            Pump();
+        }
+    });
+
+    [Fact]
+    public void StatusKeepsSelectedDialogueAndNavigationAvailable() => RunSta(() =>
+    {
+        var view = ShowView(out var window);
+        try
+        {
+            var result = CreateResult();
+            LocalizationAudioTextOccurrence? navigated = null;
+            view.TextNavigator = (occurrence, _) =>
+            {
+                navigated = occurrence;
+                return Task.CompletedTask;
+            };
+            view.SetResult(result);
+            Named<ListView>(view, "Occurrences").SelectedItem = result.Occurrences[1];
+            view.SetStatus("Unable to open text.");
+
+            Assert.Same(result, view.CurrentResult);
+            Assert.Same(result.Occurrences[1], view.SelectedOccurrence);
+            Assert.Equal(3, Named<ListView>(view, "Occurrences").Items.Count);
+            Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "EmptyMessage").Visibility);
+            Assert.True(Named<Button>(view, "OpenText").IsEnabled);
+            Pump(view.OpenSelectedTextAsync());
+            Assert.Same(result.Occurrences[1], navigated);
         }
         finally
         {

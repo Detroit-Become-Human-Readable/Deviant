@@ -340,7 +340,15 @@ public sealed partial class FeatureStore
             AssetLoadDiagnostics.Counters("TextureBrowser.Store.OwnerRows", diagnosticKey, new Dictionary<string, long> { ["Rows"] = rows.Count });
             EnsureTextureSchema(); using var transaction = connection.BeginTransaction();
             using var current = TextureCommand("SELECT generation FROM texture_projection_heads WHERE revision=$revision AND profile=$profile", profile, transaction);
-            long generation = checked(Convert.ToInt64(current.ExecuteScalar() ?? throw new InvalidOperationException("Texture projection baseline is unavailable.")) + 1);
+            long headGeneration = Convert.ToInt64(current.ExecuteScalar() ?? throw new InvalidOperationException("Texture projection baseline is unavailable."));
+            if (completedRebuildRequest is null && TextureOwnerPublicationUnchanged(profile, checkpoint, rows, headGeneration, transaction, token))
+            {
+                token.ThrowIfCancellationRequested(); transaction.Commit();
+                AssetLoadDiagnostics.Counters("TextureBrowser.Store.OwnerUnchanged", diagnosticKey,
+                    new Dictionary<string, long> { ["Rows"] = rows.Count });
+                return headGeneration;
+            }
+            long generation = checked(headGeneration + 1);
             foreach (var row in rows)
             {
                 token.ThrowIfCancellationRequested();
@@ -365,28 +373,17 @@ public sealed partial class FeatureStore
 
     private void WriteTextureRow(string profile, long generation, TextureDiscoveryEntry entry, bool evidence, SqliteTransaction transaction)
     {
-        var thin = entry with
-        {
-            NameCandidates = [], ProvenanceLines = [], AdvancedLines = [],
-            Owners = entry.Owners.Select(link => link with { Evidence = [] }).ToArray(),
-            Related = entry.Related.Select(link => link with { Evidence = [] }).ToArray()
-        };
+        var thin = ThinTextureProjection(entry);
         byte[]? encoded = evidence ? JsonSerializer.SerializeToUtf8Bytes(entry with { Alias = null }) : null;
         if (encoded?.Length > MaximumTextureEvidenceBytes) throw new InvalidDataException("TextureProjectionEvidenceLimit");
         using var command = TextureCommand("INSERT OR REPLACE INTO texture_projection_rows VALUES($revision,$profile,$identity,$generation,$ordinal,$nameKind,$kind,$label,$sort,$search,$width,$height,$format,$context,$contextLabel,$owner,$conflict,$metadata,$thin)", profile, transaction);
-        Add("$identity", entry.Identity.Key); Add("$generation", generation); Add("$ordinal", entry.Identity.Ordinal); Add("$nameKind", (int)entry.NameKind);
-        Add("$kind", (int)entry.Kind); Add("$label", entry.Label); Add("$sort", NaturalOrder.Key(TextureNameDisplay.Project(entry.Label)));
-        Add("$search", entry.SearchText); Add("$width", entry.Width); Add("$height", entry.Height); Add("$format", entry.Format);
-        Add("$context", entry.ContextKey); Add("$contextLabel", entry.ContextLabel); Add("$owner", entry.Owners.Any(link => link.Verified) ? 1 : 0);
-        Add("$conflict", entry.ConflictLines.Count > 0 ? 1 : 0); Add("$metadata", entry.MetadataIdentities.Count > 0 ? 1 : 0);
+        Add("$identity", entry.Identity.Key); Add("$generation", generation);
+        foreach (var value in TextureProjectionScalars(entry)) Add(value.Parameter, value.Value);
         Add("$thin", JsonSerializer.Serialize(thin)); command.ExecuteNonQuery();
         WriteCurrentTextureRoles(profile, entry.Identity.Key, generation,
             entry.Owners.Where(owner => owner.Verified && !string.IsNullOrEmpty(owner.Role)).Select(owner => owner.Role!).Distinct(StringComparer.Ordinal), transaction);
         void Add(string name, object? value) => command.Parameters.AddWithValue(name, value ?? DBNull.Value);
-        foreach (var item in entry.Owners.Select(link => (Relation: 0, Link: link)).Concat(entry.Related.Select(link => (Relation: 1, Link: link))))
-            Link(item.Relation, item.Link.Identity.Key, item.Link.Role ?? "", item.Link.Label, item.Link.Verified);
-        foreach (var catalog in entry.CatalogKeys.Distinct(StringComparer.Ordinal)) Link(2, catalog, "", "", true);
-        foreach (var metadata in entry.MetadataIdentities.Distinct()) Link(3, metadata.Key, "", "", true);
+        foreach (var item in TextureProjectionLinks(entry)) Link(item.Relation, item.Key, item.Role, item.Label, item.Verified);
         void Link(int relation, string key, string role, string label, bool verified)
         {
             using var write = TextureCommand("INSERT OR IGNORE INTO texture_projection_links VALUES($revision,$profile,$identity,$generation,$relation,$key,$role,$label,$verified)", profile, transaction);
@@ -400,12 +397,7 @@ public sealed partial class FeatureStore
             write.Parameters.AddWithValue("$identity", entry.Identity.Key); write.Parameters.AddWithValue("$generation", generation); write.Parameters.AddWithValue("$payload", encoded);
             string evidenceSha = Convert.ToHexString(SHA256.HashData(encoded)).ToLowerInvariant();
             write.Parameters.AddWithValue("$sha", evidenceSha); write.ExecuteNonQuery();
-            var sources = entry.NameCandidates.SelectMany(candidate => candidate.Evidence)
-                .Concat(entry.Owners.Concat(entry.Related).SelectMany(link => link.Evidence))
-                .DistinctBy(evidence => (evidence.Source, evidence.Revision, evidence.Reader, evidence.ReaderVersion, evidence.SourceSha256, evidence.PhysicalExtent)).ToArray();
-            if (sources.Length > 128) throw new InvalidDataException("TextureProjectionNameProofLimit");
-            byte[] proof = JsonSerializer.SerializeToUtf8Bytes(new TextureNameProof(thin with { Alias = null }, sources));
-            if (proof.Length > MaximumTextureNameProofBytes) throw new InvalidDataException("TextureProjectionNameProofLimit");
+            byte[] proof = EncodeTextureProjectionNameProof(entry, thin);
             using var name = TextureCommand("INSERT OR REPLACE INTO texture_projection_name_proofs VALUES($revision,$profile,$identity,$generation,$payload,$sha,$evidence)", profile, transaction);
             name.Parameters.AddWithValue("$identity", entry.Identity.Key); name.Parameters.AddWithValue("$generation", generation); name.Parameters.AddWithValue("$payload", proof);
             name.Parameters.AddWithValue("$sha", Convert.ToHexString(SHA256.HashData(proof)).ToLowerInvariant()); name.Parameters.AddWithValue("$evidence", evidenceSha); name.ExecuteNonQuery();

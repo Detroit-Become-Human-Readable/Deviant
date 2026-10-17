@@ -70,6 +70,7 @@ public partial class AudioDialogueView : UserControl
     {
         Status.Text = message ?? string.Empty;
         Status.Visibility = Status.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+        UpdateEmptyMessage();
     }
 
     public void Clear()
@@ -80,8 +81,8 @@ public partial class AudioDialogueView : UserControl
         Languages.ItemsSource = null;
         Occurrences.ItemsSource = null;
         Occurrences.SelectedItem = null;
-        EmptyMessage.Text = "No dialogue linked.";
-        EmptyMessage.Visibility = Visibility.Visible;
+        EmptyMessage.Text = string.Empty;
+        EmptyMessage.Visibility = Visibility.Collapsed;
         SelectedLanguage.Text = "Select dialogue";
         SelectedText.Clear();
         Advanced.Clear();
@@ -139,8 +140,9 @@ public partial class AudioDialogueView : UserControl
 
     private void UpdateEmptyMessage()
     {
-        var visible = Occurrences.Items.Count == 0;
-        EmptyMessage.Text = occurrences.Length == 0 ? "No dialogue linked." : "No matches for this language.";
+        var visible = result is not null && Status.Text.Length == 0 && Occurrences.Items.Count == 0;
+        EmptyMessage.Text = result is null ? string.Empty :
+            occurrences.Length == 0 ? "No dialogue linked." : "No matches for this language.";
         EmptyMessage.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
     }
 
