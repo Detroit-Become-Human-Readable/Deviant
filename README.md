@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-    [WIP] Browse, preview, and export game assets from Quantic Dream's *Detroit: Become Human*
+    [WIP] Browse, preview, and export game assets from Quantic Dream's <i>Detroit: Become Human</i>
 </p>
 
 ## Requirements
@@ -17,8 +17,10 @@
 2. A legal copy of *Detroit: Become Human*
 
 ## Getting started
+Since **Deviant** is in such an early and unstable state, normal releases will not be put out until the program is somewhat reliable. 
+For now, you will have to build the program yourself, or download a build from [GitHub Actions](https://github.com/Detroit-Become-Human-Readable/Deviant/actions/workflows/ci.yml).
 
-1. Download the Windows package and extract the ZIP.
+1. Download the Windows package from an [Actions run](https://github.com/Detroit-Become-Human-Readable/Deviant/actions/workflows/ci.yml) and extract the ZIP.
 2. Run `Deviant.exe`.
 3. Select your installation on Home, or open an archive index from Advanced.
 
@@ -123,8 +125,20 @@ To publish the CLI:
 
 ## AI Disclaimer
 
-Deviant was developed with assistance from AI tools.
+**Deviant** was developed with assistance from AI tools.
 
 ## Important note
 
 This tool is not affiliated with Quantic Dream. We don't provide any of *Detroit: Become Human*'s assets, you must own a purchased copy of the game to use this tool properly.
+
+<hr>
+
+<p align="center">
+  <img
+    src="https://github.com/user-attachments/assets/992b242b-2b5c-405b-8af5-3354b98c0455"
+    alt="Processing animation"
+    width="512"
+    height="512"
+  />
+  <i><b>Designed by</b> Cyber<b>Life</b>, disassembled by <b>Deviants.</b></i>
+</p>

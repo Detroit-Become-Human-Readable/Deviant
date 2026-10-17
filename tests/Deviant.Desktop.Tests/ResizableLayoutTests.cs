@@ -1,8 +1,10 @@
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
 using Deviant.Assets;
@@ -19,7 +21,7 @@ public sealed class ResizableLayoutTests
     [Fact]
     public void WorkspaceAndAudioSplittersResizeTheirAdjacentColumns()
     {
-        WorkspaceCommitTests.Run((window, fixture) =>
+        Run((window, fixture) =>
         {
             PumpWorkspace(window.OpenArchiveAsync(fixture.Index));
             LoadControlStyles(window);
@@ -63,7 +65,7 @@ public sealed class ResizableLayoutTests
     [Fact]
     public void WideAudioLayoutKeepsNameAndDefaultBankMetadataBalanced()
     {
-        WorkspaceCommitTests.Run((window, fixture) =>
+        Run((window, fixture) =>
         {
             PumpWorkspace(window.OpenArchiveAsync(fixture.Index));
             LoadControlStyles(window);
@@ -99,7 +101,7 @@ public sealed class ResizableLayoutTests
     [Fact]
     public void NameGripperDragPersistsAcrossWindowAndPaneResizesWithoutHidingMetadata()
     {
-        WorkspaceCommitTests.Run((window, fixture) =>
+        Run((window, fixture) =>
         {
             PumpWorkspace(window.OpenArchiveAsync(fixture.Index));
             LoadControlStyles(window);
@@ -157,7 +159,7 @@ public sealed class ResizableLayoutTests
     [InlineData("animation")]
     public void ExistingInspectionViewsKeepTheirTwoPaneSplittersInteractive(string viewName)
     {
-        WorkspaceCommitTests.Run((window, fixture) =>
+        Run((window, fixture) =>
         {
             PumpWorkspace(window.OpenArchiveAsync(fixture.Index));
             LoadControlStyles(window);
@@ -191,6 +193,50 @@ public sealed class ResizableLayoutTests
             Assert.True(parent.ColumnDefinitions[2].ActualWidth < rightBefore - 6);
             Assert.True(splitter.ActualWidth > 0);
         });
+    }
+
+    [Fact]
+    public void LayoutHostCanResizeBeyondTheDesktopBounds()
+    {
+        Run((window, _) =>
+        {
+            Resize(window, Math.Max(2560, SystemParameters.VirtualScreenWidth + 200), 900);
+        });
+    }
+
+    private static void Run(Action<AudioWindow, DiscoveryFixture> check) =>
+        WorkspaceCommitTests.Run((window, fixture) =>
+        {
+            // WPF uses the native maximum tracking size even for programmatic Width changes.
+            // Hosted runners have a small desktop; allow the real HWND to exercise wide layouts.
+            var source = HwndSource.FromHwnd(new WindowInteropHelper(window).Handle)
+                ?? throw new InvalidOperationException("The layout window has no native source.");
+            source.AddHook(AllowOversizedLayout);
+            try { check(window, fixture); }
+            finally { source.RemoveHook(AllowOversizedLayout); }
+        });
+
+    private static IntPtr AllowOversizedLayout(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        const int getMinMaxInfo = 0x0024;
+        if (message == getMinMaxInfo)
+        {
+            var bounds = Marshal.PtrToStructure<MinMaxInfo>(lParam);
+            bounds.MaxTrackSize.X = 32767;
+            bounds.MaxTrackSize.Y = 32767;
+            Marshal.StructureToPtr(bounds, lParam, false);
+            // Leave unhandled so WPF observes these bounds and updates its layout constraints.
+        }
+        return IntPtr.Zero;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint { public int X, Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MinMaxInfo
+    {
+        public NativePoint Reserved, MaxSize, MaxPosition, MinTrackSize, MaxTrackSize;
     }
 
     private static void AssertColumn(GridViewColumn column, string header, double expectedWidth)

@@ -94,7 +94,7 @@ public sealed class WorkspaceCommitTests
         Exception? failure=null;var thread=new Thread(()=>
         {
             var fixture=new DiscoveryFixture(2);AudioWindow? window=null;
-            try{SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));window=new(new CacheManager(Path.Combine(fixture.Root,"settings"),new(fixture.Cache)),new AliasStore(fixture.Library)){Left=-10000,Top=-10000,ShowInTaskbar=false,ShowActivated=false};WindowTestLifetime.Observe(window);window.Show();Pump(Task.Delay(50));check(window,fixture);}
+            try{SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));window=new(new CacheManager(Path.Combine(fixture.Root,"settings"),new(fixture.Cache)),new AliasStore(fixture.Library)){WindowStartupLocation=WindowStartupLocation.Manual,Left=-10000,Top=-10000,ShowInTaskbar=false,ShowActivated=false};WindowTestLifetime.Observe(window);window.Show();Pump(Task.Delay(50));check(window,fixture);}
             catch(Exception error){failure=error;}
             finally
             {

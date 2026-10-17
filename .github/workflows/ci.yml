@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   build-and-test:
-    runs-on: windows-latest
+    # Build-Vgmstream.ps1 uses the Visual Studio 2022 generator.
+    runs-on: windows-2022
+    timeout-minutes: 120
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -26,12 +28,26 @@ jobs:
       - name: Build
         run: dotnet build Deviant.slnx -c Release --no-restore -p:GenerateDesktopArtifacts=false
 
+      - name: Build verified codec tools
+        shell: pwsh
+        run: ./scripts/Build-CiAudioTools.ps1 -Destination "artifacts/ci-audio-tools-${{ github.run_id }}" -BuildDirectory "$env:RUNNER_TEMP/deviant-audio-build"
+
       - name: Test
-        run: dotnet test Deviant.slnx -c Release --no-build
+        shell: pwsh
+        run: |
+          $env:DEVIANT_AUDIO_TOOLS = (Resolve-Path "artifacts/ci-audio-tools-${{ github.run_id }}").Path
+          dotnet test Deviant.slnx -c Release --no-build
+
+      - name: Upload verified codec tools
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-audio-tools-${{ github.run_id }}
+          path: artifacts/ci-audio-tools-${{ github.run_id }}/
+          if-no-files-found: error
+          retention-days: 1
 
   publish-build:
     needs: build-and-test
-    # Match the Visual Studio 2022 generator used by Build-Vgmstream.ps1.
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
@@ -43,9 +59,11 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
-      - name: Build verified codec tools
-        shell: pwsh
-        run: ./scripts/Build-CiAudioTools.ps1 -Destination "artifacts/ci-audio-tools-${{ github.run_id }}" -BuildDirectory "$env:RUNNER_TEMP/deviant-audio-build"
+      - name: Download verified codec tools
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-audio-tools-${{ github.run_id }}
+          path: artifacts/ci-audio-tools-${{ github.run_id }}
 
       - name: Test audio tools
         shell: pwsh

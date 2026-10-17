@@ -120,10 +120,22 @@ public sealed class TextureCatalogWorkflowTests
     [Fact]
     public void AudioUpdatesCannotOverwriteTheVisibleBoundedCatalogState() => WorkspaceCommitTests.Run((window, fixture) =>
     {
-        window.TextureCatalogOptions = new(MaximumCatalogs: 2048);
-        WriteManyCatalogs(fixture.Index); Pump(window.OpenArchiveAsync(fixture.Index)); Pump(window.ShowTexturesAsync());
+        // This checks status precedence after bounded discovery, not discovery throughput.
+        // Keep a real unvisited catalog beyond the configured limit without scanning thousands.
+        const int maximumCatalogs = 2;
+        const int totalCatalogs = maximumCatalogs + 1;
+        window.TextureCatalogOptions = new(MaximumCatalogs: maximumCatalogs);
+        DiscoveryFixture.WriteIndex(fixture.Index, Enumerable.Range(0, totalCatalogs)
+            .Select(_ => (3u, Container((2229, (uint)totalCatalogs + 1))))
+            .Append((2229u, new byte[] { 1 })).ToArray());
+        Pump(window.OpenArchiveAsync(fixture.Index)); Pump(window.ShowTexturesAsync());
         var catalogs = Field<TextureCatalogSession>(window, "textureCatalogs"); Pump(catalogs.EnrichmentTask);
         Assert.Equal(TextureCatalogSessionState.StoppedAtLimit, catalogs.Progress.State); Assert.True(catalogs.Progress.DiscoveryIncomplete);
+        Assert.Equal(totalCatalogs, catalogs.Progress.CatalogsAvailable);
+        Assert.Equal(maximumCatalogs, catalogs.Progress.CatalogsVisited);
+        Assert.Equal(maximumCatalogs, catalogs.Groups.Count);
+        var texture = new ResourceIdentity(window.CurrentSession!.Snapshot.IndexContentId, totalCatalogs);
+        Assert.All(catalogs.Groups, group => Assert.Equal(texture, Assert.Single(group.UniqueTextureMembers)));
         Invoke(window, "UpdateExplorerGroups"); Assert.Equal("Catalog discovery incomplete", ((TextBlock)window.FindName("ExplorerStatus")).Text);
         Invoke(window, "Home_Click", window, new RoutedEventArgs()); Invoke(window, "UpdateExplorerGroups");
         Assert.Equal("Ready", ((TextBlock)window.FindName("ExplorerStatus")).Text);

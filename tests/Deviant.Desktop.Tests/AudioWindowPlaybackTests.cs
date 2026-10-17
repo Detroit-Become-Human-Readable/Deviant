@@ -336,7 +336,8 @@ public sealed class AudioWindowPlaybackTests
             .SelectMany(root => Ancestors(root!, maximumDepth: 8))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        var candidates = directories.Select(root => AudioToolPaths.Discover(applicationDirectory: root)).ToList();
+        var configuredDirectory = Environment.GetEnvironmentVariable("DEVIANT_AUDIO_TOOLS");
+        var candidates = directories.Select(root => AudioToolPaths.Discover(configuredDirectory, applicationDirectory: root)).ToList();
         foreach (var root in directories)
         {
             var artifacts = Path.Combine(root, "artifacts");
@@ -350,7 +351,7 @@ public sealed class AudioWindowPlaybackTests
             }
         }
         var tools = candidates.FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate.VgmstreamCli));
-        if (tools is null) throw SkipException.ForSkip("The generated playback integration requires a bundled vgmstream-cli tool.");
+        if (tools is null) throw new InvalidOperationException("The generated playback integration requires vgmstream-cli. Build the codec tools and set DEVIANT_AUDIO_TOOLS to their directory.");
         return tools;
     }
 
