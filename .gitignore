@@ -2,14 +2,13 @@ bin/
 obj/
 artifacts/
 .local/
+.codex-remote-attachments/
 TestResults/
 .vs/
 *.user
 *.db
 *.db-wal
 *.db-shm
-
-
-#Ignore vscode AI rules
+# Local tooling configuration
 .reverse-engineering-assistant.ini
 .github/instructions/codacy.instructions.md
