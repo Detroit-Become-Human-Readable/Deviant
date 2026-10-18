@@ -149,7 +149,7 @@ public sealed partial class FeatureStore
         {
             InitializeCharacterProjectionForAssetWrites();
             using var transaction = connection.BeginTransaction();
-            var existing = ReadBoundedAssetStates(preparedAssets, transaction);
+            var existing = ReadBoundedAssetStates(preparedAssets, transaction, token);
             var accepted = new List<int>(writes.Count);
             for (var index = 0; index < writes.Count; index++)
             {
@@ -245,32 +245,40 @@ public sealed partial class FeatureStore
     }
 
     private Dictionary<string, ExistingBoundedAssetState> ReadBoundedAssetStates(
-        IReadOnlyList<PreparedBoundedAssetRow> prepared, SqliteTransaction transaction)
+        IReadOnlyList<PreparedBoundedAssetRow> prepared, SqliteTransaction transaction, CancellationToken token)
     {
         using var command = connection.CreateCommand(); command.Transaction = transaction;
-        command.CommandText = "WITH incoming(identity,payload,search,search_fold,sort_key,lookup_key) AS (VALUES " +
-            string.Join(",", Enumerable.Range(0, prepared.Count).Select(index =>
-                $"($identity{index},$payload{index},$search{index},$fold{index},$sort{index},$lookup{index})")) + ") " +
-            "SELECT a.identity,a.family,a.completeness,COALESCE(p.model_kind,''),COALESCE(p.actor,''),COALESCE(p.name_profile,''),COALESCE(p.classification_profile,'')," +
-            "a.payload=i.payload AND a.search=i.search AND a.search_fold=i.search_fold AND a.sort_key=i.sort_key AND a.lookup_key IS i.lookup_key,p.identity IS NOT NULL " +
-            "FROM assets_v2 a LEFT JOIN character_projection_models p ON p.revision=a.revision AND p.identity=a.identity " +
-            "JOIN incoming i ON i.identity=a.identity WHERE a.revision=$revision";
+        command.CommandText = """
+            SELECT a.identity,a.family,a.completeness,COALESCE(p.model_kind,''),COALESCE(p.actor,''),
+                COALESCE(p.name_profile,''),COALESCE(p.classification_profile,''),
+                a.payload=$payload AND a.search=$search AND a.search_fold=$fold AND a.sort_key=$sort
+                    AND a.lookup_key IS $lookup,p.identity IS NOT NULL
+            FROM assets_v2 a LEFT JOIN character_projection_models p ON p.revision=a.revision AND p.identity=a.identity
+            WHERE a.revision=$revision AND a.identity=$identity
+            """;
         command.Parameters.AddWithValue("$revision", revision);
-        for (var index = 0; index < prepared.Count; index++)
-        {
-            var item = prepared[index];
-            command.Parameters.AddWithValue("$identity" + index, item.Asset.Identity.Key);
-            command.Parameters.AddWithValue("$payload" + index, item.Payload);
-            command.Parameters.AddWithValue("$search" + index, item.Search);
-            command.Parameters.AddWithValue("$fold" + index, item.SearchFold);
-            command.Parameters.AddWithValue("$sort" + index, item.SortKey);
-            command.Parameters.AddWithValue("$lookup" + index, (object?)item.Asset.LookupKey ?? DBNull.Value);
-        }
+        var identity = command.Parameters.Add("$identity", SqliteType.Text);
+        var payload = command.Parameters.Add("$payload", SqliteType.Text);
+        var search = command.Parameters.Add("$search", SqliteType.Text);
+        var fold = command.Parameters.Add("$fold", SqliteType.Text);
+        var sort = command.Parameters.Add("$sort", SqliteType.Text);
+        var lookup = command.Parameters.Add("$lookup", SqliteType.Text);
+        command.Prepare();
         var found = new Dictionary<string, ExistingBoundedAssetState>(StringComparer.Ordinal);
-        using var rows = command.ExecuteReader();
-        while (rows.Read())
-            found[rows.GetString(0)] = new(rows.GetString(1), (AssetCompleteness)rows.GetInt32(2), rows.GetString(3),
-                rows.GetString(4), rows.GetString(5), rows.GetString(6), rows.GetBoolean(7), rows.GetBoolean(8));
+        foreach (var item in prepared)
+        {
+            token.ThrowIfCancellationRequested();
+            identity.Value = item.Asset.Identity.Key;
+            payload.Value = item.Payload;
+            search.Value = item.Search;
+            fold.Value = item.SearchFold;
+            sort.Value = item.SortKey;
+            lookup.Value = (object?)item.Asset.LookupKey ?? DBNull.Value;
+            using var rows = command.ExecuteReader();
+            if (rows.Read())
+                found[rows.GetString(0)] = new(rows.GetString(1), (AssetCompleteness)rows.GetInt32(2), rows.GetString(3),
+                    rows.GetString(4), rows.GetString(5), rows.GetString(6), rows.GetBoolean(7), rows.GetBoolean(8));
+        }
         return found;
     }
 

@@ -219,6 +219,100 @@ public sealed class FeatureStoreUnchangedPublicationTests : IDisposable
     }
 
     [Fact]
+    public void FullMixedBatchPreservesPerIdentityStateAndRejectsFamilyConflicts()
+    {
+        using var store = FeatureStore.Open(Snapshot(), CacheRoot);
+        var template = Asset();
+        var originals = Enumerable.Range(0, FeatureStore.BoundedAssetPublicationLimit).Select(index =>
+            template with
+            {
+                Identity = template.Identity with { Ordinal = index + 1 },
+                Family = index % 8 is 4 or 5 or 6 ? "generated-media" : "character-model",
+                Label = "Generated asset " + index,
+                SearchTerms = "generated search " + index,
+                SortKey = "generated-sort-" + index,
+                LookupKey = (index + index / 8) % 2 == 0 ? null : "generated-lookup-" + index
+            }).ToArray();
+        var initial = originals.Where((_, index) => index % 8 is not (2 or 6)).Select(asset => Write(asset)).ToArray();
+        store.PublishBoundedAssetsBatch(initial);
+        foreach (var original in originals.Where((_, index) => index % 8 == 7))
+        {
+            using var remove = Connection(store).CreateCommand();
+            remove.CommandText = "DELETE FROM character_projection_models WHERE revision=$revision AND identity=$identity";
+            remove.Parameters.AddWithValue("$revision", SourceIdentity.DerivedCacheKey(
+                original.Revision.IndexContentId, original.Revision.PhysicalSourceStamp));
+            remove.Parameters.AddWithValue("$identity", original.Identity.Key);
+            Assert.Equal(1, remove.ExecuteNonQuery());
+        }
+
+        var writes = originals.Select((original, index) =>
+        {
+            var incoming = (index % 8) switch
+            {
+                1 or 5 => original with
+                {
+                    Label = "Changed asset " + index,
+                    SearchTerms = "changed search " + index,
+                    SortKey = "changed-sort-" + index,
+                    LookupKey = original.LookupKey is null ? "changed-lookup-" + index : null,
+                    Completeness = index % 8 == 5 ? AssetCompleteness.Partial : AssetCompleteness.Complete
+                },
+                3 => original with { Family = "conflicting-family", Label = "Rejected asset " + index },
+                7 => original with
+                {
+                    Label = "Inventory asset " + index,
+                    SearchTerms = "inventory search " + index,
+                    LookupKey = null,
+                    Completeness = AssetCompleteness.Partial,
+                    Metadata = new Dictionary<string, string>(original.Metadata) { ["model.kind"] = "unclassified" }
+                },
+                _ => original
+            };
+            return index % 8 is 0 or 4 ? Write(incoming) : Write(incoming, "v2", "changed evidence " + index);
+        }).ToArray();
+
+        var accepted = store.PublishBoundedAssetsBatch(writes);
+
+        var expectedAccepted = originals.Where((_, index) => index % 8 != 3).Select(asset => asset.Identity).ToHashSet();
+        Assert.True(expectedAccepted.SetEquals(accepted));
+        var actual = store.Query(new(Limit: FeatureStore.BoundedAssetPublicationLimit)).ToDictionary(asset => asset.Identity);
+        Assert.Equal(FeatureStore.BoundedAssetPublicationLimit, actual.Count);
+        for (var index = 0; index < originals.Length; index++)
+        {
+            var original = originals[index];
+            var expected = index % 8 is 3 or 7 ? original : writes[index].Asset;
+            var selected = actual[original.Identity];
+            Assert.Equal(expected.Family, selected.Family);
+            Assert.Equal(expected.Label, selected.Label);
+            Assert.Equal(expected.Completeness, selected.Completeness);
+            Assert.Equal(expected.Metadata["model.kind"], selected.Metadata["model.kind"]);
+            Assert.Equal((object?)expected.LookupKey ?? DBNull.Value, Scalar(store,
+                "SELECT lookup_key FROM assets_v2 WHERE identity=$identity", original.Identity.Key));
+            Assert.Equal(expected.SearchTerms, Scalar(store,
+                "SELECT search FROM assets_v2 WHERE identity=$identity", original.Identity.Key));
+            Assert.Equal(expected.SortKey, Scalar(store,
+                "SELECT sort_key FROM assets_v2 WHERE identity=$identity", original.Identity.Key));
+            Assert.Equal(expected.Family == "character-model" ? 1L : 0L, Scalar(store,
+                "SELECT COUNT(*) FROM character_projection_models WHERE identity=$identity", original.Identity.Key));
+            var featureKey = "model/" + original.Identity.Ordinal;
+            if (index % 8 is 0 or 3 or 4)
+            {
+                Assert.Equal("evidence", store.LoadBounded<string>(featureKey, "v1", 1024));
+                Assert.Null(store.LoadBounded<string>(featureKey, "v2", 1024));
+            }
+            else
+            {
+                Assert.Null(store.LoadBounded<string>(featureKey, "v1", 1024));
+                Assert.Equal("changed evidence " + index, store.LoadBounded<string>(featureKey, "v2", 1024));
+            }
+        }
+
+        var beforeRepeat = Changes(store);
+        Assert.True(expectedAccepted.SetEquals(store.PublishBoundedAssetsBatch(writes)));
+        Assert.Equal(beforeRepeat, Changes(store));
+    }
+
+    [Fact]
     public void CancellationDuringOwnerUpdateRollsBackItsCheckpointTransaction()
     {
         using var store = FeatureStore.Open(Snapshot(), CacheRoot);
