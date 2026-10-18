@@ -94,8 +94,9 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
             using var transaction = connection.BeginTransaction();
             using (var remove = connection.CreateCommand())
             {
-                remove.Transaction = transaction; remove.CommandText = "DELETE FROM asset_features WHERE revision=$revision AND instr(feature,$prefix)=1";
-                remove.Parameters.AddWithValue("$revision", revision); remove.Parameters.AddWithValue("$prefix", prefix); remove.ExecuteNonQuery();
+                remove.Transaction = transaction; remove.CommandText = "DELETE FROM asset_features WHERE revision=$revision AND feature>=$prefix AND feature<$end";
+                remove.Parameters.AddWithValue("$revision", revision); remove.Parameters.AddWithValue("$prefix", prefix);
+                remove.Parameters.AddWithValue("$end", collection + "/item0"); remove.ExecuteNonQuery();
             }
             using var write = connection.CreateCommand(); write.Transaction = transaction;
             write.CommandText = "INSERT INTO asset_features VALUES($revision,$key,$version,$payload)";
@@ -114,8 +115,9 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
     {
         lock (gate) return CatalogService.ExecuteInterruptible(connection, token, () =>
         {
-            using var read = connection.CreateCommand(); read.CommandText = "SELECT payload FROM asset_features WHERE revision=$revision AND instr(feature,$prefix)=1 AND version=$version ORDER BY feature";
-            read.Parameters.AddWithValue("$revision", revision); read.Parameters.AddWithValue("$prefix", collection + "/item/"); read.Parameters.AddWithValue("$version", version);
+            using var read = connection.CreateCommand(); read.CommandText = "SELECT payload FROM asset_features WHERE revision=$revision AND feature>=$prefix AND feature<$end AND version=$version ORDER BY feature";
+            read.Parameters.AddWithValue("$revision", revision); read.Parameters.AddWithValue("$prefix", collection + "/item/");
+            read.Parameters.AddWithValue("$end", collection + "/item0"); read.Parameters.AddWithValue("$version", version);
             var items = new List<T>(); using var rows = read.ExecuteReader();
             while (rows.Read()) { token.ThrowIfCancellationRequested(); items.Add(JsonSerializer.Deserialize<T>(rows.GetString(0))!); }
             return items;

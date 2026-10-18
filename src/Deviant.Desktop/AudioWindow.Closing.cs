@@ -30,13 +30,14 @@ public partial class AudioWindow
             Run("Playback timer", playbackTimer.Stop);
             Run("Seek timer", seekTimer.Stop);
             Run("Opening", () => openCancellation?.Cancel());
-            Run("Queries", () => queryCancellation?.Cancel());
+            Run("Queries", CancelAudioQueries);
             Run("Jobs", () => jobCancellation?.Cancel());
             await Step("Characters", ClearCharactersAsync);
             await Step("Dialogue", ClearAudioDialogueAsync);
             await Step("Physics", () => ClearPhysicsAsync());
             if (activeJob is { } job) await Step("Jobs", () => job, cancellationExpected: true);
             await Step("Opening", () => Task.WhenAll(pendingOpens.ToArray()), cancellationExpected: true);
+            await Step("Queries", CancelQueryAsync, cancellationExpected: true);
             await Step("Playback", () => StopPlaybackAsync());
             var sceneDrain = sceneNavigationDrain;
             sceneNavigationDrain = Task.CompletedTask;

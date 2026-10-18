@@ -34,6 +34,11 @@ public partial class AudioWindow : Window, IAssetNavigator
     private AudioExplorerQuery currentQuery = new();
     private CancellationTokenSource? openCancellation;
     private CancellationTokenSource? queryCancellation;
+    private Task? foregroundAudioQuery;
+    private Task? audioQueryRefresh;
+    private bool audioQueryRefreshPending;
+    private long audioQueryEpoch;
+    private readonly HashSet<Task> audioQueryTasks = [];
     private CancellationTokenSource? jobCancellation;
     private long openGeneration;
     private long queryGeneration;
@@ -299,7 +304,7 @@ public partial class AudioWindow : Window, IAssetNavigator
         catch (OperationCanceledException) { }
         catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); _ = Dispatcher.BeginInvoke(() => { if (ReferenceEquals(session, opened)) HomeStatus.Text = StatusText.Text = ex.Message; }); }
         if (ReferenceEquals(session, opened)&&!closingInProgress&&(currentView is "audio" or "home"))
-            await Dispatcher.InvokeAsync(async () => { UpdateFilterChoices(opened); UpdateExplorerGroups(); await QueryAsync(resetOffset: false); }).Task.Unwrap();
+            await Dispatcher.InvokeAsync(async () => { UpdateFilterChoices(opened); UpdateExplorerGroups(); await RefreshAudioQueryAsync(); }).Task.Unwrap();
         if (ReferenceEquals(session, opened) && !closingInProgress)
             await Dispatcher.InvokeAsync(RefreshActivity);
     }
@@ -310,7 +315,41 @@ public partial class AudioWindow : Window, IAssetNavigator
             audioUpdates?.Report(new(current, update, openGeneration));
     }
 
-    private async Task QueryAsync(bool resetOffset)
+    private Task QueryAsync(bool resetOffset)
+    {
+        filterTimer.Stop();
+        return foregroundAudioQuery = TrackAudioQueryAsync(RunAudioQueryAsync(resetOffset));
+    }
+
+    private async Task TrackAudioQueryAsync(Task task)
+    {
+        audioQueryTasks.Add(task);
+        try { await task; }
+        finally { audioQueryTasks.Remove(task); }
+    }
+
+    private Task RefreshAudioQueryAsync()
+    {
+        audioQueryRefreshPending = true;
+        if (audioQueryRefresh is { IsCompleted: false }) return audioQueryRefresh;
+        return audioQueryRefresh = TrackLibraryTask(DrainAudioQueryRefreshAsync());
+    }
+
+    private async Task DrainAudioQueryRefreshAsync()
+    {
+        var current = session;
+        var epoch = audioQueryEpoch;
+        while (audioQueryRefreshPending)
+        {
+            audioQueryRefreshPending = false;
+            while (foregroundAudioQuery is { IsCompleted: false } foreground) await foreground;
+            if (epoch != audioQueryEpoch || closingInProgress || !ReferenceEquals(current, session) ||
+                currentView is not ("audio" or "home") || filterTimer.IsEnabled) return;
+            await TrackAudioQueryAsync(RunAudioQueryAsync(resetOffset: false));
+        }
+    }
+
+    private async Task RunAudioQueryAsync(bool resetOffset)
     {
         var current = session;
         if (current is null) return;
@@ -393,7 +432,7 @@ public partial class AudioWindow : Window, IAssetNavigator
 
     private void FilterChanged(object sender, RoutedEventArgs e)
     {
-        if (syncingControls) return;
+        if (syncingControls || session is null || closingInProgress) return;
         queryCancellation?.Cancel();Interlocked.Increment(ref queryGeneration);
         filterTimer.Stop(); filterTimer.Start();
     }
@@ -746,7 +785,8 @@ public partial class AudioWindow : Window, IAssetNavigator
         await ClearPhysicsAsync();
         await ClearAudioDialogueAsync();
         await ClearCharactersAsync();
-        jobCancellation?.Cancel(); queryCancellation?.Cancel(); openCancellation?.Cancel();
+        jobCancellation?.Cancel(); openCancellation?.Cancel();
+        await CancelQueryAsync();
         if (activeJob is not null) try { await activeJob; } catch { }
         try{await Task.WhenAll(pendingOpens.ToArray());}catch{}
         await stringsView.DisposeAsync();
@@ -768,7 +808,21 @@ public partial class AudioWindow : Window, IAssetNavigator
     }
     private async Task ReopenAfterCacheChangeAsync(CancellationToken token)
     { if (inputPath is not null) await OpenAsync(inputPath, token); }
-    private async Task CancelQueryAsync() { queryCancellation?.Cancel(); if (queryCancellation is not null) await Task.Yield(); }
+    private void CancelAudioQueries()
+    {
+        filterTimer.Stop();
+        audioQueryRefreshPending = false;
+        ++audioQueryEpoch;
+        ++queryGeneration;
+        queryCancellation?.Cancel();
+    }
+
+    private async Task CancelQueryAsync()
+    {
+        CancelAudioQueries();
+        await Task.WhenAll(audioQueryTasks.ToArray());
+        if (audioQueryRefresh is { } refresh) await refresh;
+    }
 
     private void SetBusy(bool busy, string message)
     {
@@ -795,12 +849,14 @@ public partial class AudioWindow : Window, IAssetNavigator
     private async void Cancel_Click(object sender, RoutedEventArgs e)
     {
         CancelPhysics();
-        jobCancellation?.Cancel(); openCancellation?.Cancel(); queryCancellation?.Cancel();
+        jobCancellation?.Cancel(); openCancellation?.Cancel();
+        CancelAudioQueries();
         var metadata = session;
         var metadataCancelled = metadata?.CancelEnrichment() == true;
         SetBusy(true, "Cancelling…");
         if (activeJob is not null) try { await activeJob; } catch { }
         try{await Task.WhenAll(pendingOpens.ToArray());}catch{}
+        await CancelQueryAsync();
         if (metadataCancelled && metadata is not null) { try { await metadata.EnrichmentTask; } catch (OperationCanceledException) { } }
         await StopPlaybackAsync(); SetBusy(false, "Cancelled.");
     }

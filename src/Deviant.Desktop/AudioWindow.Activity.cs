@@ -161,7 +161,7 @@ public partial class AudioWindow
             displayedAudioGeneration = update.Generation;
             UpdateFilterChoices(current);
             UpdateExplorerGroups();
-            if (currentView == "audio") await QueryAsync(resetOffset: false);
+            if (currentView == "audio") await RefreshAudioQueryAsync();
         }
         if (update.IsComplete && currentView is "audio" or "home") StatusText.Text = $"{update.MediaCount:N0} audio resources ready";
         RefreshActivity();

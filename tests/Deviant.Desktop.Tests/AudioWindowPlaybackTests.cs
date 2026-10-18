@@ -45,6 +45,107 @@ public sealed class AudioWindowPlaybackTests
     }
 
     [Fact]
+    public void ExplicitPagingSupersedesAnEarlierDebouncedFilterRequest()
+    {
+        using var fixture = new GeneratedArchive(120);
+        RunSta(() =>
+        {
+            AudioWindow? window = null;
+            try
+            {
+                window = OpenAudioWindow(fixture, new FakeBackendFactory(), new(null, null, null, null, null, null, null), expectedVisibleRows: 100);
+                var timer = (DispatcherTimer)typeof(AudioWindow).GetField("filterTimer", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+                timer.Interval = TimeSpan.FromSeconds(10);
+                Named<TextBox>(window, "SearchBox").Text = "Generated dialogue";
+                var query = typeof(AudioWindow).GetField("currentQuery", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                query.SetValue(window, ((AudioExplorerQuery)query.GetValue(window)!) with { Offset = 100 });
+                Pump((Task)Invoke(window, "QueryAsync", false)!);
+                Assert.Equal(100, window.CurrentRows[0].Identity.Ordinal);
+                timer.Interval = TimeSpan.FromMilliseconds(1);
+                Pump(Task.Delay(75));
+                Assert.Equal(100, window.CurrentRows[0].Identity.Ordinal);
+                Assert.Equal("Generated dialogue", Named<TextBox>(window, "SearchBox").Text);
+            }
+            finally { if (window is not null) Pump(WindowTestLifetime.CloseAsync(window)); }
+        });
+    }
+
+    [Fact]
+    public void EnrichmentRefreshWaitsForExplicitPagingToPublish()
+    {
+        using var fixture = new GeneratedArchive(120);
+        RunSta(() =>
+        {
+            AudioWindow? window = null;
+            SemaphoreSlim? gate = null;
+            var held = false;
+            try
+            {
+                window = OpenAudioWindow(fixture, new FakeBackendFactory(), new(null, null, null, null, null, null, null), expectedVisibleRows: 100);
+                var selected = window.CurrentRows[0];
+                Named<ListView>(window, "MediaList").SelectedItem = selected;
+                gate = (SemaphoreSlim)typeof(AudioExplorerSession).GetField("featureGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window.CurrentSession)!;
+                Pump(gate.WaitAsync()); held = true;
+                var query = typeof(AudioWindow).GetField("currentQuery", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                query.SetValue(window, ((AudioExplorerQuery)query.GetValue(window)!) with { Offset = 100 });
+                var paging = (Task)Invoke(window, "QueryAsync", false)!;
+                var cancellation = ((CancellationTokenSource)typeof(AudioWindow).GetField("queryCancellation", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!).Token;
+                var generation = typeof(AudioWindow).GetField("openGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+                var refresh = (Task)Invoke(window, "ObserveEnrichmentAsync", window.CurrentSession!, generation, CancellationToken.None)!;
+                Pump(Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle).Task);
+                Assert.False(cancellation.IsCancellationRequested, "An indexing refresh cancelled the requested page.");
+                Assert.False(paging.IsCompleted);
+                gate.Release(); held = false;
+                Pump(paging);
+                Assert.Equal(100, window.CurrentRows[0].Identity.Ordinal);
+                Pump(refresh);
+                Assert.Equal(100, window.CurrentRows[0].Identity.Ordinal);
+                Assert.Equal(selected.Label, Named<TextBlock>(window, "DetailName").Text);
+                Assert.True(Named<Button>(window, "PlayButton").IsEnabled);
+            }
+            finally
+            {
+                if (held) gate!.Release();
+                if (window is not null) Pump(WindowTestLifetime.CloseAsync(window));
+            }
+        });
+    }
+
+    [Fact]
+    public void ReturningHomeCancelsPendingAudioPageAndRefresh()
+    {
+        using var fixture = new GeneratedArchive(120);
+        RunSta(() =>
+        {
+            AudioWindow? window = null;
+            SemaphoreSlim? gate = null;
+            var held = false;
+            try
+            {
+                window = OpenAudioWindow(fixture, new FakeBackendFactory(), new(null, null, null, null, null, null, null), expectedVisibleRows: 100);
+                gate = (SemaphoreSlim)typeof(AudioExplorerSession).GetField("featureGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window.CurrentSession)!;
+                Pump(gate.WaitAsync()); held = true;
+                var query = typeof(AudioWindow).GetField("currentQuery", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                query.SetValue(window, ((AudioExplorerQuery)query.GetValue(window)!) with { Offset = 100 });
+                var paging = (Task)Invoke(window, "QueryAsync", false)!;
+                var generation = typeof(AudioWindow).GetField("openGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+                var refresh = (Task)Invoke(window, "ObserveEnrichmentAsync", window.CurrentSession!, generation, CancellationToken.None)!;
+                Pump(Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle).Task);
+                Invoke(window, "Home_Click", window, new RoutedEventArgs());
+                gate.Release(); held = false;
+                Pump(Task.WhenAll(paging, refresh));
+                Assert.Equal(0, window.CurrentRows[0].Identity.Ordinal);
+                Assert.Equal(Visibility.Visible, Named<Grid>(window, "HomeHost").Visibility);
+            }
+            finally
+            {
+                if (held) gate!.Release();
+                if (window is not null) Pump(WindowTestLifetime.CloseAsync(window));
+            }
+        });
+    }
+
+    [Fact]
     public void SelectedAudioDetailsAndPlayStayAvailableWhenQueriesMoveTheRowOffPage()
     {
         using var fixture = new GeneratedArchive(120);

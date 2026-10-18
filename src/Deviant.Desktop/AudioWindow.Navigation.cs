@@ -46,7 +46,7 @@ public partial class AudioWindow
     private async Task DrainLibraryTasksAsync(){while(libraryTasks.Count>0){var batch=libraryTasks.ToArray();try{await Task.WhenAll(batch);}catch{}foreach(var task in batch)libraryTasks.Remove(task);}}
     private CancellationTokenSource navigationCancellation=new();
     private (long Generation,CancellationToken Token) BeginNavigation()
-    {pendingDialogueRefresh=null;workspacePreparation?.NotifyActivity();navigationCancellation.Cancel();navigationCancellation.Dispose();navigationCancellation=new();PauseCommonGroupsForNavigation();return(++navigationGeneration,navigationCancellation.Token);}
+    {CancelAudioQueries();pendingDialogueRefresh=null;workspacePreparation?.NotifyActivity();navigationCancellation.Cancel();navigationCancellation.Dispose();navigationCancellation=new();PauseCommonGroupsForNavigation();return(++navigationGeneration,navigationCancellation.Token);}
     private void NavigationError(Exception error){Deviant.Assets.WorkflowDiagnostics.Failure("Workspace.Navigation",error);HomeStatus.Text=StatusText.Text=LibraryEmpty.Text=error.Message;}
 
     private void InitializeNavigation()
@@ -133,7 +133,7 @@ public partial class AudioWindow
     {
         if (!RequireWorkspaceNavigation()) return;
         SelectLibraryTab();
-        if (view != "audio") audioDialogueCancellation?.Cancel();
+        if (view != "audio") { audioDialogueCancellation?.Cancel(); CancelAudioQueries(); }
         if (view != "physics") SuspendPhysics();
         PhysicsHost.Visibility = view == "physics" ? Visibility.Visible : Visibility.Collapsed;
         if (view != "textures") PauseTextureWorkForNavigation();
