@@ -50,7 +50,19 @@ public sealed record RenderTexture(ResourceIdentity NativeIdentity, TextureSurfa
     public NativeTextureSamplingProfile? Sampling { get; init; }
 }
 
-public sealed record RenderMaterial(MaterialAsset Asset, IReadOnlyDictionary<int, RenderTexture> TexturesBySlot);
+public sealed record RenderMaterial(MaterialAsset Asset, IReadOnlyDictionary<int, RenderTexture> TexturesBySlot)
+{
+    public bool PreparationComplete => HasRequiredSlots(Asset, TexturesBySlot.Keys,
+        Asset.SurfaceGraph?.TextureSlots ?? Array.Empty<int>());
+
+    internal static bool HasRequiredSlots(MaterialAsset asset, IEnumerable<int> slots, IEnumerable<int> graphSlots)
+    {
+        if (asset.Profile == "neutral" && asset.Diagnostics.Count > 0) return false;
+        var available = slots.ToHashSet();
+        return asset.Bindings.All(binding => binding.SlotOrdinal >= 0 && available.Contains(binding.SlotOrdinal)) &&
+            graphSlots.All(slot => slot >= 0 && available.Contains(slot));
+    }
+}
 
 public sealed record RenderIssue(ResourceIdentity Identity, string Code, string Message,
     string? OccurrenceKey = null);
@@ -96,6 +108,8 @@ public sealed class RenderAssetSnapshot : IDisposable
         Meshes = meshes;
         Occurrences = occurrences;
         Materials = materials;
+        HasIncompleteMaterials = materials.Values.Any(material => !material.PreparationComplete) ||
+            meshes.Values.Any(mesh => mesh.MaterialsByPrimitive?.Values.Any(identity => !materials.ContainsKey(identity)) == true);
         Region = region;
         Issues = issues;
         Hierarchy = hierarchy;
@@ -109,6 +123,7 @@ public sealed class RenderAssetSnapshot : IDisposable
     public IReadOnlyDictionary<string, RenderMesh> Meshes { get; }
     public IReadOnlyList<RenderOccurrence> Occurrences { get; }
     public IReadOnlyDictionary<ResourceIdentity, RenderMaterial> Materials { get; }
+    public bool HasIncompleteMaterials { get; }
     public GeometryBounds Region { get; }
     public IReadOnlyList<RenderIssue> Issues { get; }
     public IReadOnlyList<RenderHierarchyNode> Hierarchy { get; }

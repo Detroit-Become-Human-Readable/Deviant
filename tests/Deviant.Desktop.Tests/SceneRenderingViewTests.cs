@@ -15,6 +15,48 @@ namespace Deviant.Desktop.Tests;
 public sealed class SceneRenderingViewTests
 {
     [Fact]
+    public void IncompleteMaterialsKeepGeometryVisibleAndRetryCanFinish() => Run(() =>
+    {
+        var budget = new AssetMemoryBudget();
+        using var original = Snapshot(budget);
+        var materialId = Identity(30);
+        var mesh = original.Meshes.Single().Value;
+        mesh = mesh with { MaterialsByPrimitive = new Dictionary<string, ResourceIdentity> { [mesh.Geometry.Primitives[0].Key] = materialId } };
+        var meshes = new Dictionary<string, RenderMesh> { [mesh.Key] = mesh };
+        var partial = new RenderAssetSnapshot(Revision, meshes, original.Occurrences,
+            new Dictionary<ResourceIdentity, RenderMaterial> { [materialId] = new(new(materialId, Revision, "neutral", [], [], ["AssetMemoryLimit"]), new Dictionary<int, RenderTexture>()) },
+            original.Region, [new(materialId, "AssetMemoryLimit", "Generated material preparation limit")], original.Hierarchy,
+            original.Coverage, [], budget, [original.AcquireLease()]);
+        var complete = new RenderAssetSnapshot(Revision, meshes, original.Occurrences,
+            new Dictionary<ResourceIdentity, RenderMaterial> { [materialId] = new(new(materialId, Revision, "generated", [], [], []), new Dictionary<int, RenderTexture>()) },
+            original.Region, [], original.Hierarchy, original.Coverage, [], budget, [original.AcquireLease()]);
+        using var service = new AssetViewportService();
+        var calls = 0;
+        var view = new SceneView { RenderProvider = (_, _, _) => Task.FromResult(++calls == 1 ? partial : complete) };
+        view.SetViewportService(service);
+        try
+        {
+            var loaded = Section();
+            Pump(view.LoadAsync(new Session(loaded))); Pump(view.SelectResourceAsync(loaded.Result.Identity));
+            Pump(view.LoadRegionAsync());
+            Assert.Same(partial, view.CurrentRenderSnapshot);
+            Assert.True(view.Viewport.VisiblePartCount > 0);
+            Assert.True(view.Viewport.IsEnabled);
+            Assert.False(view.ActivityProgress.IsActive);
+            Assert.Equal("Materials incomplete", view.ActivityProgress.Stage);
+            Assert.Contains("incomplete", ((TextBlock)view.FindName("RenderStatus")).Text, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("AssetMemoryLimit", ((TextBox)view.FindName("Advanced")).Text);
+            Assert.True(((Button)view.FindName("LoadRegionButton")).IsEnabled);
+            Pump(view.LoadRegionAsync());
+            Assert.Same(complete, view.CurrentRenderSnapshot);
+            Assert.Equal("Ready", view.ActivityProgress.Stage);
+            Assert.DoesNotContain("incomplete", ((TextBlock)view.FindName("RenderStatus")).Text, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(2, calls);
+        }
+        finally { Pump(view.DisposeAsync().AsTask()); }
+    });
+
+    [Fact]
     public void ApprovedRetryReleasesFailedStreamBeforePreparingAgain() => Run(() =>
     {
         var loaded = Section();

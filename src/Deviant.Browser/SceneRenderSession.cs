@@ -135,7 +135,7 @@ public sealed class SceneRenderSession : IAsyncDisposable
         }
         AssetLoadDiagnostics.Cache("PreparedScene", key, false);
         var fresh = await LoadUnpreparedAsync(request, progress, token, geometryReady).ConfigureAwait(false);
-        if (preparedCache is not null && preparation is not null)
+        if (!fresh.HasIncompleteMaterials && preparedCache is not null && preparation is not null)
         {
             preparedKeys.Add("scene/" + key);
             preparation.Enqueue("scene/" + key, async cancellation =>

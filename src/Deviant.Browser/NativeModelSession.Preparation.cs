@@ -75,6 +75,7 @@ public sealed partial class NativeModelSession
             if (frame is null)
             {
                 material = new(identity, Revision, "neutral", [], [], ["MaterialUnavailable"]);
+                issues.Add(new(identity, "MaterialUnavailable", "The material source is unavailable."));
             }
             else
             {
@@ -102,15 +103,19 @@ public sealed partial class NativeModelSession
                     // The preflight estimate is retained even for malformed records; parsing may have decoded a valid prefix first.
                     using var programScratch = programWorkingBytes > 0
                         ? MemoryBudget.Reserve(programWorkingBytes, "material program records") : null;
-                    material = new NativeMaterialReader { UseSerializedScalarInitialValues = true,
+                    var parsed = new NativeMaterialReader { UseSerializedScalarInitialValues = true,
                         ProjectionDepthNormalizationDistance = 10000f,
-                        JointWorldPositions = materialJointPositions }.Parse(frame, Revision, scan, token).Value
-                        ?? new(identity, Revision, "neutral", [], [], ["MaterialUnavailable"]);
+                        JointWorldPositions = materialJointPositions }.Parse(frame, Revision, scan, token).Value;
+                    material = parsed ?? new(identity, Revision, "neutral", [], [], ["MaterialUnavailable"]);
+                    if (parsed is null) issues.Add(new(identity, "MaterialUnavailable", "The material source could not be prepared."));
                 }
-                catch (Exception error) when (error is IOException or ArgumentException or OverflowException)
+                catch (Exception error) when (error is not ArchiveException { Code: "SourceChanged" } &&
+                    (error is IOException or ArgumentException or OverflowException))
                 {
                     WorkflowDiagnostics.Failure("Model.Material", error, identity.Key, partial: true);
-                    material = NeutralMaterial(frame, error is ArchiveException archive ? archive.Code : "MaterialUnavailable", token);
+                    var code = error is ArchiveException archive ? archive.Code : "MaterialUnavailable";
+                    material = NeutralMaterial(frame, code, token);
+                    issues.Add(new(identity, code, error.Message));
                 }
             }
             resources.Add(MemoryBudget.Reserve(EstimateMaterialBytes(material), "material metadata"));
@@ -138,7 +143,8 @@ public sealed partial class NativeModelSession
                             maximumPreviewDimension, token).ConfigureAwait(false);
                         surfaces.Add(nativeTexture, surface);
                     }
-                    catch (Exception error) when (error is IOException or ArgumentException or OverflowException)
+                    catch (Exception error) when (error is not ArchiveException { Code: "SourceChanged" } &&
+                    (error is IOException or ArgumentException or OverflowException))
                     { WorkflowDiagnostics.Failure("Model.Texture", error, nativeTexture.Key, partial: true);
                         issues.Add(new(nativeTexture, error is TextureFormatException format ? format.Code : error is ArchiveException archive ? archive.Code : "MaterialTextureUnavailable", error.Message)); continue; }
                 }

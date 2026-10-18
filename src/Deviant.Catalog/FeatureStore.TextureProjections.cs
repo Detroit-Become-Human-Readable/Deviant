@@ -339,6 +339,8 @@ public sealed partial class FeatureStore
             using var holdDiagnostic = TextureDiagnostic("TextureBrowser.Store.OwnerPublishHold", diagnosticKey);
             AssetLoadDiagnostics.Counters("TextureBrowser.Store.OwnerRows", diagnosticKey, new Dictionary<string, long> { ["Rows"] = rows.Count });
             EnsureTextureSchema(); using var transaction = connection.BeginTransaction();
+            using var transactionDiagnostic = TextureDiagnostic("TextureBrowser.Store.OwnerTransaction", diagnosticKey);
+            bool historyWasClean = TextureHistoryIsClean(profile, transaction);
             using var current = TextureCommand("SELECT generation FROM texture_projection_heads WHERE revision=$revision AND profile=$profile", profile, transaction);
             long headGeneration = Convert.ToInt64(current.ExecuteScalar() ?? throw new InvalidOperationException("Texture projection baseline is unavailable."));
             if (completedRebuildRequest is null && TextureOwnerPublicationUnchanged(profile, checkpoint, rows, headGeneration, transaction, token))
@@ -363,7 +365,7 @@ public sealed partial class FeatureStore
             owner.Parameters.AddWithValue("$payload", JsonSerializer.Serialize(checkpoint)); owner.ExecuteNonQuery();
             using var head = TextureCommand("UPDATE texture_projection_heads SET generation=$generation WHERE revision=$revision AND profile=$profile", profile, transaction);
             head.Parameters.AddWithValue("$generation", generation); head.ExecuteNonQuery();
-            RefreshTextureHistory(profile, transaction);
+            RefreshTextureHistoryAfterAppend(profile, headGeneration, generation, historyWasClean, transaction);
             token.ThrowIfCancellationRequested();
             CompleteTextureOwnerRebuild(profile, checkpoint.Identity, completedRebuildRequest, transaction);
             using (TextureDiagnostic("TextureBrowser.Store.OwnerCommit", diagnosticKey)) transaction.Commit();

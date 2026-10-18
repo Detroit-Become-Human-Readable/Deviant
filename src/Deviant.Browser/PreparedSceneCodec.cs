@@ -22,6 +22,7 @@ public static class PreparedSceneCodec
 
     public static async Task WriteAsync(string path, string key, RenderAssetSnapshot source, CancellationToken token = default)
     {
+        if (source.HasIncompleteMaterials) throw new InvalidDataException("The scene has incomplete materials.");
         using var held = source.AcquireLease();
         using var scratch = source.MemoryBudget.Reserve(MaximumMetadataBytes + 1024 * 1024, "prepared scene encoding");
         if (source.Meshes.Values.Any(mesh => mesh.Pose is not null || mesh.SkinSourceGeometry is not null || mesh.SkinSourceMetadata is not null || mesh.SkinAttributes is not null))
@@ -35,7 +36,11 @@ public static class PreparedSceneCodec
             source.Materials.Values.Select(material => new MaterialRow(material.Asset with { SurfaceGraph = null },
                 PackGraph(material.Asset.SurfaceGraph), material.TexturesBySlot.Select(pair => new SlotRow(pair.Key,
                     textureIds[(pair.Value.NativeIdentity, pair.Value.RgbaSha256, pair.Value.Sampling?.RawWord)])).ToArray())).ToArray(),
-            textures.Select(texture => TextureRow.From(texture)).ToArray(), source.Meshes.Count);
+            textures.Select(texture => TextureRow.From(texture)).ToArray(), source.Meshes.Count)
+        {
+            RequiredMaterialKeys = source.Meshes.Values.SelectMany(mesh => mesh.MaterialsByPrimitive?.Values ??
+                Enumerable.Empty<ResourceIdentity>()).Select(identity => identity.Key).Distinct(StringComparer.Ordinal).ToArray()
+        };
         await using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.Asynchronous))
         using (var writer = new BinaryWriter(file, System.Text.Encoding.UTF8, true))
         {
@@ -104,7 +109,9 @@ public static class PreparedSceneCodec
             file.Position = sizeof(uint) + sizeof(int);
             var manifest = ReadJson<Manifest>(reader);
             if (manifest.Key != key || manifest.Revision != revision || manifest.OwnedBytes is < 1 or > MaximumOwnedBytes ||
-                manifest.Textures is null || manifest.Textures.Any(row => !row.ValidMetadata())) return false;
+                manifest.MeshCount is < 0 or > NativeModelSession.MaximumLargeSelections ||
+                manifest.Textures is null || manifest.Textures.Any(row => !row.ValidMetadata()) || !MaterialsComplete(manifest)) return false;
+            if (manifest.RequiredMaterialKeys is null && !LegacyMaterialReferencesComplete(reader, manifest, budget, token)) return false;
             file.Position = 0;
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             var buffer = new byte[128 * 1024];
@@ -139,7 +146,7 @@ public static class PreparedSceneCodec
             var manifest = ReadJson<Manifest>(reader);
             if (manifest.Key != key || manifest.Revision != new SourceRevision(archive.IndexContentId, archive.PhysicalSourceStamp) ||
                 manifest.OwnedBytes is < 1 or > MaximumOwnedBytes || manifest.MeshCount is < 0 or > NativeModelSession.MaximumLargeSelections ||
-                manifest.Textures is null || manifest.Textures.Any(row => !row.ValidMetadata()))
+                manifest.Textures is null || manifest.Textures.Any(row => !row.ValidMetadata()) || !MaterialsComplete(manifest))
                 throw new InvalidDataException("The scene preparation identity is invalid.");
             resources.Add(budget.Reserve(manifest.OwnedBytes, "prepared scene content"));
             var admission = new BufferAdmission(manifest.OwnedBytes);
@@ -165,6 +172,9 @@ public static class PreparedSceneCodec
                 }
                 meshes.Add(mesh.Key, mesh with { Geometry = mesh.Geometry with { Primitives = primitives } });
             }
+            var materialKeys = manifest.Materials.Select(row => row.Asset.Identity.Key).ToHashSet(StringComparer.Ordinal);
+            if (meshes.Values.Any(mesh => mesh.MaterialsByPrimitive?.Values.Any(identity => !materialKeys.Contains(identity.Key)) == true))
+                throw new InvalidDataException("A required prepared material is missing.");
             var textures = new RenderTexture[manifest.Textures.Length];
             var blobs = new Dictionary<(TextureEncodingKind Kind, string Hash), byte[]>();
             var backings = new Dictionary<(TextureEncodingKind Kind, string Hash), PreparedTexturePixelSource>();
@@ -318,9 +328,63 @@ public static class PreparedSceneCodec
         return new(Get(graph.Color), Get(graph.Opacity), Get(graph.Cutoff), graph.Inputs, graph.Slots, graph.Diagnostics) { IsUnlit = graph.IsUnlit };
     }
 
+    private static bool MaterialsComplete(Manifest manifest)
+    {
+        if (manifest.Materials is null || manifest.Materials.Any(row => row is null || row.Asset is null ||
+            row.Asset.Bindings is null || row.Asset.Diagnostics is null || row.Slots is null ||
+            row.Graph is { Slots: null } || row.Slots.Any(slot => slot is null || slot.Slot < 0 ||
+                slot.Texture < 0 || slot.Texture >= manifest.Textures.Length) ||
+            row.Slots.Select(slot => slot.Slot).Distinct().Count() != row.Slots.Length ||
+            !RenderMaterial.HasRequiredSlots(row.Asset, row.Slots.Select(slot => slot.Slot), row.Graph?.Slots ?? []))) return false;
+        var available = manifest.Materials.Select(row => row.Asset.Identity.Key).ToHashSet(StringComparer.Ordinal);
+        return available.Count == manifest.Materials.Length &&
+            (manifest.RequiredMaterialKeys is null || manifest.RequiredMaterialKeys.All(available.Contains));
+    }
+
+    private static bool LegacyMaterialReferencesComplete(BinaryReader reader, Manifest manifest, AssetMemoryBudget? budget,
+        CancellationToken token)
+    {
+        var available = manifest.Materials.Select(row => row.Asset.Identity.Key).ToHashSet(StringComparer.Ordinal);
+        for (int index = 0; index < manifest.MeshCount; index++)
+        {
+            token.ThrowIfCancellationRequested();
+            long at = reader.BaseStream.Position;
+            int length = Count(reader, MaximumMetadataBytes);
+            using var scratch = budget?.Reserve(checked(length * 4L + 128 * 1024), "prepared material references");
+            reader.BaseStream.Position = at;
+            var mesh = ReadJson<RenderMesh>(reader);
+            if (mesh.MaterialsByPrimitive?.Values.Any(identity => !available.Contains(identity.Key)) == true) return false;
+            int primitives = Count(reader, 65_536);
+            for (int primitive = 0; primitive < primitives; primitive++)
+            {
+                token.ThrowIfCancellationRequested();
+                SkipBytes(Count(reader, MaximumMetadataBytes));
+                SkipValues(12); SkipValues(4);
+                if (reader.ReadBoolean()) SkipValues(12);
+                if (reader.ReadBoolean()) SkipValues(16);
+                int sets = reader.ReadInt32();
+                if (sets is < -1 or > 16) throw new InvalidDataException("The texture coordinate count is invalid.");
+                for (int set = 0; set < sets; set++) SkipValues(8);
+                if (reader.ReadBoolean()) SkipValues(16);
+            }
+        }
+        return true;
+
+        void SkipValues(int elementBytes) => SkipBytes(checked((long)Count(reader, 16_777_216) * elementBytes));
+        void SkipBytes(long bytes)
+        {
+            if (bytes < 0 || bytes > reader.BaseStream.Length - reader.BaseStream.Position - 32)
+                throw new InvalidDataException("The prepared geometry extent is invalid.");
+            reader.BaseStream.Position = checked(reader.BaseStream.Position + bytes);
+        }
+    }
+
     private sealed record Manifest(string Key, SourceRevision Revision, long OwnedBytes, RenderOccurrence[] Occurrences,
         GeometryBounds Region, RenderIssue[] Issues, RenderHierarchyNode[] Hierarchy, RenderCoverage Coverage,
-        SourceExtent[] Extents, MaterialRow[] Materials, TextureRow[] Textures, int MeshCount);
+        SourceExtent[] Extents, MaterialRow[] Materials, TextureRow[] Textures, int MeshCount)
+    {
+        public string[]? RequiredMaterialKeys { get; init; }
+    }
     private sealed record SlotRow(int Slot, int Texture);
     private sealed record MaterialRow(MaterialAsset Asset, GraphRow? Graph, SlotRow[] Slots);
     private sealed record ExpressionRow(MaterialExpressionOperation Operation, MaterialValueType Type, int[] Arguments,

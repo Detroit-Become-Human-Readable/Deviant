@@ -299,6 +299,11 @@ public partial class SceneView
             Advanced.Text = FormatCoverage(renderSnapshot) + "\n" + FormatIssues(renderSnapshot.Issues.Concat(SceneViewport.RendererIssues));
             lastSuccessfulSceneRenderRequest = request;
             lastSuccessfulRenderBudget = renderSnapshot.MemoryBudget;
+            if (renderSnapshot.HasIncompleteMaterials)
+            {
+                SetActivityTerminal("Materials incomplete");
+                diagnostic?.Partial();
+            }
 
             async Task LoadCandidateAsync()
             {
@@ -652,7 +657,8 @@ public partial class SceneView
     }
     private void UpdateRenderedCount()
     {
-        if (renderSnapshot is not null) RenderStatus.Text = $"{SceneViewport.VisibleOccurrenceCount:N0} objects · {SceneViewport.VisibleMeshCount:N0} meshes";
+        if (renderSnapshot is not null) RenderStatus.Text = $"{SceneViewport.VisibleOccurrenceCount:N0} objects · {SceneViewport.VisibleMeshCount:N0} meshes" +
+            (renderSnapshot.HasIncompleteMaterials ? " · Materials incomplete" : "");
     }
     private void RenderHierarchy_SelectionChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
     {

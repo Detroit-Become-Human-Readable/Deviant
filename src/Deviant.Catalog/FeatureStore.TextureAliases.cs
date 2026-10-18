@@ -88,6 +88,7 @@ public sealed partial class FeatureStore
         using var head = TextureCommand("SELECT generation FROM texture_projection_heads WHERE revision=$revision AND profile=$profile", profile, transaction);
         long previous = Convert.ToInt64(head.ExecuteScalar() ?? 0L);
         long generation = previous == 0 ? 0 : checked(previous + 1);
+        bool historyWasClean = TextureHistoryIsClean(profile, transaction);
         foreach (var pair in changes)
         {
             token.ThrowIfCancellationRequested();
@@ -103,7 +104,7 @@ public sealed partial class FeatureStore
             version.Parameters.AddWithValue("$alias", (object?)pair.Value ?? DBNull.Value);
             version.ExecuteNonQuery();
         }
-        RefreshTextureHistory(profile, transaction);
+        RefreshTextureHistoryAfterAppend(profile, previous, generation, historyWasClean, transaction);
         if (previous > 0)
         {
             using var publish = TextureCommand("UPDATE texture_projection_heads SET generation=$generation WHERE revision=$revision AND profile=$profile", profile, transaction);
