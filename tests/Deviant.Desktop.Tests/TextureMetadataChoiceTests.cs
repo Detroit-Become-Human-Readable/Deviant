@@ -51,6 +51,38 @@ public sealed class TextureMetadataChoiceTests
         });
 
     [Fact]
+    public void DelayedRelationshipDetailsCannotUndoANewerNamePublication()
+        => Run(false, (view, owner, cache, catalog, decoded) =>
+        {
+            var captured = new TaskCompletionSource<TextureDiscoveryEntry>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource<TextureDiscoveryEntry?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            catalog.ReadDetails = (call, entry) =>
+            {
+                if (call != 2) return Task.FromResult<TextureDiscoveryEntry?>(call > 2
+                    ? entry with { VerifiedRole = "Generated detail role" } : entry);
+                captured.TrySetResult(entry);
+                return release.Task;
+            };
+            try
+            {
+                Pump(view.SelectResourceAsync(catalog.Entry.Identity)); WaitReady(view);
+                Pump(captured.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+                var surface = view.NativeImageBrowser.ImageBrowser.CurrentDisplaySurface;
+                var source = view.NativeImageBrowser.CurrentSource;
+                catalog.Rename("Renamed generated texture"); Pump(view.RefreshAsync());
+                Assert.Equal("Renamed generated texture", view.SelectedLabel);
+                release.SetResult(captured.Task.Result);
+                Pump(Task.WhenAll(Field<HashSet<Task>>(view, "operations").ToArray()).WaitAsync(TimeSpan.FromSeconds(5)));
+                Assert.Equal("Renamed generated texture", view.SelectedLabel);
+                Assert.Equal("Generated detail role", view.SelectedEntry!.VerifiedRole);
+                Assert.Same(source, view.NativeImageBrowser.CurrentSource);
+                Assert.Same(surface, view.NativeImageBrowser.ImageBrowser.CurrentDisplaySurface);
+                Assert.Equal(1, decoded());
+            }
+            finally { release.TrySetResult(catalog.Entry); }
+        });
+
+    [Fact]
     public void NavigationCancelsAQueuedRecordChoiceAndDrainsItsLeases()
         => Run(true, (view, owner, cache, catalog, decoded) =>
         {
@@ -146,7 +178,10 @@ public sealed class TextureMetadataChoiceTests
         public TextureNamingCoverage Coverage => new(1, 1, 0, 0, 0, 1, 0, 0, 1, 1, false, [], []);
         public event EventHandler? Updated;
         public Task<TextureDiscoveryPage> QueryAsync(TextureDiscoveryQuery query, CancellationToken token = default) => Task.FromResult(new TextureDiscoveryPage([Entry], 1, 0));
-        public Task<TextureDiscoveryEntry?> GetDetailsAsync(ResourceIdentity identity, CancellationToken token = default) => Task.FromResult<TextureDiscoveryEntry?>(Entry);
+        private int detailCalls;
+        public Func<int, TextureDiscoveryEntry, Task<TextureDiscoveryEntry?>>? ReadDetails { get; set; }
+        public Task<TextureDiscoveryEntry?> GetDetailsAsync(ResourceIdentity identity, CancellationToken token = default)
+            => ReadDetails?.Invoke(Interlocked.Increment(ref detailCalls), Entry) ?? Task.FromResult<TextureDiscoveryEntry?>(Entry);
         public Task SetAliasAsync(ResourceIdentity identity, string? alias, CancellationToken token = default) => Task.CompletedTask;
         public void Rename(string label) => Replace(Entry with { Label = label, SearchText = label });
         public void Replace(TextureDiscoveryEntry entry) { Entry = entry; Updated?.Invoke(this, EventArgs.Empty); }

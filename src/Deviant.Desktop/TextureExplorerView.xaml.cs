@@ -645,10 +645,11 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     private async Task LoadSelectionRelationshipEvidenceAsync(ITextureDiscoveryCatalog catalog,
         NativeTextureSession owner, ResourceIdentity identity, long version, CancellationToken token)
     {
+        var expectedEntry = selected;
         try
         {
             var details = await Task.Run(() => catalog.GetDetailsAsync(identity, token), token);
-            if (details is null || !Current(owner, identity, version)) return;
+            if (details is null || !Current(owner, identity, version) || !ReferenceEquals(selected, expectedEntry)) return;
             selected = details;
             RenderDetails(false);
         }

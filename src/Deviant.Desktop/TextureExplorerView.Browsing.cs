@@ -193,7 +193,16 @@ public partial class TextureExplorerView
             Rows.ItemsSource = cards;
             var same = cards.FirstOrDefault(card => card.Identity == previous);
             Rows.SelectedItem = same;
-            if (same is not null) { if (nativePreviewSelection is null) selected = same.Entry; RenderDetails(false); }
+            if (same is not null)
+            {
+                if (nativePreviewSelection is null)
+                {
+                    selected = same.Entry;
+                    if (CurrentPreviewState == TexturePreviewState.Ready && discovery is { } catalog && native is { } owner)
+                        _ = Track(LoadSelectionRelationshipEvidenceAsync(catalog, owner, same.Identity, nativeVersion, nativeWork.Token));
+                }
+                RenderDetails(false);
+            }
             else if (!preserveSelection) SetSelected(null);
         }
         finally { updating = false; }
