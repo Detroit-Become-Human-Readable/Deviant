@@ -30,9 +30,12 @@ public sealed partial class AudioExplorerSession
     private async Task RestoreAudioMetadataAsync(string featureKey, CancellationToken token)
     {
         using var timing = AssetLoadDiagnostics.Measure("AudioMetadataRestore", Snapshot.PhysicalSourceStamp);
+        var dependencies = await Task.Run(() => featureStore.CaptureLinkedFeatureDependencies(BrowseScope, token), token).ConfigureAwait(false);
+        cachedBrowseDependencies = dependencies;
         var result = await LoadCachedSnapshotAsync(featureStore, featureKey, Snapshot, token).ConfigureAwait(false);
         if (result is null)
         {
+            Interlocked.Exchange(ref enrichmentComplete, 0);
             await featureGate.WaitAsync(token).ConfigureAwait(false);
             try
             {
@@ -43,18 +46,25 @@ public sealed partial class AudioExplorerSession
         }
         await LoadDialogueHeadersAsync(featureStore, featureKey, Snapshot, result.Catalog, token).ConfigureAwait(false);
         var marker = await Task.Run(() => featureStore.Load<AudioFeatureMarker>("audio-feature-index", AssetIndexVersion, token), token).ConfigureAwait(false);
-        await ReplaceSnapshotAsync(result, initializeFeatures: true, token,
-            persistFeatures: marker?.MediaCount != result.Catalog.Media.Count).ConfigureAwait(false);
+        var projectionCount = await Task.Run(() => featureStore.Count(new(Family: AssetFamily), token), token).ConfigureAwait(false);
+        cachedBrowseDependencies = await ReplaceSnapshotAsync(result, initializeFeatures: true, token,
+            persistFeatures: marker?.MediaCount != result.Catalog.Media.Count || projectionCount != result.Catalog.Media.Count,
+            expectedBrowse: dependencies).ConfigureAwait(false);
         token.ThrowIfCancellationRequested();
         hasCachedAudioSnapshot = true;
         cachedNamesReady = result.Catalog.EventMediaVersion == DetroitAudioSnapshotReader.EventMediaVersion;
         bool ready = cachedNamesReady && result.Catalog.DialogueHeaderVersion == DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion;
         Interlocked.Exchange(ref enrichmentComplete, ready ? 1 : 0);
+        Interlocked.Exchange(ref completeCatalogLoaded, 1);
         Volatile.Write(ref currentProgress, new(cachedNamesReady ? "Catalogue ready" : "Updating audio names", result.Catalog.Media.Count, result.Catalog.Media.Count));
         Interlocked.Exchange(ref enrichmentProgressCompleted, result.Catalog.Media.Count);
         Interlocked.Exchange(ref enrichmentProgressTotal, result.Catalog.Media.Count);
         lock (disposeGate)
             if (ready && enrichmentTask?.IsValueCreated != true) enrichmentTask = null;
+        if (ready && cachedBrowseDependencies is not null)
+        {
+            await PublishBrowseAsync(cachedBrowseDependencies, token).ConfigureAwait(false);
+        }
         PublishUpdate("Loaded cached audio metadata", null);
     }
 

@@ -20,7 +20,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
     public const string AssetFamily = "audio.media";
     private const string SnapshotFeature = "audio.snapshot.ready";
     private const string SnapshotVersion = "audio-snapshot-m1.4-v3-midi";
-    private const string AssetIndexVersion = "audio-asset-index-v7-midi";
+    private const string AssetIndexVersion = "audio-asset-index-v8-browse";
     private const string PreviewVersion = "audio-preview-m1-v1";
     private const long MaximumPreviewSourceBytes = 512L * 1024 * 1024;
 
@@ -245,10 +245,23 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
                 result.Catalog.DialogueHeaderVersion = DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion;
             }
             ReportEnrichmentProgress("Preparing audio library", 0, 0, progress);
-            await ReplaceSnapshotAsync(result, initializeFeatures: true, token).ConfigureAwait(false);
-            await SaveSnapshotItemsAsync(featureKey, result, progress, token).ConfigureAwait(false);
-            await SaveDialogueHeadersAsync(featureStore, featureKey, Snapshot, result.Catalog, token).ConfigureAwait(false);
+            LinkedFeatureDependencies? finalFence = null;
+            for (int attempt = 0; attempt < 2 && finalFence is null; attempt++)
+            {
+                if (attempt > 0) ReportEnrichmentProgress("Retrying audio cache", 0, 0, progress);
+                var expected = await Task.Run(() => featureStore.CaptureLinkedFeatureDependencies(BrowseScope, token), token).ConfigureAwait(false);
+                var assetFence = await ReplaceSnapshotAsync(result, initializeFeatures: true, token,
+                    expectedBrowse: expected).ConfigureAwait(false);
+                if (assetFence is null) continue;
+                var mediaFence = await SaveSnapshotItemsAsync(featureKey, result, progress, token, assetFence).ConfigureAwait(false);
+                if (mediaFence is null) continue;
+                finalFence = await SaveDialogueHeadersAsync(featureStore, featureKey, Snapshot,
+                    result.Catalog, token, BrowseScope, mediaFence).ConfigureAwait(false);
+            }
+            if (finalFence is null) throw new InvalidDataException("Audio metadata changed while saving. Retry indexing after the other update finishes.");
             Interlocked.Exchange(ref enrichmentComplete, 1);
+            Interlocked.Exchange(ref completeCatalogLoaded, 1);
+            await PublishBrowseAsync(finalFence, token).ConfigureAwait(false);
             Volatile.Write(ref currentProgress, new("Catalogue ready", result.Catalog.Media.Count, result.Catalog.Media.Count));
             Interlocked.Exchange(ref enrichmentProgressCompleted, result.Catalog.Media.Count);
             Interlocked.Exchange(ref enrichmentProgressTotal, result.Catalog.Media.Count);
@@ -272,8 +285,8 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         }
     }
 
-    private async Task ReplaceSnapshotAsync(AudioSnapshotResult result, bool initializeFeatures, CancellationToken token,
-        bool persistFeatures = true, IReadOnlyList<MediaEntry>? changedMedia = null)
+    private async Task<LinkedFeatureDependencies?> ReplaceSnapshotAsync(AudioSnapshotResult result, bool initializeFeatures, CancellationToken token,
+        bool persistFeatures = true, IReadOnlyList<MediaEntry>? changedMedia = null, LinkedFeatureDependencies? expectedBrowse = null)
     {
         if (result.Catalog.IndexContentId != Snapshot.IndexContentId || result.Catalog.PhysicalSourceStamp != Snapshot.PhysicalSourceStamp)
             throw new InvalidDataException("Audio snapshot does not belong to the opened archive revision.");
@@ -310,13 +323,18 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         IEnumerable<AssetDescriptor> Descriptors() => mediaToIndex.Select(media => Describe(media,
             media.Identity is not null && labels.TryGetValue(media.Identity.Key, out var label) ? label : null));
         await featureGate.WaitAsync(token).ConfigureAwait(false);
+        var publishedFence = expectedBrowse;
         try
         {
             if (persistFeatures && initializeFeatures)
-                await Task.Run(() => featureStore.ReplaceAssets(AssetFamily, Descriptors(), token), token).ConfigureAwait(false);
+            {
+                if (expectedBrowse is null)
+                    await Task.Run(() => featureStore.ReplaceAssets(AssetFamily, Descriptors(), token), token).ConfigureAwait(false);
+                else publishedFence = await Task.Run(() => featureStore.ReplaceLinkedFeatureAssets(expectedBrowse, Descriptors(), token), token).ConfigureAwait(false);
+            }
             else if (persistFeatures && mediaToIndex.Count > 0)
                 await Task.Run(() => featureStore.UpsertAssets(Descriptors(), token), token).ConfigureAwait(false);
-            if (persistFeatures && initializeFeatures)
+            if (persistFeatures && initializeFeatures && (expectedBrowse is null || publishedFence is not null))
                 await Task.Run(() => featureStore.Save("audio-feature-index", AssetIndexVersion, new AudioFeatureMarker(mediaToIndex.Count), token), token).ConfigureAwait(false);
             lock (catalogGate)
             {
@@ -339,6 +357,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
             }
         }
         finally { featureGate.Release(); }
+        return publishedFence;
     }
 
     private void UpdateStagedFilterOptions(AudioCatalog catalog, IReadOnlyCollection<MediaEntry>? changedMedia = null)
@@ -361,7 +380,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
                 ? $"Bank {index + 1}" : bank.Name;
             bankLabelsByKey[bank.Key] = label;
             choices.Add(new(bank.Key, label, stagedGroupCounts.GetValueOrDefault(bank.Key), bank.Id, bank.Name,
-                bank.Diagnostics.FirstOrDefault()?.Message ?? (bank.ContainerIdentity is null ? "Bank payload unavailable." : null)));
+                bank.Diagnostics.FirstOrDefault()?.Message ?? (bank.ContainerIdentity is null ? "Bank payload unavailable." : null)) { CanExportOriginal = bank.ContainerIdentity is not null });
         }
         if (stagedGroupCounts.TryGetValue(StandaloneGroupKey, out var standalone)) choices.Add(new(StandaloneGroupKey, "Standalone", standalone, 0, "Standalone"));
         Banks = choices;
@@ -446,8 +465,8 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         progress?.Report(update);
     }
 
-    private async Task SaveSnapshotItemsAsync(string featureKey, AudioSnapshotResult result, IProgress<AudioExplorerProgress>? progress,
-        CancellationToken token)
+    private async Task<LinkedFeatureDependencies?> SaveSnapshotItemsAsync(string featureKey, AudioSnapshotResult result, IProgress<AudioExplorerProgress>? progress,
+        CancellationToken token, LinkedFeatureDependencies expected)
     {
         var catalog = result.Catalog;
         long completed = 0;
@@ -466,7 +485,8 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
             }
         }
         await Task.Run(() => featureStore.SaveItems("audio.banks", SnapshotVersion, Track(catalog.Banks), token), token).ConfigureAwait(false);
-        await Task.Run(() => featureStore.SaveItems("audio.media", SnapshotVersion, Track(catalog.Media), token), token).ConfigureAwait(false);
+        var fence = await Task.Run(() => featureStore.TrySaveLinkedFeatureItems(expected, Track(catalog.Media), token), token).ConfigureAwait(false);
+        if (fence is null) return null;
         await Task.Run(() => featureStore.SaveItems("audio.events", SnapshotVersion, Track(catalog.Events), token), token).ConfigureAwait(false);
         await Task.Run(() => featureStore.SaveItems("audio.names", SnapshotVersion, Track(catalog.Names), token), token).ConfigureAwait(false);
         await Task.Run(() => featureStore.SaveItems("audio.localization", SnapshotVersion, Track(catalog.Localization), token), token).ConfigureAwait(false);
@@ -474,7 +494,8 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         await Task.Run(() => featureStore.SaveItems("audio.source-declarations", SnapshotVersion, Track(catalog.SourceDeclarations), token), token).ConfigureAwait(false);
         var head = new AudioSnapshotHead(catalog.SourcePath, catalog.Fingerprint, catalog.IndexContentId,
             catalog.PhysicalSourceStamp, catalog.IndexStamp, catalog.SourceVolumes, catalog.IndexedResourceCount, catalog.EventMediaVersion);
-        await Task.Run(() => featureStore.Save(featureKey, SnapshotVersion, head, token), token).ConfigureAwait(false);
+        return await Task.Run(() => featureStore.TrySaveLinkedFeatureCheckpoint(fence,
+            BoundedFeatureWrite.Create(featureKey, SnapshotVersion, head, FeatureStore.MaximumLinkedFeatureHeadBytes), token), token).ConfigureAwait(false);
     }
 
     private void PublishUpdate(string phase, string? detail, long progressCompleted = 0, long progressTotal = 0)
@@ -503,6 +524,8 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(query);
         ValidateQuery(query);
         ThrowIfDisposed();
+        var cachedPage = await ReadBrowsePageAsync(query, cancellationToken).ConfigureAwait(false);
+        if (cachedPage is not null) return cachedPage;
         await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
         var assetQuery = ToAssetQuery(query);
         await featureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -569,12 +592,12 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
+        if (!HasKnownMedia(identity, out _)) await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
         MediaEntry media;
         AssetCapabilities capabilities;
         lock (catalogGate)
         {
-            if (identity.IndexContentId != Snapshot.IndexContentId || !mediaByIdentity.TryGetValue(identity.Key, out media!))
+            if (identity.IndexContentId != Snapshot.IndexContentId || !HasKnownMedia(identity, out media!))
                 throw new AudioToolException("The selected media identity does not belong to this audio catalog revision.");
             capabilities = Describe(media).Capabilities;
         }
@@ -652,12 +675,15 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(identities);
         ThrowIfDisposed();
+        var requested = identities.Where(identity => identity.IndexContentId == Snapshot.IndexContentId).Distinct().ToArray();
+        var known = ResolveKnownSelection(requested.Select(identity => identity.Key));
+        if (!IsCatalogLoaded && known.Count == requested.Length) return known;
         EnsureAudioInitialized();
         lock (catalogGate)
         {
             var result = new List<AudioExplorerRow>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var identity in identities)
+            foreach (var identity in requested)
             {
                 if (identity.IndexContentId != Snapshot.IndexContentId || !seen.Add(identity.Key) ||
                     !mediaByIdentity.TryGetValue(identity.Key, out var media)) continue;
@@ -672,12 +698,15 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(identityKeys);
         ThrowIfDisposed();
+        var requested = identityKeys.Distinct(StringComparer.Ordinal).ToArray();
+        var known = ResolveKnownSelection(requested);
+        if (!IsCatalogLoaded && known.Count == requested.Length) return known;
         EnsureAudioInitialized();
         lock (catalogGate)
         {
             var rows = new List<AudioExplorerRow>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var key in identityKeys)
+            foreach (var key in requested)
             {
                 if (!seen.Add(key) || !mediaByIdentity.TryGetValue(key, out var media) || media.Identity is null) continue;
                 var descriptor = Describe(media);
@@ -751,7 +780,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         {
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
             lifetime.Cancel();
-            started = new[] { enrichmentTask, audioInitialization }.OfType<Lazy<Task>>()
+            started = new[] { enrichmentTask, audioInitialization, browseInitialization }.OfType<Lazy<Task>>()
                 .Where(task => task.IsValueCreated).Select(task => task.Value)
                 .Concat(toolFingerprints.Values.Where(task => task.IsValueCreated).Select(task => (Task)task.Value)).ToArray();
         }
@@ -826,6 +855,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
             media.ResolutionDetails.Length == 0 ? null : media.ResolutionDetails,
             NaturalOrder.Key(label))
         {
+            Metadata = new Dictionary<string, string> { ["audio.source-label"] = labelOverride ?? UserLabel(media) },
             SearchTerms = string.Join('\n', names.Select(name => name.Text).Concat(media.Aliases)
                 .Prepend(label).Append(identity.Key).Append(media.IdText).Append(media.Name).Append(media.BankName))
         };

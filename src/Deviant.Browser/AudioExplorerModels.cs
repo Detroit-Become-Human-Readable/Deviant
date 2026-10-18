@@ -8,7 +8,10 @@ public sealed record AudioExplorerProgress(string Phase, long Completed, long To
 public sealed record AudioExplorerUpdate(long Generation, bool IsComplete, IReadOnlyList<AudioBankChoice> Banks,
     long MediaCount, string Phase, string? Detail = null, long ProgressCompleted = 0, long ProgressTotal = 0);
 
-public sealed record AudioBankChoice(string Key, string Label, long MediaCount, uint Id, string Name, string? Reason = null);
+public sealed record AudioBankChoice(string Key, string Label, long MediaCount, uint Id, string Name, string? Reason = null)
+{
+    public bool CanExportOriginal { get; init; }
+}
 
 public sealed record AudioExplorerQuery(
     string? Search = null,
@@ -46,7 +49,10 @@ public sealed record AudioExplorerRow(AssetDescriptor Descriptor, MediaEntry Med
     public string? UnavailableReason => MediaPolicy.GetUnavailableReason(Media) is { Length: > 0 } reason ? reason : null;
 }
 
-public sealed record AudioExplorerPage(long Total, IReadOnlyList<AudioExplorerRow> Rows);
+public sealed record AudioExplorerPage(long Total, IReadOnlyList<AudioExplorerRow> Rows)
+{
+    public long Generation { get; init; }
+}
 
 public sealed record AudioExportReview(
     ArchiveSnapshot Snapshot,

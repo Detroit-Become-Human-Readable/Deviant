@@ -102,6 +102,7 @@ public sealed class DialogueHeaderAssociationTests
         Assert.True(warm.AreDialogueHeadersReady);
         Assert.True(warm.IsEnrichmentComplete);
         Assert.False(warm.IsEnrichmentStarted);
+        await warm.PrepareDialogueLookupAsync();
         Assert.Single(warm.Catalog.DialogueHeaderAssociations);
     }
 

@@ -216,8 +216,8 @@ public partial class AudioWindow
     {
         ExplorerStatus.Text=currentView switch
         {
-            "audio" when session?.EnrichmentTask.IsCanceled==true=>"Audio indexing cancelled",
-            "audio" when session?.EnrichmentTask.IsFaulted==true=>"Audio indexing failed",
+            "audio" when session is { IsEnrichmentStarted: true } cancelledAudio && cancelledAudio.EnrichmentTask.IsCanceled=>"Audio indexing cancelled",
+            "audio" when session is { IsEnrichmentStarted: true } failedAudio && failedAudio.EnrichmentTask.IsFaulted=>"Audio indexing failed",
             "audio" when session?.IsEnrichmentComplete!=true=>"Indexing audio…",
             "strings" when stringsView.CurrentSession?.EnrichmentTask.IsCanceled==true=>"Text indexing cancelled",
             "strings" when stringsView.CurrentSession?.EnrichmentTask.IsFaulted==true=>"Text indexing failed",
@@ -416,7 +416,7 @@ public partial class AudioWindow
         filterTimer.Stop();queryCancellation?.Cancel();++queryGeneration;
         syncingControls=true;try{SearchBox.Text="";BankBox.SelectedIndex=0;LanguageBox.SelectedIndex=CodecBox.SelectedIndex=ChannelsBox.SelectedIndex=AvailabilityBox.SelectedIndex=CompletenessBox.SelectedIndex=0;MinimumDurationBox.Clear();MaximumDurationBox.Clear();}finally{syncingControls=false;}
         suppressSelectionTracking=true;try{MediaList.ItemsSource=new[]{row};MediaList.SelectedItem=row;}finally{suppressSelectionTracking=false;}
-        selectedIdentities.Clear();selectedIdentities.Add(identity.Key);SelectionText.Text="1 selected";PageText.Text="Saved item";UpdateSelectedDetails();SelectionForLibraryChanged();
+        selectedIdentities.Clear();selectedAudioRows.Clear();selectedIdentities.Add(identity.Key);selectedAudioRows[identity.Key]=row;SelectionText.Text="1 selected";PageText.Text="Saved item";UpdateSelectedDetails();SelectionForLibraryChanged();
     }
     private async Task ApplySavedFilterAsync(SavedFilter filter,long generation,CancellationToken token)
     {

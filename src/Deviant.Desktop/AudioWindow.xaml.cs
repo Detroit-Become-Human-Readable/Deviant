@@ -26,6 +26,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     private readonly DispatcherTimer playbackTimer = new() { Interval = TimeSpan.FromMilliseconds(120) };
     private readonly DispatcherTimer seekTimer = new() { Interval = TimeSpan.FromMilliseconds(150) };
     private readonly HashSet<string> selectedIdentities = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, AudioExplorerRow> selectedAudioRows = new(StringComparer.Ordinal);
     private ResourceIdentity? focusedIdentity;
     private string? focusedSourceStamp;
     private AudioExplorerSession? session;
@@ -257,6 +258,7 @@ public partial class AudioWindow : Window, IAssetNavigator
             if(!sameSource)aliasDrafts.Clear();aliasEditorIdentity=null;
             inputPath = path; SourceLabel.Text = System.IO.Path.GetFileName(path);
             selectedIdentities.Clear();
+            if (!sameSource) selectedAudioRows.Clear();
             selectedIdentities.UnionWith(previousSelection);
             if (sameSource && previousFocus is { } retainedFocus)
             {
@@ -300,7 +302,11 @@ public partial class AudioWindow : Window, IAssetNavigator
 
     private async Task ObserveEnrichmentAsync(AudioExplorerSession opened, long generation, CancellationToken token)
     {
-        try { await opened.EnrichmentTask; }
+        try
+        {
+            await opened.PrepareBrowseAsync(token);
+            if (!opened.IsEnrichmentComplete) await opened.EnrichmentTask;
+        }
         catch (OperationCanceledException) { }
         catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); _ = Dispatcher.BeginInvoke(() => { if (ReferenceEquals(session, opened)) HomeStatus.Text = StatusText.Text = ex.Message; }); }
         if (ReferenceEquals(session, opened)&&!closingInProgress&&(currentView is "audio" or "home"))
@@ -373,17 +379,22 @@ public partial class AudioWindow : Window, IAssetNavigator
                 if (generation != queryGeneration || token.IsCancellationRequested || !ReferenceEquals(current, session)) return;
             }
             var selection = selectedIdentities.ToArray();
+            var refreshedSelection = current.IsCatalogLoaded
+                ? await Task.Run(() => current.ResolveSelectionKeys(selection), token)
+                : Array.Empty<AudioExplorerRow>();
+            if (generation != queryGeneration || token.IsCancellationRequested || !ReferenceEquals(current, session)) return;
+            foreach (var row in refreshedSelection) if (selectedIdentities.Contains(row.Identity.Key)) selectedAudioRows[row.Identity.Key] = row;
             var focusIdentity = IsFocusedInCurrentSource ? focusedIdentity?.Key : null;
             suppressSelectionTracking = true;
             try
             {
                 MediaList.ItemsSource = page.Rows;
+                foreach (var row in page.Rows.Where(row => selectedIdentities.Contains(row.Identity.Key))) selectedAudioRows[row.Identity.Key] = row;
                 foreach (var row in page.Rows.Where(row => selectedIdentities.Contains(row.Identity.Key))) MediaList.SelectedItems.Add(row);
                 if (focusIdentity is not null && page.Rows.FirstOrDefault(row => row.Identity.Key == focusIdentity) is { } focused)
                     MediaList.SelectedItem = focused;
             }
             finally { suppressSelectionTracking = false; }
-            selectedIdentities.Clear(); selectedIdentities.UnionWith(selection);
             PageText.Text = $"{(page.Total == 0 ? 0 : offset + 1):N0}–{Math.Min(offset + page.Rows.Count, page.Total):N0} of {page.Total:N0}";
             audioResultStatus = $"{page.Total:N0} audio resources";
             AudioPrevious.IsEnabled = offset > 0;
@@ -422,7 +433,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     {
         syncingControls = true;
         var selectedBank = (BankBox.SelectedItem as AudioBankChoice)?.Key;
-        BankBox.ItemsSource = new[] { new AudioBankChoice("", "All banks", current.Catalog.Media.Count, 0, "") }.Concat(current.Banks).ToArray();
+        BankBox.ItemsSource = new[] { new AudioBankChoice("", "All banks", current.MediaCount, 0, "") }.Concat(current.Banks).ToArray();
         BankBox.SelectedItem = BankBox.Items.Cast<AudioBankChoice>().FirstOrDefault(item => item.Key == selectedBank) ?? BankBox.Items[0];
         var lang = LanguageBox.SelectedItem as string; LanguageBox.ItemsSource = new[] { "Any" }.Concat(current.Languages).ToArray(); LanguageBox.SelectedItem = lang is not null && LanguageBox.Items.Contains(lang) ? lang : "Any";
         var codec = CodecBox.SelectedItem as string; CodecBox.ItemsSource = new[] { "Any" }.Concat(current.Codecs).ToArray(); CodecBox.SelectedItem = codec is not null && CodecBox.Items.Contains(codec) ? codec : "Any";
@@ -455,11 +466,13 @@ public partial class AudioWindow : Window, IAssetNavigator
         foreach (AudioExplorerRow row in e.RemovedItems)
         {
             selectedIdentities.Remove(row.Identity.Key);
+            selectedAudioRows.Remove(row.Identity.Key);
             if (focusedIdentity == row.Identity) ClearFocusedIdentity();
         }
         foreach (AudioExplorerRow row in e.AddedItems)
         {
             selectedIdentities.Add(row.Identity.Key);
+            selectedAudioRows[row.Identity.Key] = row;
             focusedIdentity = row.Identity;
             focusedSourceStamp = session?.Snapshot.PhysicalSourceStamp;
         }
@@ -484,14 +497,13 @@ public partial class AudioWindow : Window, IAssetNavigator
         {
             if (MediaList.SelectedItem is AudioExplorerRow visible) return visible;
             if (!IsFocusedInCurrentSource || focusedIdentity is not { } identity || session is not { } current) return null;
-            return current.ResolveSelection([identity]).SingleOrDefault(row => row.Identity == identity);
+            return selectedAudioRows.GetValueOrDefault(identity.Key);
         }
     }
     private void UpdateSelectedDetails()
     {
         UpdateAudioDialogueSelection(CurrentRow);
-        var selected = selectedIdentities.Count == 0 ? Array.Empty<AudioExplorerRow>() :
-            session?.ResolveSelectionKeys(selectedIdentities) ?? Array.Empty<AudioExplorerRow>();
+        var selected = selectedIdentities.Select(key => selectedAudioRows.GetValueOrDefault(key)).OfType<AudioExplorerRow>().ToArray();
         var statuses = selected.Select(item => item.CompletenessBadge).Where(text => text.Length > 0).Distinct().ToArray();
         SelectionBadge.Text = string.Join(" · ", statuses);
         SelectionBadge.Visibility = statuses.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
@@ -511,17 +523,35 @@ public partial class AudioWindow : Window, IAssetNavigator
         ExportPartialButton.Visibility = row?.Media.Completeness == MediaCompleteness.Fragment && row.CanExportOriginal
             ? Visibility.Visible : Visibility.Collapsed;
         _=RefreshRelatedAsync();
-        ExportBankButton.IsEnabled = row is not null && session?.Catalog.Banks.Any(bank => bank.Key == row.Media.BankKey && bank.ContainerIdentity is not null) == true;
+        ExportBankButton.IsEnabled = row is not null && session?.Banks.Any(bank => bank.Key == row.Media.BankKey && bank.CanExportOriginal) == true;
     }
 
     private async void SaveAlias_Click(object sender, RoutedEventArgs e)
     {
-        if (session is null || CurrentRow is not { } row) return;
-        try { var draft=AliasBox.Text; await session.SetAliasAsync(row.Identity,draft); aliasDrafts.Saved(row.Identity,draft); await QueryAsync(false); }
+        if (session is not { } current || CurrentRow is not { } row) return;
+        try
+        {
+            var draft = AliasBox.Text;
+            await current.SetAliasAsync(row.Identity, draft);
+            aliasDrafts.Saved(row.Identity, draft);
+            if (!ReferenceEquals(session, current)) return;
+            if (selectedIdentities.Contains(row.Identity.Key)) selectedAudioRows[row.Identity.Key] = current.ResolveSelection([row.Identity]).Single();
+            await QueryAsync(false);
+        }
         catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); StatusText.Text = ex.Message; }
     }
     private async void RemoveAlias_Click(object sender, RoutedEventArgs e)
-    { if (session is not null && CurrentRow is { } row) { await session.SetAliasAsync(row.Identity, null); aliasDrafts.Saved(row.Identity,null); await QueryAsync(false); } }
+    {
+        if (session is not { } current || CurrentRow is not { } row) return;
+        try
+        {
+            await current.SetAliasAsync(row.Identity, null); aliasDrafts.Saved(row.Identity, null);
+            if (!ReferenceEquals(session, current)) return;
+            if (selectedIdentities.Contains(row.Identity.Key)) selectedAudioRows[row.Identity.Key] = current.ResolveSelection([row.Identity]).Single();
+            await QueryAsync(false);
+        }
+        catch (Exception error) { WorkflowDiagnostics.Failure("Audio.Operation", error); StatusText.Text = error.Message; }
+    }
 
     private void AliasBox_TextChanged(object sender,TextChangedEventArgs e)
     { if(!updatingAlias&&aliasEditorIdentity is not null) aliasDrafts.Edit(aliasEditorIdentity,AliasBox.Text); }
@@ -670,7 +700,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     private async Task ExportSelectedCoreAsync()
     {
         var current = session; if (current is null) return;
-        var rows = current.ResolveSelectionKeys(selectedIdentities);
+        var rows = await current.ReadSelectionAsync(selectedIdentities);
         await ExportAsync(current.Review(rows));
     }
     private async void ExportMatches_Click(object sender, RoutedEventArgs e) => await TrackJobAsync(ExportMatchesCoreAsync);
@@ -686,7 +716,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     }
     private async void ExportPartial_Click(object sender, RoutedEventArgs e) => await TrackJobAsync(ExportPartialCoreAsync);
     private async Task ExportPartialCoreAsync()
-    { if (session is not null && CurrentRow is { } row) await ExportAsync(session.Review([row]), allowPartial: true); }
+    { if (session is not null && CurrentRow is { } row) { await session.LoadCatalogAsync(); await ExportAsync(session.Review([row]), allowPartial: true); } }
 
     private async void ExportBank_Click(object sender, RoutedEventArgs e) => await TrackJobAsync(ExportBankCoreAsync);
     private async Task ExportBankCoreAsync()

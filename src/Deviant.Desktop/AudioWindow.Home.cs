@@ -38,7 +38,7 @@ public partial class AudioWindow
             homeResourceTypes = current.Snapshot.Records.Select(record => record.Type).ToHashSet();
         }
         var types = homeResourceTypes;
-        HomeAudioButton.Visibility = current.Catalog.Media.Count > 0 || current.Catalog.Banks.Count > 0 ||
+        HomeAudioButton.Visibility = current.MediaCount > 0 || current.BankCount > 0 ||
             types.Overlaps([65u, 1016u, 1022u, 1023u, 1031u, 1033u, 4091u]) ? Visibility.Visible : Visibility.Collapsed;
         HomeStringsButton.Visibility = types.Contains(1016) ? Visibility.Visible : Visibility.Collapsed;
         HomeCharactersButton.Visibility = types.Contains(29) ? Visibility.Visible : Visibility.Collapsed;

@@ -16,6 +16,7 @@ public partial class AudioWindow
 
     private async Task RefreshRelatedAsync()
     {
+        RelatedLoadButton.Visibility = Visibility.Collapsed;
         var row=CurrentRow;var current=session;
         if(row is null||current is null){relatedCancellation?.Cancel();++relatedGeneration;relatedIdentity=null;RelatedList.ItemsSource=null;RelatedStatus.Text="Select a clip";if(!ReferenceEquals(relationshipSession,current)){audioRelationships?.ClearBankGraphCache();audioRelationships=null;relationshipSession=null;}return;}
         if(!current.IsEnrichmentComplete)
@@ -27,6 +28,13 @@ public partial class AudioWindow
                 "Enrichment failed" => "Relationships unavailable.",
                 _ => "Indexing relationships…"
             };
+            return;
+        }
+        if (!current.IsCatalogLoaded)
+        {
+            relatedCancellation?.Cancel(); ++relatedGeneration; relatedIdentity = null;
+            RelatedList.ItemsSource = null; RelatedStatus.Text = "";
+            RelatedLoadButton.Visibility = Visibility.Visible;
             return;
         }
         if(relatedIdentity==row.Identity)return;
@@ -45,6 +53,27 @@ public partial class AudioWindow
         catch(OperationCanceledException){}
         catch(Exception error){if(generation==relatedGeneration)RelatedStatus.Text=error.Message;}
     }
+    private async void RelatedLoad_Click(object sender, RoutedEventArgs e) => await TrackJobAsync(async () =>
+    {
+        if (session is not { } current || CurrentRow is not { } row) return;
+        var navigation = navigationGeneration;
+        using var own = CancellationTokenSource.CreateLinkedTokenSource(navigationCancellation.Token);
+        jobCancellation = own;
+        SetBusy(true, "Loading relationships…");
+        try
+        {
+            await current.LoadCatalogAsync(own.Token);
+            if (ReferenceEquals(session, current) && CurrentRow?.Identity == row.Identity) await RefreshRelatedAsync();
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception error) { WorkflowDiagnostics.Failure("Audio.Relationships", error); RelatedStatus.Text = error.Message; }
+        finally
+        {
+            if (ReferenceEquals(jobCancellation, own)) jobCancellation = null;
+            SetBusy(false, navigation == navigationGeneration && ReferenceEquals(session, current) && currentView == "audio"
+                ? audioResultStatus : StatusText.Text);
+        }
+    });
     private static string RelatedLabel(AudioExplorerSession current,AssetRelationship link)
     {
         if (AudioRelationshipPresentation.EventLabel(link, current.Catalog.Events) is {} eventLabel) return eventLabel;

@@ -19,7 +19,30 @@ public sealed partial class AudioExplorerSession
         FileStamp IndexStamp, IReadOnlyList<VolumeSource> Volumes, int SchemaVersion, bool Complete,
         int Count, string RowsSha256, IReadOnlyList<DialogueHeaderAssociation> Rows);
 
-    public bool AreDialogueHeadersReady => Catalog.DialogueHeaderVersion == DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion;
+    public bool AreDialogueHeadersReady => Catalog.DialogueHeaderVersion == DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion ||
+        browseSummary?.DialogueHeaderVersion == DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion;
+
+    public bool? HasDialogueLink(ResourceIdentity owner) =>
+        Catalog.DialogueHeaderVersion == DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion
+            ? Catalog.DialogueHeaderAssociations.Any(link => link.AudioResolution.Candidates.Contains(owner))
+            : AreDialogueHeadersReady ? null : false;
+
+    public async Task PrepareDialogueLookupAsync(CancellationToken token = default)
+    {
+        ThrowIfDisposed();
+        await featureGate.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            if (Catalog.DialogueHeaderVersion != DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion)
+                await LoadDialogueHeadersAsync(featureStore, BuildSnapshotFeatureKey(Snapshot), Snapshot, Catalog, token).ConfigureAwait(false);
+            if (Catalog.DialogueHeaderVersion != DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion)
+            {
+                browseSummary = null;
+                throw new ArchiveException("DialogueCacheUnavailable", "Dialogue links need to be indexed again.");
+            }
+        }
+        finally { featureGate.Release(); }
+    }
 
     private static string DialogueHeaderKey(string featureKey) => featureKey + "/dialogue-headers";
 
@@ -51,10 +74,11 @@ public sealed partial class AudioExplorerSession
         }, token).ConfigureAwait(false);
     }
 
-    private static async Task SaveDialogueHeadersAsync(FeatureStore store, string featureKey,
-        ArchiveSnapshot snapshot, AudioCatalog catalog, CancellationToken token)
+    private static async Task<LinkedFeatureDependencies?> SaveDialogueHeadersAsync(FeatureStore store, string featureKey,
+        ArchiveSnapshot snapshot, AudioCatalog catalog, CancellationToken token, LinkedFeatureScope? browseScope = null,
+        LinkedFeatureDependencies? expected = null)
     {
-        await Task.Run(() =>
+        return await Task.Run(() =>
         {
             ValidateDialogueSnapshot(snapshot, token);
             ValidateDialogueRows(snapshot, catalog.DialogueHeaderAssociations, token);
@@ -63,9 +87,13 @@ public sealed partial class AudioExplorerSession
                 snapshot.IndexStamp, snapshot.Volumes, DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion,
                 true, rows.Length, DialogueRowsHash(rows), rows);
             token.ThrowIfCancellationRequested();
-            store.SaveBounded(DialogueHeaderKey(featureKey), DialogueHeaderCacheVersion, envelope,
-                MaximumDialogueHeaderCacheBytes, token);
+            LinkedFeatureDependencies? fence = null;
+            if (browseScope is null)
+                store.SaveBounded(DialogueHeaderKey(featureKey), DialogueHeaderCacheVersion, envelope, MaximumDialogueHeaderCacheBytes, token);
+            else if (expected is not null) fence = store.TrySaveLinkedFeatureCheckpoint(expected,
+                BoundedFeatureWrite.Create(DialogueHeaderKey(featureKey), DialogueHeaderCacheVersion, envelope, MaximumDialogueHeaderCacheBytes), token);
             ValidateDialogueSnapshot(snapshot, token);
+            return fence;
         }, token).ConfigureAwait(false);
     }
 
@@ -78,7 +106,8 @@ public sealed partial class AudioExplorerSession
             var rows = await new DetroitAudioSnapshotReader().ReadDialogueHeaderAssociationsAsync(Snapshot, token).ConfigureAwait(false);
             var candidate = new AudioCatalog { DialogueHeaderAssociations = rows.ToList(),
                 DialogueHeaderVersion = DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion };
-            await SaveDialogueHeadersAsync(featureStore, featureKey, Snapshot, candidate, token).ConfigureAwait(false);
+            var finalFence = await SaveDialogueHeadersAsync(featureStore, featureKey, Snapshot, candidate, token,
+                BrowseScope, cachedBrowseDependencies).ConfigureAwait(false);
             token.ThrowIfCancellationRequested();
             lock (catalogGate)
             {
@@ -86,6 +115,7 @@ public sealed partial class AudioExplorerSession
                 Catalog.DialogueHeaderVersion = candidate.DialogueHeaderVersion;
             }
             Interlocked.Exchange(ref enrichmentComplete, 1);
+            if (finalFence is not null) await PublishBrowseAsync(finalFence, token).ConfigureAwait(false);
             Interlocked.Exchange(ref enrichmentProgressCompleted, Catalog.Media.Count);
             Interlocked.Exchange(ref enrichmentProgressTotal, Catalog.Media.Count);
             Volatile.Write(ref currentProgress, new("Catalogue ready", Catalog.Media.Count, Catalog.Media.Count));

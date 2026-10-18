@@ -88,7 +88,7 @@ public sealed class AudioExplorerStartupTests
     }
 
     [Fact]
-    public async Task DeferredWarmOpenRestoresOnAudioDemandWithoutStartingColdReader()
+    public async Task DeferredWarmOpenPublishesBrowseMetadataBeforeCompleteCatalogRestoration()
     {
         using var fixture = FormatsFixtureBuilder.CreateAudioCatalog();
         using var workspace = new StartupWorkspace();
@@ -106,6 +106,11 @@ public sealed class AudioExplorerStartupTests
         Assert.Empty(cached.Catalog.DialogueHeaderAssociations);
         Assert.Equal(expected, (await cached.QueryAsync(new())).Total);
         Assert.True(cached.IsEnrichmentComplete);
+        Assert.Equal(expected, cached.MediaCount);
+        Assert.Empty(cached.Catalog.Media);
+        Assert.False(cached.IsCatalogLoaded);
+        Assert.False(cached.IsEnrichmentStarted);
+        await cached.LoadCatalogAsync();
         Assert.Equal(expected, cached.Catalog.Media.Count);
         Assert.True(cached.EnrichmentTask.IsCompletedSuccessfully);
         Assert.False(cached.IsEnrichmentStarted);
@@ -194,6 +199,8 @@ public sealed class AudioExplorerStartupTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => session.QueryAsync(new(), cancel.Token));
         Assert.Equal(0, observations.Count); Assert.Empty(session.Catalog.Media);
         Assert.NotEmpty((await session.QueryAsync(new())).Rows);
+        Assert.Equal(0, observations.Count);
+        await session.LoadCatalogAsync();
         Assert.Equal(1, observations.Count);
     }
 

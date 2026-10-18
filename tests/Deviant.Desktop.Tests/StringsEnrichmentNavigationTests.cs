@@ -12,6 +12,37 @@ namespace Deviant.Desktop.Tests;
 public sealed class StringsEnrichmentNavigationTests
 {
     [Fact]
+    public void PreparingSelectedDialogueHeadersHonorsWorkspaceCancel() => WorkspaceCommitTests.Run((window, fixture) =>
+    {
+        DiscoveryFixture.WriteLinkedStrings(fixture.Index);
+        Pump(window.OpenArchiveAsync(fixture.Index));
+        Pump(window.OpenHomeViewAsync("audio"));
+        Wait(() => window.CurrentRows.Count == 1);
+        ((ListView)window.FindName("MediaList")).SelectedItem = Assert.Single(window.CurrentRows);
+        var gate = (SemaphoreSlim)typeof(AudioExplorerSession).GetField("featureGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window.CurrentSession)!;
+        Assert.True(gate.Wait(0));
+        using var cancel = new CancellationTokenSource();
+        Task? lookup = null;
+        try
+        {
+            lookup = window.FindSelectedAudioTextAsync(cancel.Token);
+            Pump(Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle).Task);
+            var cancelButton = (Button)window.FindName("WorkspaceCancelButton");
+            Assert.Equal(System.Windows.Visibility.Visible, cancelButton.Visibility);
+            cancelButton.RaiseEvent(new(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
+            Pump(Task.WhenAny(lookup, Task.Delay(TimeSpan.FromSeconds(2))));
+            Assert.True(lookup.IsCompleted, "Workspace cancellation did not stop dialogue header preparation.");
+            Assert.ThrowsAny<OperationCanceledException>(() => Pump(lookup));
+            Assert.Null(window.AudioDialogueBrowser.CurrentResult);
+        }
+        finally
+        {
+            cancel.Cancel(); gate.Release();
+            if (lookup is not null) { try { Pump(lookup); } catch (OperationCanceledException) { } }
+        }
+    });
+
+    [Fact]
     public void SharedCancelStopsIndexingAndReopeningRetriesTheSameSession() => WorkspaceCommitTests.Run((window, fixture) =>
     {
         Pump(window.OpenArchiveAsync(fixture.Index));

@@ -63,6 +63,7 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
         if(!hasLookupKey){using var migrate=connection.CreateCommand();migrate.CommandText="ALTER TABLE assets_v2 ADD COLUMN lookup_key TEXT";migrate.ExecuteNonQuery();}
         using var temporary=connection.CreateCommand();temporary.CommandText="CREATE TEMP TABLE asset_replacement_keys(identity TEXT PRIMARY KEY); CREATE INDEX IF NOT EXISTS assets_v2_lookup ON assets_v2(revision,family,lookup_key,bank,sort_key,identity)";temporary.ExecuteNonQuery();
         InitializeLocalizationStreamedGroups();
+        InitializeLinkedFeatures();
     }
     public T? Load<T>(string key, string version, CancellationToken token = default)
     {
@@ -88,10 +89,17 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
     public void Checkpoint() { lock (gate) { using var command = connection.CreateCommand(); command.CommandText = "PRAGMA wal_checkpoint(TRUNCATE)"; command.ExecuteNonQuery(); } }
     public void SaveItems<T>(string collection, string version, IEnumerable<T> items, CancellationToken token = default)
     {
+        SaveItemsCore(collection, version, items, _ => true, token);
+    }
+
+    private TResult SaveItemsCore<T, TResult>(string collection, string version, IEnumerable<T> items,
+        Func<SqliteTransaction, TResult> completion, CancellationToken token, Func<SqliteTransaction, bool>? prepare = null)
+    {
         var prefix = collection + "/item/";
-        lock (gate) CatalogService.ExecuteInterruptible(connection, token, () =>
+        lock (gate) return CatalogService.ExecuteInterruptible(connection, token, () =>
         {
             using var transaction = connection.BeginTransaction();
+            if (prepare is not null && !prepare(transaction)) return default!;
             using (var remove = connection.CreateCommand())
             {
                 remove.Transaction = transaction; remove.CommandText = "DELETE FROM asset_features WHERE revision=$revision AND feature>=$prefix AND feature<$end";
@@ -108,7 +116,8 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
                 token.ThrowIfCancellationRequested(); key.Value = prefix + ordinal++.ToString("D12", System.Globalization.CultureInfo.InvariantCulture);
                 payload.Value = JsonSerializer.Serialize(item); write.ExecuteNonQuery();
             }
-            transaction.Commit(); return true;
+            var result = completion(transaction);
+            token.ThrowIfCancellationRequested(); transaction.Commit(); return result;
         });
     }
     public List<T> LoadItems<T>(string collection, string version, CancellationToken token = default)
@@ -142,11 +151,17 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
     public void ReplaceAssets(string family, IEnumerable<Deviant.Assets.AssetDescriptor> assets, CancellationToken token = default)
         => StoreAssets(assets, family, token);
     private void StoreAssets(IEnumerable<Deviant.Assets.AssetDescriptor> assets, string? replaceFamily, CancellationToken token)
+        => StoreAssetsCore(assets, replaceFamily, _ => true, token);
+
+    private TResult StoreAssetsCore<TResult>(IEnumerable<Deviant.Assets.AssetDescriptor> assets, string? replaceFamily,
+        Func<SqliteTransaction, TResult> completion, CancellationToken token, Func<SqliteTransaction, bool>? prepare = null)
     {
-        lock (gate) CatalogService.ExecuteInterruptible(connection, token, () =>
+        lock (gate) return CatalogService.ExecuteInterruptible(connection, token, () =>
         {
+            ObjectDisposedException.ThrowIf(disposed, this);
             InitializeCharacterProjectionForAssetWrites();
             using var transaction = connection.BeginTransaction();
+            if (prepare is not null && !prepare(transaction)) return default!;
             using (var clear = connection.CreateCommand())
             {
                 clear.Transaction = transaction;
@@ -206,7 +221,8 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
                 else if (replaceFamily is not null || hasNonModelAssets)
                     RemoveReplacedCharacterProjections(transaction);
             }
-            transaction.Commit(); counts.Clear(); return true;
+            var result = completion(transaction);
+            token.ThrowIfCancellationRequested(); transaction.Commit(); counts.Clear(); return result;
         });
     }
 
@@ -293,15 +309,16 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
             foreach (var asset in page.Groups) retainPayload(JsonSerializer.Serialize(asset).Length);
         return page.Groups;
     }
-    private SqliteCommand AssetPageCommand(Deviant.Assets.AssetQuery query, string projection)
+    private SqliteCommand AssetPageCommand(Deviant.Assets.AssetQuery query, string projection,
+        SqliteConnection? readConnection = null, SqliteTransaction? transaction = null, bool prepareIndexes = true)
     {
-        if (query.Sort == Deviant.Assets.AssetSort.Name)
+        if (prepareIndexes && query.Sort == Deviant.Assets.AssetSort.Name)
         {
-            using var index = connection.CreateCommand();
+            using var index = (readConnection ?? connection).CreateCommand(); index.Transaction = transaction;
             index.CommandText = "CREATE INDEX IF NOT EXISTS assets_v2_name_v1 ON assets_v2(revision,family,deviant_natural(label),sort_key,deviant_ordinal(identity),deviant_member(identity),identity)";
             index.ExecuteNonQuery();
         }
-        var command = AssetCommand(query, "row_id");
+        var command = AssetCommand(query, "row_id", readConnection, transaction, allowNameIndex: prepareIndexes);
         var order = SortOrder(query);
         command.CommandText = "WITH selected AS MATERIALIZED (" + command.CommandText + " ORDER BY " + order +
             " LIMIT $limit OFFSET $offset) SELECT a." + projection + " FROM selected s JOIN assets_v2 a ON a.row_id=s.row_id ORDER BY " + order;
@@ -337,15 +354,17 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
         var first=key.IndexOf(':');var second=first<0?-1:key.IndexOf(':',first+1);
         return second<0?"":Deviant.Assets.NaturalOrder.Key(key[(second+1)..]);
     }
-    private SqliteCommand AssetCommand(Deviant.Assets.AssetQuery query, string select)
+    private SqliteCommand AssetCommand(Deviant.Assets.AssetQuery query, string select,
+        SqliteConnection? readConnection = null, SqliteTransaction? transaction = null, bool allowNameIndex = true)
     {
         var useTrigram=query.GroupKey is null&&!string.IsNullOrWhiteSpace(query.Search)&&query.Search.EnumerateRunes().Count()>=3;
         var indexHint=useTrigram?" NOT INDEXED":query.GroupKey is not null&&query.ExactKey is null?" INDEXED BY assets_v2_bank":"";
         if(!useTrigram&&query.GroupKey is null&&query.Sort==Deviant.Assets.AssetSort.Name&&query.Language is not null&&query.Family is not null)
             indexHint=" INDEXED BY assets_v2_language";
         if(select=="row_id"&&query.Sort is Deviant.Assets.AssetSort.Name or Deviant.Assets.AssetSort.Default&&query.Family is not null&&query.GroupKey is null&&string.IsNullOrWhiteSpace(query.Search)&&query.ExactKey is null&&query.Language is null&&query.Codec is null&&query.Channels is null&&query.Availability is null&&query.Completeness is null&&query.MinimumDuration is null&&query.MaximumDuration is null)
-            indexHint=query.Sort==Deviant.Assets.AssetSort.Name?" INDEXED BY assets_v2_name_v1":" INDEXED BY assets_v2_family_sort";
-        var command = connection.CreateCommand(); command.CommandText = $"SELECT {select} FROM assets_v2{indexHint} WHERE revision=$revision";
+            indexHint=query.Sort==Deviant.Assets.AssetSort.Name?(allowNameIndex?" INDEXED BY assets_v2_name_v1":""):" INDEXED BY assets_v2_family_sort";
+        var command = (readConnection ?? connection).CreateCommand(); command.Transaction = transaction;
+        command.CommandText = $"SELECT {select} FROM assets_v2{indexHint} WHERE revision=$revision";
         command.Parameters.AddWithValue("$revision", revision);
         void Filter(string column, string op, object? value)
         { if (value is null) return; command.CommandText += $" AND {column}{op}${column}"; command.Parameters.AddWithValue("$" + column, value); }
@@ -434,6 +453,7 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
         lock (disposalGate)
         {
             if (disposed) return;
+            DisposeLinkedFeatureReaders();
             DisposeTextureProjectionReaders();
             DisposeCharacterReadConnection();
             lock (gate)

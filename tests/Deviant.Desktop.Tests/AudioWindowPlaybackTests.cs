@@ -77,15 +77,15 @@ public sealed class AudioWindowPlaybackTests
         RunSta(() =>
         {
             AudioWindow? window = null;
-            SemaphoreSlim? gate = null;
+            object? gate = null;
             var held = false;
             try
             {
                 window = OpenAudioWindow(fixture, new FakeBackendFactory(), new(null, null, null, null, null, null, null), expectedVisibleRows: 100);
                 var selected = window.CurrentRows[0];
                 Named<ListView>(window, "MediaList").SelectedItem = selected;
-                gate = (SemaphoreSlim)typeof(AudioExplorerSession).GetField("featureGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window.CurrentSession)!;
-                Pump(gate.WaitAsync()); held = true;
+                gate = AudioQueryReadGate(window);
+                Monitor.Enter(gate); held = true;
                 var query = typeof(AudioWindow).GetField("currentQuery", BindingFlags.Instance | BindingFlags.NonPublic)!;
                 query.SetValue(window, ((AudioExplorerQuery)query.GetValue(window)!) with { Offset = 100 });
                 var paging = (Task)Invoke(window, "QueryAsync", false)!;
@@ -95,7 +95,7 @@ public sealed class AudioWindowPlaybackTests
                 Pump(Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle).Task);
                 Assert.False(cancellation.IsCancellationRequested, "An indexing refresh cancelled the requested page.");
                 Assert.False(paging.IsCompleted);
-                gate.Release(); held = false;
+                Monitor.Exit(gate); held = false;
                 Pump(paging);
                 Assert.Equal(100, window.CurrentRows[0].Identity.Ordinal);
                 Pump(refresh);
@@ -105,7 +105,7 @@ public sealed class AudioWindowPlaybackTests
             }
             finally
             {
-                if (held) gate!.Release();
+                if (held) Monitor.Exit(gate!);
                 if (window is not null) Pump(WindowTestLifetime.CloseAsync(window));
             }
         });
@@ -118,13 +118,13 @@ public sealed class AudioWindowPlaybackTests
         RunSta(() =>
         {
             AudioWindow? window = null;
-            SemaphoreSlim? gate = null;
+            object? gate = null;
             var held = false;
             try
             {
                 window = OpenAudioWindow(fixture, new FakeBackendFactory(), new(null, null, null, null, null, null, null), expectedVisibleRows: 100);
-                gate = (SemaphoreSlim)typeof(AudioExplorerSession).GetField("featureGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window.CurrentSession)!;
-                Pump(gate.WaitAsync()); held = true;
+                gate = AudioQueryReadGate(window);
+                Monitor.Enter(gate); held = true;
                 var query = typeof(AudioWindow).GetField("currentQuery", BindingFlags.Instance | BindingFlags.NonPublic)!;
                 query.SetValue(window, ((AudioExplorerQuery)query.GetValue(window)!) with { Offset = 100 });
                 var paging = (Task)Invoke(window, "QueryAsync", false)!;
@@ -132,7 +132,7 @@ public sealed class AudioWindowPlaybackTests
                 var refresh = (Task)Invoke(window, "ObserveEnrichmentAsync", window.CurrentSession!, generation, CancellationToken.None)!;
                 Pump(Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle).Task);
                 Invoke(window, "Home_Click", window, new RoutedEventArgs());
-                gate.Release(); held = false;
+                Monitor.Exit(gate); held = false;
                 Pump(Task.WhenAll(paging, refresh));
                 Assert.Equal(0, window.CurrentRows[0].Identity.Ordinal);
                 Assert.Equal(Visibility.Visible, Named<Grid>(window, "HomeHost").Visibility);
@@ -141,9 +141,121 @@ public sealed class AudioWindowPlaybackTests
             }
             finally
             {
-                if (held) gate!.Release();
+                if (held) Monitor.Exit(gate!);
                 if (window is not null) Pump(WindowTestLifetime.CloseAsync(window));
             }
+        });
+    }
+
+    [Fact]
+    public void WarmOpeningSelectionPagingAndReturnKeepTheCompleteCatalogDeferred()
+    {
+        using var fixture = new GeneratedArchive(120);
+        RunSta(() =>
+        {
+            AudioWindow? window = null;
+            try
+            {
+                window = OpenAudioWindow(fixture, new FakeBackendFactory(), new(null, null, null, null, null, null, null), 100);
+                Pump(WindowTestLifetime.CloseAsync(window));
+                window = OpenAudioWindow(fixture, new FakeBackendFactory(), new(null, null, null, null, null, null, null), 100, completeCatalog: false);
+                Assert.False(window.CurrentSession!.IsCatalogLoaded);
+                var first = window.CurrentRows[0];
+                Named<ListView>(window, "MediaList").SelectedItem = first;
+                var query = typeof(AudioWindow).GetField("currentQuery", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                query.SetValue(window, ((AudioExplorerQuery)query.GetValue(window)!) with { Offset = 100 });
+                Pump((Task)Invoke(window, "QueryAsync", false)!);
+                Assert.Equal(100, window.CurrentRows[0].Identity.Ordinal);
+                Assert.Equal(first.Label, Named<TextBlock>(window, "DetailName").Text);
+                Assert.True(Named<Button>(window, "PlayButton").IsEnabled);
+                Assert.Equal(Visibility.Visible, Named<Button>(window, "RelatedLoadButton").Visibility);
+                Invoke(window, "Home_Click", window, new RoutedEventArgs());
+                Invoke(window, "ShowBrowse", "audio");
+                Pump(Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle).Task);
+                Assert.False(window.CurrentSession.IsCatalogLoaded);
+                var complete = (Lazy<Task>)typeof(AudioExplorerSession).GetField("audioInitialization", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window.CurrentSession)!;
+                Assert.False(complete.IsValueCreated);
+            }
+            finally { if (window is not null) Pump(WindowTestLifetime.CloseAsync(window)); }
+        });
+    }
+
+    [Fact]
+    public void SelectionChangedDuringMetadataRefreshRemainsSelected()
+    {
+        using var fixture = new GeneratedArchive(3);
+        RunSta(() =>
+        {
+            AudioWindow? window = null;
+            try
+            {
+                window = OpenAudioWindow(fixture, new FakeBackendFactory(), new(null, null, null, null, null, null, null));
+                var list = Named<ListView>(window, "MediaList");
+                var newer = window.CurrentRows[1];
+                list.SelectedItem = window.CurrentRows[0];
+                var catalogGate = typeof(AudioExplorerSession).GetField("catalogGate", BindingFlags.Instance | BindingFlags.NonPublic)!
+                    .GetValue(window.CurrentSession)!;
+                var previous = SynchronizationContext.Current!;
+                var context = new SelectionRefreshContext(previous, catalogGate, () => list.SelectedItem = newer);
+                Task query;
+                SynchronizationContext.SetSynchronizationContext(context);
+                try
+                {
+                    lock (AudioQueryReadGate(window)) query = (Task)Invoke(window, "QueryAsync", false)!;
+                }
+                finally { SynchronizationContext.SetSynchronizationContext(previous); }
+                Pump(query);
+                Assert.True(context.Intercepted);
+                var selected = (HashSet<string>)typeof(AudioWindow).GetField("selectedIdentities", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+                Assert.Equal(new[] { newer.Identity.Key }, selected);
+                Assert.Equal(newer.Identity, Assert.IsType<AudioExplorerRow>(list.SelectedItem).Identity);
+                Assert.Equal(newer.Label, Named<TextBlock>(window, "DetailName").Text);
+            }
+            finally
+            {
+                if (window is not null) Pump(WindowTestLifetime.CloseAsync(window));
+            }
+        });
+    }
+
+    private sealed class SelectionRefreshContext(SynchronizationContext inner, object catalogGate, Action changeSelection) : SynchronizationContext
+    {
+        public bool Intercepted { get; private set; }
+        public override void Post(SendOrPostCallback callback, object? state) => inner.Post(_ =>
+        {
+            if (Intercepted) { callback(state); return; }
+            Intercepted = true;
+            lock (catalogGate)
+            {
+                callback(state);
+                changeSelection();
+            }
+        }, null);
+    }
+
+    [Fact]
+    public void OffPageSelectionRefreshesClassificationWhenCatalogDataIsReady()
+    {
+        using var fixture = new GeneratedArchive(120);
+        RunSta(() =>
+        {
+            AudioWindow? window = null;
+            try
+            {
+                window = OpenAudioWindow(fixture, new FakeBackendFactory(), new(null, null, null, null, null, null, null), 100);
+                var ready = window.CurrentRows[0];
+                var pending = PendingRow(ready.Identity, ready.Descriptor.Revision.PhysicalSourceStamp);
+                var list = Named<ListView>(window, "MediaList");
+                list.ItemsSource = new[] { pending }; list.SelectedItem = pending;
+                Assert.False(Named<Button>(window, "PlayButton").IsEnabled);
+                var query = typeof(AudioWindow).GetField("currentQuery", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                query.SetValue(window, ((AudioExplorerQuery)query.GetValue(window)!) with { Offset = 100 });
+                Pump((Task)Invoke(window, "QueryAsync", false)!);
+                Assert.Equal(100, window.CurrentRows[0].Identity.Ordinal);
+                Assert.Equal(ready.Label, Named<TextBlock>(window, "DetailName").Text);
+                Assert.True(Named<Button>(window, "PlayButton").IsEnabled);
+            }
+            finally { if (window is not null) Pump(WindowTestLifetime.CloseAsync(window)); }
         });
     }
 
@@ -181,6 +293,12 @@ public sealed class AudioWindowPlaybackTests
                 var selectedKeys = (HashSet<string>)typeof(AudioWindow).GetField("selectedIdentities",
                     BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
                 Assert.Contains(selected.Identity.Key, selectedKeys);
+
+                Named<TextBox>(window, "AliasBox").Text = "Generated off-page alias";
+                Invoke(window, "SaveAlias_Click", window, new RoutedEventArgs());
+                Pump(WaitUntilAsync(() => Named<TextBlock>(window, "DetailName").Text == "Generated off-page alias"));
+                Invoke(window, "RemoveAlias_Click", window, new RoutedEventArgs());
+                Pump(WaitUntilAsync(() => Named<TextBlock>(window, "DetailName").Text == selected.Label));
 
                 Named<TextBox>(window, "SearchBox").Clear();
                 Pump((Task)Invoke(window, "QueryAsync", true)!);
@@ -397,7 +515,7 @@ public sealed class AudioWindowPlaybackTests
     }
 
     private static AudioWindow OpenAudioWindow(GeneratedArchive fixture, FakeBackendFactory factory, AudioToolPaths tools,
-        int? expectedVisibleRows = null)
+        int? expectedVisibleRows = null, bool completeCatalog = true)
     {
         var window = new AudioWindow(
             new CacheManager(Path.Combine(fixture.Root, "settings"), new(Path.Combine(fixture.Root, "cache"))),
@@ -413,10 +531,16 @@ public sealed class AudioWindowPlaybackTests
         Pump(window.DevicesReady);
         Invoke(window, "ShowBrowse", "audio");
         Pump(window.OpenArchiveAsync(fixture.Index));
-        Pump(window.CurrentSession!.EnrichmentTask);
+        if (completeCatalog) Pump(window.CurrentSession!.EnrichmentTask);
         Pump((Task)Invoke(window, "QueryAsync", true)!);
         Pump(WaitUntilAsync(() => window.CurrentRows.Count == (expectedVisibleRows ?? fixture.Count)));
         return window;
+    }
+
+    private static object AudioQueryReadGate(AudioWindow window)
+    {
+        var store = typeof(AudioExplorerSession).GetField("featureStore", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window.CurrentSession)!;
+        return typeof(FeatureStore).GetField("linkedReadGate", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(store)!;
     }
 
     private static AudioExplorerRow PendingRow(ResourceIdentity identity, string revision)

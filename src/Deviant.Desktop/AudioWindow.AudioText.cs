@@ -56,9 +56,11 @@ public partial class AudioWindow
         }
         var owner = row is null ? null : DialogueAudioOwner(row);
         FindDialogueButton.IsEnabled = owner is not null && session?.IsEnrichmentComplete == true && session.AreDialogueHeadersReady &&
-            session.Catalog.DialogueHeaderAssociations.Any(link => link.AudioResolution.Candidates.Contains(owner));
+            session.HasDialogueLink(owner) != false;
         ReturnToTextButton.Visibility = dialogueReturnContext is null ? Visibility.Collapsed : Visibility.Visible;
         if (row is null) audioDialogueView.SetStatus("Select a clip");
+        else if (owner is not null && session?.HasDialogueLink(owner) is null && audioDialogueView.CurrentResult is null)
+            audioDialogueView.SetStatus("Find dialogue");
         else if (!FindDialogueButton.IsEnabled && audioDialogueView.CurrentResult is null)
             audioDialogueView.SetStatus(owner is not null && session?.AreDialogueHeadersReady != true
                 ? "Reading dialogue links…" : "No dialogue link available.");
@@ -72,16 +74,13 @@ public partial class AudioWindow
         var current = session ?? throw new InvalidOperationException("Open a workspace first.");
         var row = CurrentRow ?? throw new InvalidOperationException("Select a clip first.");
         var owner = DialogueAudioOwner(row) ?? throw new InvalidOperationException("This clip has no dialogue link.");
-        var headers = current.Catalog.DialogueHeaderAssociations.Where(link => link.AudioResolution.Candidates.Contains(owner))
-            .Select(link => link.HeaderIdentity).Distinct().ToArray();
-        if (headers.Length == 0) { audioDialogueView.SetStatus(current.AreDialogueHeadersReady ? "No dialogue linked." : "Reading dialogue links…"); return; }
         pendingDialogueRefresh = null;
         audioDialogueCancellation?.Cancel();
         using var own = CancellationTokenSource.CreateLinkedTokenSource(token, audioDialogueSelection.Token, navigationCancellation.Token);
         audioDialogueCancellation = own; jobCancellation = own;
         audioDialogueActivity = new(true, "Reading dialogue");
         var generation = ++audioDialogueGeneration;
-        var task = FindAudioDialogueCoreAsync(current, row, owner, headers, generation, own.Token, token);
+        var task = PrepareAndFindAudioDialogueAsync(current, row, owner, generation, own.Token, token);
         audioDialogueTasks.Add(task);
         RefreshActivity();
         try { await task; }
@@ -93,6 +92,23 @@ public partial class AudioWindow
             if (generation == audioDialogueGeneration) audioDialogueActivity = audioDialogueActivity with { IsActive = false };
             RefreshActivity();
         }
+    }
+
+    private async Task PrepareAndFindAudioDialogueAsync(AudioExplorerSession current, AudioExplorerRow row,
+        ResourceIdentity owner, long generation, CancellationToken token, CancellationToken requestToken)
+    {
+        audioDialogueView.SetStatus("Reading dialogue…");
+        await current.PrepareDialogueLookupAsync(token);
+        token.ThrowIfCancellationRequested();
+        if (!AudioDialogueCurrent(current, row.Identity, generation)) return;
+        var headers = current.Catalog.DialogueHeaderAssociations.Where(link => link.AudioResolution.Candidates.Contains(owner))
+            .Select(link => link.HeaderIdentity).Distinct().ToArray();
+        if (headers.Length == 0)
+        {
+            audioDialogueView.SetStatus(current.AreDialogueHeadersReady ? "No dialogue linked." : "Reading dialogue links…");
+            return;
+        }
+        await FindAudioDialogueCoreAsync(current, row, owner, headers, generation, token, requestToken);
     }
 
     private bool AudioDialogueCurrent(AudioExplorerSession owner, ResourceIdentity identity, long generation) =>

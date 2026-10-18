@@ -208,7 +208,7 @@
                             <ContentControl x:Name="AudioDialogueHost"/>
                         </StackPanel>
                     </GroupBox>
-                    <GroupBox Header="Related" Padding="8" Margin="0,8,0,0"><StackPanel><TextBlock x:Name="RelatedStatus" Text="Select a clip" FontSize="12"/><ListBox x:Name="RelatedList" MaxHeight="240" MouseDoubleClick="Related_DoubleClick"><ListBox.ItemTemplate><DataTemplate><StackPanel Margin="0,3"><TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis"/><TextBlock Text="{Binding Status}" FontSize="11"/></StackPanel></DataTemplate></ListBox.ItemTemplate></ListBox></StackPanel></GroupBox>
+                    <GroupBox Header="Related" Padding="8" Margin="0,8,0,0"><StackPanel><TextBlock x:Name="RelatedStatus" Text="Select a clip" FontSize="12"/><Button x:Name="RelatedLoadButton" Content="Load relationships" Click="RelatedLoad_Click" Visibility="Collapsed" HorizontalAlignment="Left" Margin="0,4"/><ListBox x:Name="RelatedList" MaxHeight="240" MouseDoubleClick="Related_DoubleClick"><ListBox.ItemTemplate><DataTemplate><StackPanel Margin="0,3"><TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis"/><TextBlock Text="{Binding Status}" FontSize="11"/></StackPanel></DataTemplate></ListBox.ItemTemplate></ListBox></StackPanel></GroupBox>
                     <GroupBox Header="Activity" Padding="8" Margin="0,8,0,0">
                         <TextBlock x:Name="ActivityText" TextWrapping="Wrap" />
                     </GroupBox>
