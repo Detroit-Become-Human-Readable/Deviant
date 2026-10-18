@@ -389,8 +389,11 @@ public sealed partial class FeatureStore
         return command;
     }
 
+    private bool characterReadClosed;
+
     private SqliteConnection CharacterReadConnection()
     {
+        ObjectDisposedException.ThrowIf(characterReadClosed, this);
         if (characterReadConnection is not null) return characterReadConnection;
         var read = new SqliteConnection(new SqliteConnectionStringBuilder
         { DataSource = path, Mode = SqliteOpenMode.ReadOnly, Pooling = false }.ToString());
@@ -674,6 +677,6 @@ public sealed partial class FeatureStore
 
     private void DisposeCharacterReadConnection()
     {
-        lock (characterReadGate) { characterReadConnection?.Dispose(); characterReadConnection = null; }
+        lock (characterReadGate) { characterReadClosed = true; characterReadConnection?.Dispose(); characterReadConnection = null; }
     }
 }

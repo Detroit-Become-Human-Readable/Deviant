@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Reflection;
 using Deviant.Assets;
 using Deviant.Audio;
@@ -36,9 +37,9 @@ public sealed class AudioEventNameCacheTests
             await session.SetAliasAsync(identity, "My clip");
             Assert.Equal("My clip", Assert.Single((await session.QueryAsync(new(Search: "Play_Fixture_Sound"))).Rows).Label);
         }
-        var phases = new List<string>();
+        var phases = new ConcurrentQueue<string>();
         await using var cached = await AudioExplorerSession.OpenStagedAsync(fixture.IndexPath, workspace.Cache,
-            workspace.Aliases, NoTools, new InlineProgress(progress => phases.Add(progress.Phase)), CancellationToken.None, startEnrichment: false);
+            workspace.Aliases, NoTools, new InlineProgress(progress => phases.Enqueue(progress.Phase)), CancellationToken.None, startEnrichment: false);
         var cachedPage = await cached.QueryAsync(new(Search: "Play_Fixture_Sound"));
         Assert.True(cached.IsEnrichmentComplete);
         Assert.False(cached.IsEnrichmentStarted);
@@ -91,9 +92,9 @@ public sealed class AudioEventNameCacheTests
                 legacy.IndexStamp, legacy.SourceVolumes, legacy.IndexedResourceCount, legacy.EventMediaVersion
             });
         }
-        var phases = new List<string>();
+        var phases = new ConcurrentQueue<string>();
         await using (var upgraded = await AudioExplorerSession.OpenStagedAsync(fixture.IndexPath, workspace.Cache,
-            workspace.Aliases, NoTools, new InlineProgress(progress => phases.Add(progress.Phase)), CancellationToken.None, startEnrichment: false))
+            workspace.Aliases, NoTools, new InlineProgress(progress => phases.Enqueue(progress.Phase)), CancellationToken.None, startEnrichment: false))
         {
             Assert.False(upgraded.IsEnrichmentStarted);
             Assert.False(upgraded.IsEnrichmentComplete);

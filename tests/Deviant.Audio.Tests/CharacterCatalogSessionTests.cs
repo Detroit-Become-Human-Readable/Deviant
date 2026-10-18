@@ -105,9 +105,11 @@ public sealed class CharacterCatalogSessionTests
             contextLabel: "Actor_Formal_CHA");
         var budget = new AssetMemoryBudget(128L * 1024 * 1024);
         var cacheRoot = Path.Combine(Path.GetTempPath(), "deviant-compact-inventory-seed-" + Guid.NewGuid().ToString("N"));
+        FeatureStore? observedStore = null;
+        Exception? bodyFailure = null;
         try
         {
-            using var store = FeatureStore.Open(generated.Snapshot, cacheRoot);
+            using var store = observedStore = FeatureStore.Open(generated.Snapshot, cacheRoot);
             var provider = generated.Provider(budget);
             CharacterCatalogModelEntry expected;
             await using (var coldSession = new CharacterCatalogSession(generated.Snapshot, provider, budget, features: store))
@@ -162,7 +164,19 @@ public sealed class CharacterCatalogSessionTests
             Assert.NotEmpty(selected.Entry.Bindings);
             Assert.Equal(expected.Descriptor.Label, selected.Entry.Descriptor.Label);
         }
-        finally { if (Directory.Exists(cacheRoot)) Directory.Delete(cacheRoot, recursive: true); }
+        catch (Exception error) { bodyFailure = error; throw; }
+        finally
+        {
+            try { if (Directory.Exists(cacheRoot)) Directory.Delete(cacheRoot, recursive: true); }
+            catch (IOException cleanup)
+            {
+                var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+                var writer = observedStore is null ? null : typeof(FeatureStore).GetField("connection", flags)!.GetValue(observedStore) as System.Data.Common.DbConnection;
+                var reader = observedStore is null ? null : typeof(FeatureStore).GetField("characterReadConnection", flags)!.GetValue(observedStore) as System.Data.Common.DbConnection;
+                var context = $"Generated cache cleanup failed; writer {writer?.State.ToString() ?? "absent"}, character reader {reader?.State.ToString() ?? "absent"}.";
+                throw bodyFailure is null ? new AggregateException(context, cleanup) : new AggregateException(context, bodyFailure, cleanup);
+            }
+        }
         Assert.Equal(0, budget.UsedBytes);
     }
 
