@@ -155,18 +155,19 @@ internal static unsafe class CacheStorageVfs
         }
 
         internal string NewTempPath() => Path.Combine(Root, ".sqlite-temp-" + Guid.NewGuid().ToString("N"));
+        internal string NewAnonymousIdentity() => Path.Combine(Root, ".sqlite-anon-" + Guid.NewGuid().ToString("N"));
         internal ICacheStorageWriteLease? Reserve(string path, long current, long requested) =>
             Volatile.Read(ref Acquire)(path, current, requested);
     }
 
-    private sealed class OpenFile(Registration registration, string path, bool deleteOnClose)
+    private sealed class OpenFile(Registration registration, string path, bool deleteOnClose, bool anonymousTemporary = false)
     {
         internal readonly Registration Registration = registration;
         internal readonly string Path = path;
         internal readonly bool DeleteOnClose = deleteOnClose;
+        internal readonly bool AnonymousTemporary = anonymousTemporary;
         internal IoMethods* Original;
         internal IoMethods* Methods;
-        internal byte* OwnedFilename;
         internal int Chunk;
     }
 
@@ -240,7 +241,6 @@ internal static unsafe class CacheStorageVfs
             GCHandle.FromIntPtr(file->State).Free();
             file->State = 0;
         }
-        if (state.OwnedFilename != null) NativeFreeFilename(state.OwnedFilename);
         NativeMemory.Free(state.Methods);
     }
 
@@ -256,18 +256,10 @@ internal static unsafe class CacheStorageVfs
             string path;
             if (name == null)
             {
-                path = context.NewTempPath();
-                state = new OpenFile(context, path, true);
-                // Use SQLite's filename allocator: URI helpers may inspect data
-                // surrounding sqlite3_filename even for a non-URI filename.
-                var bytes = Encoding.UTF8.GetBytes(path + '\0');
-                fixed (byte* text = bytes)
-                {
-                    byte empty = 0;
-                    name = NativeCreateFilename(text, &empty, &empty, 0, null);
-                }
-                if (name == null) return IoError;
-                state.OwnedFilename = name;
+                // Preserve the OS VFS's temporary-file placement and attributes.
+                // This path is only a quota identity; it is never opened on disk.
+                path = context.NewAnonymousIdentity();
+                state = new OpenFile(context, path, true, anonymousTemporary: true);
                 flags = (flags | OpenReadWrite | OpenCreate | OpenExclusive | OpenDeleteOnClose) & ~OpenUri;
             }
             else
@@ -286,7 +278,7 @@ internal static unsafe class CacheStorageVfs
             {
                 if ((flags & (OpenReadWrite | OpenCreate | OpenDeleteOnClose)) != 0)
                 {
-                    var length = DiskLength(path);
+                    var length = state.AnonymousTemporary ? 0 : DiskLength(path);
                     lease = context.Reserve(path, length, length);
                     if (lease == null) return Full;
                 }
@@ -297,7 +289,7 @@ internal static unsafe class CacheStorageVfs
                     InitializeMethods(state);
                     file->Methods = state.Methods;
                 }
-                lease?.Complete(state.Original != null ? FileLength(state, real) : DiskLength(path));
+                lease?.Complete(state.Original != null ? FileLength(state, real) : state.AnonymousTemporary ? 0 : DiskLength(path));
                 return result == Ok && file->Methods == null ? IoError : result;
             }
             finally { lease?.Dispose(); }
@@ -320,7 +312,7 @@ internal static unsafe class CacheStorageVfs
         var real = Real(file);
         // Named files are sized under the root admission lock. Only Unix
         // unlinked temporary files need their live handle length as a fallback.
-        var current = !OperatingSystem.IsWindows() && state.DeleteOnClose ? FileLength(state, real) : 0;
+        var current = !OperatingSystem.IsWindows() && state.DeleteOnClose && !state.AnonymousTemporary ? FileLength(state, real) : 0;
         var requested = operation switch
         {
             0 => Round(checked(offset + amount), state.Chunk),
@@ -413,6 +405,10 @@ internal static unsafe class CacheStorageVfs
             closeAttempted = true;
             result = state.Original->Close(Real(file));
             if (lease == null) result = IoError;
+            else if (state.AnonymousTemporary)
+            {
+                if (result == Ok) lease.Complete(0);
+            }
             else CompletePath(lease, state.Path);
         }
         catch { result = IoError; }
@@ -458,6 +454,7 @@ internal static unsafe class CacheStorageVfs
         {
             if (page < 0 || pageSize <= 0 || output == null) return IoError;
             var state = State(file);
+            if (state.AnonymousTemporary) return IoError;
             var path = state.Path + "-shm";
             var current = DiskLength(path);
             // Unix may map multiple 32KiB regions on large-page systems. Its
@@ -650,10 +647,6 @@ internal static unsafe class CacheStorageVfs
     private static extern Vfs* NativeVfsFind(byte* name);
     [DllImport("e_sqlite3", EntryPoint = "sqlite3_vfs_register", CallingConvention = CallingConvention.Cdecl)]
     private static extern int NativeVfsRegister(Vfs* vfs, int makeDefault);
-    [DllImport("e_sqlite3", EntryPoint = "sqlite3_create_filename", CallingConvention = CallingConvention.Cdecl)]
-    private static extern byte* NativeCreateFilename(byte* database, byte* journal, byte* wal, int parameters, byte** values);
-    [DllImport("e_sqlite3", EntryPoint = "sqlite3_free_filename", CallingConvention = CallingConvention.Cdecl)]
-    private static extern void NativeFreeFilename(byte* name);
     [DllImport("e_sqlite3", EntryPoint = "sqlite3_malloc64", CallingConvention = CallingConvention.Cdecl)]
     private static extern void* NativeMalloc64(ulong bytes);
 }

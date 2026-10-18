@@ -320,12 +320,13 @@ public sealed partial class CacheManager
         try
         {
             EnsureAccounting(); RefreshChangedPaths();
+            var transient = kind is CacheUsage.Total or CacheUsage.Metadata ? CacheStorageBudget.ForRoot(Location).TransientBytes : 0;
             lock (leaseGate) return kind switch
             {
                 CacheUsage.Preview => previewBytes,
                 CacheUsage.Prepared => preparedBytes,
-                CacheUsage.Metadata => totalBytes - previewBytes - preparedBytes,
-                _ => totalBytes
+                CacheUsage.Metadata => totalBytes - previewBytes - preparedBytes + transient,
+                _ => totalBytes + transient
             };
         }
         finally { operation.Release(); }

@@ -112,6 +112,26 @@ internal sealed class CacheStorageBudget
         get { Enter(); try { ReapProcesses(); return EffectiveLimit(); } finally { mutex.ReleaseMutex(); } }
     }
 
+    internal long TransientBytes
+    {
+        get
+        {
+            Enter();
+            try
+            {
+                ReapProcesses();
+                long bytes = 0;
+                for (int index = 0; index < SlotCount; index++)
+                {
+                    int at = SlotStart + index * SlotSize;
+                    if (state.ReadInt32(at) != 0) bytes = checked(bytes + state.ReadInt64(at + 24));
+                }
+                return bytes;
+            }
+            finally { mutex.ReleaseMutex(); }
+        }
+    }
+
     internal void Reconcile()
     {
         Enter();
@@ -197,12 +217,13 @@ internal sealed class CacheStorageBudget
         {
             if (state.ReadInt64(24) != 0) { state.Write(8, MeasureRoot()); state.Write(24, 0L); AdvanceEpoch(); }
             // Another connection may have extended a shared sidecar before this lock was acquired.
-            bool unlinked = IsUnlinkedTemporary(path);
+            bool anonymous = Path.GetFileName(path).StartsWith(".sqlite-anon-", StringComparison.Ordinal);
+            bool unlinked = anonymous || IsUnlinkedTemporary(path);
             long epoch = state.ReadInt64(32);
             if (cachedEpoch != epoch) { fileLengths.Clear(); cachedEpoch = epoch; }
             if (!unlinked && fileLengths.TryGetValue(path, out var cached))
                 previousLength = cached;
-            else
+            else if (!anonymous)
             {
                 try { previousLength = new FileInfo(path).Length; unlinked = false; }
                 catch (FileNotFoundException) { if (!unlinked) previousLength = 0; }
