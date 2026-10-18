@@ -51,6 +51,32 @@ public sealed partial class CacheManager
             extension.ToLowerInvariant(), validator, Path.Combine("prepared-v1", category));
     }
 
+    /// <summary>Produces a prepared artifact through a readable, seekable stream admitted by the shared storage budget.</summary>
+    public Task<CacheLease> AcquirePreparedOutputAsync(string category, string key, string extension,
+        Func<Stream, CancellationToken, Task> producer, Func<string, CancellationToken, Task<bool>> validator,
+        CancellationToken token = default)
+    {
+        ValidateCategory(category);
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        if (extension is null || extension.Length is < 2 or > 17 || extension[0] != '.' ||
+            extension.Skip(1).Any(c => !char.IsAsciiLetterOrDigit(c)))
+            throw new ArgumentException("Use a single artifact file extension.", nameof(extension));
+        ArgumentNullException.ThrowIfNull(producer);
+        ArgumentNullException.ThrowIfNull(validator);
+        return AcquireCoreAsync("prepared-v1/" + category + "/" + key, null, token,
+            extension.ToLowerInvariant(), validator, Path.Combine("prepared-v1", category), producer);
+    }
+
+    /// <summary>Produces an admitted bake in the existing material-bake cache namespace.</summary>
+    public Task<CacheLease> AcquireMaterialBakeOutputAsync(string key, Func<Stream, CancellationToken, Task> producer,
+        Func<string, CancellationToken, Task<bool>> validate, CancellationToken token = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        ArgumentNullException.ThrowIfNull(producer);
+        ArgumentNullException.ThrowIfNull(validate);
+        return AcquireCoreAsync("material-bake-v1/" + key, null, token, ".bake", validate, outputProducer: producer);
+    }
+
     public async Task<CacheLease?> TryAcquirePreparedAsync(string category, string key, string extension,
         Func<string, CancellationToken, Task<bool>> validator, CancellationToken token = default)
     {
@@ -71,11 +97,11 @@ public sealed partial class CacheManager
             throw new ArgumentException("Use an artifact category name containing letters, numbers, hyphens or underscores.", nameof(category));
     }
 
-    private async Task<CacheLease> AcquireCoreAsync(string key, Func<string, CancellationToken, Task> producer,
+    private async Task<CacheLease> AcquireCoreAsync(string key, Func<string, CancellationToken, Task>? producer,
         CancellationToken token, string extension, Func<string, CancellationToken, Task<bool>>? validate,
-        string subdirectory = "previews-v1")
+        string subdirectory = "previews-v1", Func<Stream, CancellationToken, Task>? outputProducer = null)
     {
-        ArgumentNullException.ThrowIfNull(producer);
+        if (outputProducer is null) ArgumentNullException.ThrowIfNull(producer);
         ArgumentNullException.ThrowIfNull(key);
         string location = await BeginAcquisitionAsync(token).ConfigureAwait(false);
         string safeKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key))).ToLowerInvariant();
@@ -88,6 +114,7 @@ public sealed partial class CacheManager
         }
         bool entered = false;
         CacheLease? pin = null;
+        Exception? acquisitionFailure = null;
         try
         {
             await flight.Gate.WaitAsync(token).ConfigureAwait(false); entered = true;
@@ -110,12 +137,16 @@ public sealed partial class CacheManager
                         if (!exists && leases.ContainsKey(path))
                             throw new IOException("A cached artifact was removed while in use.");
                     }
-                    if (exists) pin = Lease(path, false);
+                    if (exists) pin = outputProducer is null ? Lease(path, false) : AdmittedLease(path, location);
                 }
             }
             finally { operation.Release(); }
 
-            if (uncached) return await ProduceTemporaryAsync(producer, validate, extension, token).ConfigureAwait(false);
+            if (uncached)
+            {
+                if (outputProducer is not null) throw OutputStorageDisabled();
+                return await ProduceTemporaryAsync(producer!, validate, extension, token).ConfigureAwait(false);
+            }
             if (pin is not null)
             {
                 bool valid = validate is null || await validate(path, token).ConfigureAwait(false);
@@ -139,39 +170,83 @@ public sealed partial class CacheManager
                 finally { operation.Release(); }
             }
 
-            string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            string temp;
+            if (outputProducer is null) temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            else
+            {
+                EnsureOutputStorageEnabled(location);
+                var directory = Path.Combine(location, "artifact-staging-v1");
+                await operation.WaitAsync(token).ConfigureAwait(false);
+                try
+                {
+                    ValidateLocation(directory); Directory.CreateDirectory(directory);
+                    lock (leaseGate) knownDirectories.Add(directory);
+                }
+                finally { operation.Release(); }
+                temp = Path.Combine(directory, safeKey + "." + Guid.NewGuid().ToString("N") + extension);
+            }
+            Exception? failure = null;
+            bool adopted = false;
             try
             {
-                try { await producer(temp, token).ConfigureAwait(false); }
-                catch (IOException error) when ((error.HResult & 0xffff) is 112 or 39)
+                try
+                {
+                    if (outputProducer is null) await producer!(temp, token).ConfigureAwait(false);
+                    else
+                    {
+                        EnsureOutputStorageEnabled(location);
+                        await using var output = new CacheArtifactOutput(location, temp).OpenWrite();
+                        await outputProducer(output, token).ConfigureAwait(false);
+                    }
+                }
+                catch (IOException error) when (outputProducer is null && ((error.HResult & 0xffff) is 112 or 39))
                 {
                     DeleteTemporary(temp);
-                    return await ProduceTemporaryAsync(producer, validate, extension, token).ConfigureAwait(false);
+                    return await ProduceTemporaryAsync(producer!, validate, extension, token).ConfigureAwait(false);
                 }
                 token.ThrowIfCancellationRequested();
                 if (!File.Exists(temp)) throw new IOException("Cache producer did not create a file.");
                 if (validate is not null && !await validate(temp, token).ConfigureAwait(false))
                     throw new InvalidDataException("Cache producer created an invalid artifact.");
                 token.ThrowIfCancellationRequested();
-                bool fallback;
                 await operation.WaitAsync(token).ConfigureAwait(false);
                 try
                 {
-                    using var storage = CacheStorageBudget.ForRoot(location).BeginManagedMutation();
-                    ValidateLocation(Path.GetDirectoryName(path)!);
-                    RefreshChangedPaths();
-                    var size = new FileInfo(temp).Length;
-                    Evict(size, path);
-                    fallback = LimitBytes == 0 || size > LimitBytes || TrackedUsageBytes > LimitBytes - size;
-                    if (!fallback)
+                    using (CacheStorageBudget.ForRoot(location).BeginManagedMutation())
                     {
-                        lock (leaseGate)
-                            if (leases.ContainsKey(path)) throw new IOException("A cached artifact changed while in use.");
-                        File.Move(temp, path, true);
-                        File.SetLastWriteTimeUtc(path, DateTime.UtcNow);
-                        ObserveFile(path);
-                        return Lease(path, false);
+                        ValidateLocation(Path.GetDirectoryName(path)!);
+                        RefreshChangedPaths();
+                        var size = new FileInfo(temp).Length;
+                        if (outputProducer is not null)
+                        {
+                            EnsureOutputStorageEnabled(location);
+                            lock (leaseGate)
+                                if (leases.ContainsKey(path)) throw new IOException("A cached artifact changed while in use.");
+                            // Production already paid for these bytes. Adoption is
+                            // a same-root rename, with no copy or extra reservation.
+                            File.Move(temp, path, true); adopted = true;
+                            File.SetLastWriteTimeUtc(path, DateTime.UtcNow);
+                            lock (leaseGate) RemoveObservedFile(temp);
+                            ObserveFile(path);
+                        }
+                        else
+                        {
+                            Evict(size, path);
+                            bool fallback = LimitBytes == 0 || size > LimitBytes || TrackedUsageBytes > LimitBytes - size;
+                            if (!fallback)
+                            {
+                                lock (leaseGate)
+                                    if (leases.ContainsKey(path)) throw new IOException("A cached artifact changed while in use.");
+                                File.Move(temp, path, true);
+                                File.SetLastWriteTimeUtc(path, DateTime.UtcNow);
+                                ObserveFile(path);
+                                return Lease(path, false);
+                            }
+                        }
                     }
+                    // Register the pin after the fallible census completes,
+                    // while publication still owns the manager operation gate.
+                    if (adopted) return AdmittedLease(path, location);
                 }
                 finally { operation.Release(); }
                 var temporary = TemporaryPath(extension);
@@ -186,18 +261,104 @@ public sealed partial class CacheManager
                 }
                 catch { DeleteTemporary(temporary); throw; }
             }
-            finally { DeleteTemporary(temp); }
-        }
-        finally
-        {
-            if (pin is not null) await pin.DisposeAsync().ConfigureAwait(false);
-            if (entered) flight.Gate.Release();
-            lock (leaseGate)
+            catch (Exception error) { failure = error; throw; }
+            finally
             {
-                if (--flight.Users == 0) { flights.Remove(path); flight.Gate.Dispose(); }
-                EndAcquisition();
+                if (outputProducer is null) DeleteTemporary(temp);
+                else if (!adopted)
+                {
+                    try { DeleteAdmittedOutput(temp, location); }
+                    catch (Exception cleanup) when (failure is not null)
+                    {
+                        // A failed deletion stays charged; preserve the original
+                        // producer/validation/cancellation failure for the caller.
+                        failure.Data["CacheCleanupError"] = cleanup.GetType().Name;
+                    }
+                }
             }
         }
+        catch (Exception error) { acquisitionFailure = error; throw; }
+        finally
+        {
+            try
+            {
+                if (pin is not null) await pin.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception cleanup) when (outputProducer is not null && acquisitionFailure is not null)
+            {
+                acquisitionFailure.Data["CacheCleanupError"] = cleanup.GetType().Name;
+            }
+            finally
+            {
+                if (entered) flight.Gate.Release();
+                lock (leaseGate)
+                {
+                    if (--flight.Users == 0) { flights.Remove(path); flight.Gate.Dispose(); }
+                    EndAcquisition();
+                }
+            }
+        }
+    }
+
+    private static IOException OutputStorageDisabled()
+    {
+        var error = new IOException("Cache storage is disabled.");
+        error.Data["ErrorCode"] = "CacheStorageLimit";
+        error.Data["LimitBytes"] = 0L;
+        return error;
+    }
+
+    private static void EnsureOutputStorageEnabled(string location)
+    {
+        if (CacheStorageBudget.ForRoot(location).Limit == 0) throw OutputStorageDisabled();
+    }
+
+    private static long OutputLength(string path)
+    {
+        try { return new FileInfo(path).Length; }
+        catch (FileNotFoundException) { return 0; }
+        catch (DirectoryNotFoundException) { return 0; }
+    }
+
+    private void DeleteAdmittedOutput(string path, string location)
+    {
+        using var storage = CacheStorageBudget.ForRoot(location).Acquire(path, 0, 0)
+            ?? throw new IOException("The artifact output could not be removed.");
+        try
+        {
+            File.Delete(path);
+            lock (leaseGate) RemoveObservedFile(path);
+        }
+        finally { storage.Complete(OutputLength(path)); }
+    }
+
+    private CacheLease AdmittedLease(string path, string location)
+    {
+        var pin = Lease(path, false);
+        return new(path, () =>
+        {
+            ICacheStorageWriteLease? storage = null;
+            try
+            {
+                storage = CacheStorageBudget.ForRoot(location).Acquire(path, 0, 0)
+                    ?? throw new IOException("The artifact lease could not be released.");
+            }
+            finally
+            {
+                // Always drop the local pin, including when accounting is busy.
+                // Cleanup can only shrink storage and must not strand maintenance.
+                try { pin.Dispose(); }
+                finally
+                {
+                    if (storage is not null)
+                    {
+                        try { storage.Complete(OutputLength(path)); }
+                        finally { storage.Dispose(); }
+                    }
+                }
+            }
+            return ValueTask.CompletedTask;
+        });
     }
 
     private async Task<CacheLease> ProduceTemporaryAsync(Func<string, CancellationToken, Task> producer,

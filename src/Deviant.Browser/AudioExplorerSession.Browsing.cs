@@ -28,7 +28,8 @@ public sealed partial class AudioExplorerSession
         IReadOnlyList<string> Languages, IReadOnlyList<string> Codecs, IReadOnlyList<int> Channels,
         int EventMediaVersion, int DialogueHeaderVersion);
 
-    public long MediaCount => browseSummary?.MediaCount ?? Catalog.Media.Count;
+    public long MediaCount => browseSummary?.MediaCount ?? (IsCatalogLoaded?Catalog.Media.Count:
+        Math.Max(Catalog.Media.Count,Interlocked.Read(ref recoveryMediaCount)));
     public int BankCount => browseSummary?.BankCount ?? Catalog.Banks.Count;
     public bool IsCatalogLoaded => Volatile.Read(ref completeCatalogLoaded) != 0;
     public Task LoadCatalogAsync(CancellationToken token = default) => EnsureAudioInitializedAsync(token);

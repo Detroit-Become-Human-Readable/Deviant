@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
+using System.Reflection;
 using System.Security.Cryptography;
+using Deviant.Archives;
 using Deviant.Assets;
 using Deviant.Browser;
 using Deviant.Catalog;
@@ -11,6 +13,116 @@ namespace Deviant.Texture.Tests;
 
 public sealed class PreparedTexturePixelSourceTests
 {
+    [Theory]
+    [InlineData("full-112")]
+    [InlineData("full-39")]
+    [InlineData("io-5")]
+    [InlineData("cancel")]
+    [InlineData("memory")]
+    public async Task NativeSurfaceOptionalBackingKeepsResidentPixelsOnlyForStoragePressure(string fault)
+    {
+        using var fixture = new Fixture();
+        var archiveType = typeof(NativeTextureSessionTests).GetNestedType("NativeFrameArchive", BindingFlags.NonPublic)!;
+        using var generated = (IDisposable)archiveType.GetConstructors().Single().Invoke([null, false, false, false, true]);
+        string indexPath = (string)archiveType.GetProperty("IndexPath")!.GetValue(generated)!;
+        var snapshot = await new ArchiveReader().OpenAsync(indexPath);
+        await using var catalogs = new TextureCatalogSession(snapshot, new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        await using var textures = new NativeTextureSession(catalogs);
+        var budget = new AssetMemoryBudget();
+        using var container = await NativeContainerLease.OpenAsync(snapshot, new(snapshot.IndexContentId, 1), budget);
+        var read = await textures.ReadForNativeAsync(container.Directory.Objects[0].Identity, new(snapshot.IndexContentId, 0), container);
+        var source = Assert.IsType<NativeTextureSource>(read.Source);
+        byte[] expected;
+        using (var baseline = await DecodeSurfaceAsync(new NativeModelSession(textures, budget), source, container))
+            expected = SurfaceBytes(baseline).ToArray();
+        Assert.NotEmpty(expected);
+        long before = budget.UsedBytes;
+        int code = fault == "full-112" ? 112 : fault == "full-39" ? 39 : 5;
+        Exception injected = fault switch
+        {
+            "cancel" => new OperationCanceledException("Generated cancelled cache write", new CancellationToken(true)),
+            "memory" => new ArchiveException("AssetMemoryLimit", "Generated cache memory pressure"),
+            _ => new IOException("Generated cache write failure", unchecked((int)0x80070000) | code)
+        };
+        string key = (string)typeof(NativeModelSession).GetMethod("CreateSurfacePreparationKey", BindingFlags.NonPublic | BindingFlags.Static)!
+            .Invoke(null, [source, 1])!;
+        var observer = new PixelWriteFailure(key, injected);
+        using var subscription = AssetLoadDiagnostics.Listener.Subscribe(observer, name => name == AssetLoadDiagnostics.MeasurementName);
+        IDisposable? owner = null;
+        try
+        {
+            var failure = await Record.ExceptionAsync(async () =>
+                owner = await DecodeSurfaceAsync(new NativeModelSession(textures, budget, fixture.Cache), source, container));
+            Assert.Equal(1, observer.Count);
+            if (fault is "full-112" or "full-39")
+            {
+                Assert.Null(failure); Assert.NotNull(owner);
+                Assert.Equal(expected, SurfaceBytes(owner).ToArray());
+                Assert.Null(owner.GetType().GetProperty("PixelSource")!.GetValue(owner));
+                Assert.True(budget.UsedBytes > before);
+            }
+            else
+            {
+                Assert.Null(owner);
+                if (fault == "cancel") Assert.IsAssignableFrom<OperationCanceledException>(failure);
+                else Assert.Same(injected, failure);
+            }
+            Assert.Empty(Directory.EnumerateFiles(fixture.Cache.Location, "*", SearchOption.AllDirectories));
+            Assert.Equal(0, fixture.Cache.ActivePreviewLeases);
+            container.EnsureUnchanged();
+        }
+        finally { owner?.Dispose(); }
+        Assert.Equal(before, budget.UsedBytes);
+    }
+
+    private static async Task<IDisposable> DecodeSurfaceAsync(NativeModelSession models, NativeTextureSource source,
+        NativeContainerLease container)
+    {
+        var task = (Task)typeof(NativeModelSession).GetMethod("DecodeSharedSurfaceAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(models, [source, container, 1, CancellationToken.None])!;
+        await task;
+        return (IDisposable)task.GetType().GetProperty("Result")!.GetValue(task)!;
+    }
+
+    private static ReadOnlyMemory<byte> SurfaceBytes(IDisposable surface) =>
+        (ReadOnlyMemory<byte>)surface.GetType().GetProperty("Rgba8")!.GetValue(surface)!;
+
+    private sealed class PixelWriteFailure(string key, Exception failure) : IObserver<KeyValuePair<string, object?>>
+    {
+        private int count;
+        public int Count => Volatile.Read(ref count);
+        public void OnNext(KeyValuePair<string, object?> value)
+        {
+            if (value.Value is AssetLoadMeasurement { Stage: "PreparedTexturePixelsWrite" } measurement && measurement.Key == key &&
+                Interlocked.CompareExchange(ref count, 1, 0) == 0) throw failure;
+        }
+        public void OnCompleted() { }
+        public void OnError(Exception error) { }
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(192 * 1024)]
+    public async Task DisabledOrFullStorageRejectsBackingWithoutAnExternalTemporaryArtifact(long limit)
+    {
+        using var fixture = new Fixture();
+        await fixture.Cache.SetLimitAsync(limit);
+        var (surface, bytes) = Surface(256, 256);
+        var budget = new AssetMemoryBudget();
+        PreparedTexturePixelSource? unexpected = null;
+        try
+        {
+            var failure = await Record.ExceptionAsync(async () =>
+                unexpected = await PreparedTexturePixelSource.StoreAsync(fixture.Cache, "quota", surface, Hash(bytes), budget));
+            var storage = Assert.IsType<IOException>(failure);
+            Assert.Equal("CacheStorageLimit", storage.Data["ErrorCode"]);
+            Assert.Empty(Directory.EnumerateFiles(fixture.Cache.Location, "*", SearchOption.AllDirectories));
+            Assert.Equal(0, fixture.Cache.ActivePreviewLeases);
+            Assert.Equal(0, budget.UsedBytes);
+        }
+        finally { unexpected?.Dispose(); }
+    }
+
     [Fact]
     public async Task RestoresExactPixelsAndMetadataWithOnlySmallRetainedBacking()
     {

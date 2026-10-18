@@ -33,22 +33,37 @@ public sealed class MaterialBakeCache(CacheManager cache)
             key = Fingerprint(material, primitive, textures, width, height, uvSet, corners, graph, token);
         MaterialSurfaceMap? created = null;
         bool hit = true;
-        await using var lease = await cache.AcquireMaterialBakeAsync(key, async (path, cancellation) =>
+        CacheLease? lease = null;
+        try
         {
+            lease = await cache.AcquireMaterialBakeOutputAsync(key, async (output, cancellation) =>
+            {
+                hit = false;
+                created = await Task.Run(() => MaterialSurfaceMapBaker.Bake(material, primitive, textures, width, height,
+                    budget.Reserve, cancellation, uvSet, corners, reservedOutputBytes), cancellation).ConfigureAwait(false);
+                using (AssetLoadDiagnostics.Measure("BakeCacheWrite", key))
+                    await WriteAsync(output, created, key, cancellation).ConfigureAwait(false);
+            }, (path, cancellation) => ValidateAsync(path, key, graph, width, height, uvSet, cancellation), token).ConfigureAwait(false);
+        }
+        catch (IOException error) when (error.Data["ErrorCode"] is "CacheStorageLimit" ||
+            ((error.HResult & 0xffff) is 112 or 39))
+        {
+            token.ThrowIfCancellationRequested();
             hit = false;
-            created = await Task.Run(() => MaterialSurfaceMapBaker.Bake(material, primitive, textures, width, height,
-                budget.Reserve, cancellation, uvSet, corners, reservedOutputBytes), cancellation).ConfigureAwait(false);
-            using (AssetLoadDiagnostics.Measure("BakeCacheWrite", key))
-                await WriteAsync(path, created, key, cancellation).ConfigureAwait(false);
-        }, (path, cancellation) => ValidateAsync(path, key, graph, width, height, uvSet, cancellation), token).ConfigureAwait(false);
+            // A bake remains usable without retaining an optional disk entry.
+            created ??= await Task.Run(() => MaterialSurfaceMapBaker.Bake(material, primitive, textures, width, height,
+                budget.Reserve, token, uvSet, corners, reservedOutputBytes), token).ConfigureAwait(false);
+        }
+        await using var heldLease = lease;
         AssetLoadDiagnostics.Cache("BakeCache", key, hit);
         await validateSources(token).ConfigureAwait(false);
         if (created is not null) return created;
-        using var timing = AssetLoadDiagnostics.Measure("BakeCacheRead", key, relativeSource: Path.GetFileName(lease.Path),
+        var cachedPath = lease?.Path ?? throw new InvalidOperationException("The prepared bake lease is unavailable.");
+        using var timing = AssetLoadDiagnostics.Measure("BakeCacheRead", key, relativeSource: Path.GetFileName(cachedPath),
             requestedBytes: checked(148L + (long)width * height * 4));
         using var decodeScratch = budget.Reserve(checked(148L + (long)width * height * 4 + 4096 -
             Math.Min(reservedOutputBytes, 148L + (long)width * height * 4)), "material bake cache input");
-        using var input = new FileStream(lease.Path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var input = new FileStream(cachedPath, FileMode.Open, FileAccess.Read, FileShare.Read);
         input.Position = HeaderBytes;
         var encoded = new byte[checked(148 + width * height * 4)];
         await input.ReadExactlyAsync(encoded, token).ConfigureAwait(false);
@@ -57,9 +72,8 @@ public sealed class MaterialBakeCache(CacheManager cache)
         return new(document, surface, graph, uvSet) { PolygonCornerCoordinates = corners };
     }
 
-    private static async Task WriteAsync(string path, MaterialSurfaceMap map, string key, CancellationToken token)
+    private static async Task WriteAsync(Stream output, MaterialSurfaceMap map, string key, CancellationToken token)
     {
-        using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, true);
         using var writer = new BinaryWriter(output, Encoding.UTF8, true);
         writer.Write(Magic); writer.Write(Convert.FromHexString(key)); writer.Write(Convert.FromHexString(map.GraphSha256));
         writer.Write(map.Surface.Width); writer.Write(map.Surface.Height); writer.Write(map.TextureCoordinateSet);

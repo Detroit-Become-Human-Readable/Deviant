@@ -333,7 +333,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
                 else publishedFence = await Task.Run(() => featureStore.ReplaceLinkedFeatureAssets(expectedBrowse, Descriptors(), token), token).ConfigureAwait(false);
             }
             else if (persistFeatures && mediaToIndex.Count > 0)
-                await Task.Run(() => featureStore.UpsertAssets(Descriptors(), token), token).ConfigureAwait(false);
+                await PublishRecoveryCheckpointsAsync(mediaToIndex, labels, token).ConfigureAwait(false);
             if (persistFeatures && initializeFeatures && (expectedBrowse is null || publishedFence is not null))
                 await Task.Run(() => featureStore.Save("audio-feature-index", AssetIndexVersion, new AudioFeatureMarker(mediaToIndex.Count), token), token).ConfigureAwait(false);
             lock (catalogGate)
@@ -527,6 +527,8 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         var cachedPage = await ReadBrowsePageAsync(query, cancellationToken).ConfigureAwait(false);
         if (cachedPage is not null) return cachedPage;
         await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
+        if (!IsCatalogLoaded && !hasCachedAudioSnapshot)
+            return await ReadRecoveryPageAsync(query, cancellationToken).ConfigureAwait(false);
         var assetQuery = ToAssetQuery(query);
         await featureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try

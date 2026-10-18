@@ -100,10 +100,22 @@ public sealed partial class NativeModelSession
                     pixels.SourceIsHdr, pixels.IsSrgb, nativeMip, pixels.SourceFormat, pixels.SourceFormatName,
                     pixels.SourcePayloadSha256, pixels.Subresource with { MipIndex = nativeMip },
                     source.Metadata.Identity, source.Revision, pixels.DisplayTransform);
-                var prepared = await PreparedTexturePixelSource.StoreAsync(surfaceDiskCache, preparationKey!, resident,
-                    rgbaSha256, MemoryBudget, resize, token).ConfigureAwait(false);
-                try { token.ThrowIfCancellationRequested(); return FromPrepared(prepared); }
-                catch { prepared.Dispose(); throw; }
+                PreparedTexturePixelSource? prepared = null;
+                try
+                {
+                    prepared = await PreparedTexturePixelSource.StoreAsync(surfaceDiskCache, preparationKey!, resident,
+                        rgbaSha256, MemoryBudget, resize, token).ConfigureAwait(false);
+                }
+                catch (IOException error) when (error.Data["ErrorCode"] is "CacheStorageLimit" ||
+                    ((error.HResult & 0xffff) is 112 or 39))
+                {
+                    token.ThrowIfCancellationRequested();
+                }
+                if (prepared is not null)
+                {
+                    try { token.ThrowIfCancellationRequested(); return FromPrepared(prepared); }
+                    catch { prepared.Dispose(); throw; }
+                }
             }
             try
             {

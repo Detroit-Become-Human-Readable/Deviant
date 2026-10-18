@@ -51,19 +51,27 @@ public sealed partial class ShaderBytecodeCache
                 using var scratch = budget.Reserve(MaximumBundleFileBytes, "shader bundle validation");
                 var records = retained.OrderBy(shader => shader.Key, StringComparer.Ordinal)
                     .Select(shader => new BundleRecord(shader.Key, shader.Bytes)).ToArray();
-                await using var file = await bundleDiskCache.AcquirePreparedAsync("shader-bundles", bundleKey, ".shbundle",
-                    (path, cancellation) => WriteBundleAsync(path, bundleKey, records, cancellation),
-                    async (path, cancellation) =>
-                    {
-                        try
+                try
+                {
+                    await using var file = await bundleDiskCache.AcquirePreparedOutputAsync("shader-bundles", bundleKey, ".shbundle",
+                        (stream, cancellation) => WriteBundleAsync(stream, bundleKey, records, cancellation),
+                        async (path, cancellation) =>
                         {
-                            var existing = await ReadBundleAsync(path, bundleKey, cancellation).ConfigureAwait(false);
-                            return existing.Length == records.Length && existing.OrderBy(record => record.Key, StringComparer.Ordinal)
-                                .Zip(records).All(pair => pair.First.Key == pair.Second.Key && pair.First.Bytes.AsSpan().SequenceEqual(pair.Second.Bytes));
-                        }
-                        catch (Exception error) when (InvalidBundle(error)) { return false; }
-                    }, linked.Token).ConfigureAwait(false);
-                return true;
+                            try
+                            {
+                                var existing = await ReadBundleAsync(path, bundleKey, cancellation).ConfigureAwait(false);
+                                return existing.Length == records.Length && existing.OrderBy(record => record.Key, StringComparer.Ordinal)
+                                    .Zip(records).All(pair => pair.First.Key == pair.Second.Key && pair.First.Bytes.AsSpan().SequenceEqual(pair.Second.Bytes));
+                            }
+                            catch (Exception error) when (InvalidBundle(error)) { return false; }
+                        }, linked.Token).ConfigureAwait(false);
+                    return true;
+                }
+                catch (IOException error) when (OptionalDiskCapacity(error))
+                {
+                    linked.Token.ThrowIfCancellationRequested();
+                    return false;
+                }
             }
             finally { operation.Release(); }
         }
@@ -141,11 +149,10 @@ public sealed partial class ShaderBytecodeCache
         if (key is not { Length: 64 } || !key.All(Uri.IsHexDigit)) throw new ArgumentException("Use a SHA-256 shader bundle identity.", nameof(key));
     }
     private sealed record BundleRecord(string Key, byte[] Bytes);
-    private static async Task WriteBundleAsync(string path, string key, BundleRecord[] records, CancellationToken token)
+    private static async Task WriteBundleAsync(Stream stream, string key, BundleRecord[] records, CancellationToken token)
     {
         var header = new byte[BundleHeaderBytes]; "DSHBNDL1"u8.CopyTo(header);
         Convert.FromHexString(key).CopyTo(header, 8); BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(40), records.Length);
-        await using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.Asynchronous);
         await stream.WriteAsync(header, token).ConfigureAwait(false);
         using var contentHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         foreach (var record in records)

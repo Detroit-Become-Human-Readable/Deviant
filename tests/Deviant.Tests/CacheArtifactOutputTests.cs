@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using Deviant.Catalog;
+using Deviant.Core;
 using Xunit;
 
 namespace Deviant.Tests;
@@ -173,6 +174,174 @@ public sealed class CacheArtifactOutputTests : IDisposable
         Assert.Throws<IOException>(() => output.OpenWrite());
         Assert.Equal(new byte[] { 0x71 }, File.ReadAllBytes(output.Path));
     }
+
+    [Fact]
+    public async Task AdmittedProducerRejectsBeforeOvershootAndRefundsItsPartialOutput()
+    {
+        using var permissive = Manager("first-settings", 2 * 1024 * 1024);
+        using var restrictive = Manager("second-settings", 192 * 1024);
+        int calls = 0;
+        var failure = await Assert.ThrowsAsync<IOException>(() => permissive.AcquirePreparedOutputAsync(
+            "generated", "too-large", ".data", async (output, token) =>
+            {
+                calls++;
+                try { await output.WriteAsync(new byte[2 * ChunkBytes].AsMemory(), token); }
+                catch (IOException)
+                {
+                    Assert.Equal(ChunkBytes, PhysicalBytes());
+                    Assert.True(PhysicalBytes() <= restrictive.LimitBytes);
+                    throw;
+                }
+            }, HasBytes));
+        Assert.Equal("CacheStorageLimit", failure.Data["ErrorCode"]);
+        Assert.Equal(1, calls);
+        Assert.Equal(0, PhysicalBytes());
+        // No Reconcile is permitted to repair an incorrectly retained charge.
+        using var available = CacheStorageBudget.ForRoot(Location).Acquire(Path.Combine(Location, "probe.data"), 0, ChunkBytes);
+        Assert.NotNull(available);
+        available.Complete(0);
+    }
+
+    [Fact]
+    public async Task MetadataSeesInFlightOutputAndProducerFailurePreservesMetadata()
+    {
+        using var cache = Manager("settings", 8 * 1024 * 1024);
+        using var restrictive = Manager("second-settings", 8 * 1024 * 1024);
+        using var store = FeatureStore.Open(Snapshot(), Location);
+        store.Save("retained", "v1", "Retained metadata");
+        await cache.ReconcileAsync();
+        long desiredAdmission = checked(cache.UsageBytes + 3L * ChunkBytes);
+        await restrictive.SetLimitAsync(checked((desiredAdmission * 8 + 6) / 7));
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var expected = new InvalidOperationException("Generated producer failure");
+        var production = cache.AcquirePreparedOutputAsync("generated", "held", ".data", async (output, token) =>
+        {
+            await output.WriteAsync(new byte[2 * ChunkBytes].AsMemory(), token);
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+            throw expected;
+        }, HasBytes);
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.True(PhysicalBytes() <= restrictive.LimitBytes);
+            Assert.ThrowsAny<IOException>(() => store.Save("incoming", "v1", new string('x', 2 * ChunkBytes)));
+            Assert.Null(store.Load<string>("incoming", "v1"));
+            Assert.Equal("Retained metadata", store.Load<string>("retained", "v1"));
+        }
+        finally { release.TrySetResult(); }
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => production);
+        Assert.Same(expected, failure);
+        Assert.DoesNotContain(Directory.EnumerateFiles(Location, "*", SearchOption.AllDirectories),
+            path => Path.GetExtension(path) is ".data" or ".tmp");
+        store.Save("incoming", "v1", new string('x', 2 * ChunkBytes));
+        Assert.Equal(2 * ChunkBytes, store.Load<string>("incoming", "v1")!.Length);
+    }
+
+    [Fact]
+    public async Task AwaitingProducerAllowsOtherKeysAndSharesLegacySingleFlight()
+    {
+        using var cache = Manager("settings", 4 * 1024 * 1024);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int producerCalls = 0;
+        var first = cache.AcquirePreparedOutputAsync("generated", "same", ".data", async (output, token) =>
+        {
+            producerCalls++;
+            await output.WriteAsync(new byte[] { 1, 2, 3 }.AsMemory(), token);
+            entered.TrySetResult();
+            await release.Task.WaitAsync(token);
+        }, HasBytes);
+        CacheLease? other = null;
+        Task<CacheLease>? legacy = null;
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            legacy = cache.AcquirePreparedAsync("generated", "same", ".data",
+                (_, _) => throw new InvalidOperationException("The existing flight should be shared."), HasBytes);
+            other = await cache.AcquirePreparedOutputAsync("generated", "other", ".data",
+                async (output, token) => await output.WriteAsync(new byte[] { 4, 5 }.AsMemory(), token), HasBytes)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(new byte[] { 4, 5 }, await File.ReadAllBytesAsync(other.Path));
+            Assert.False(first.IsCompleted);
+        }
+        finally { release.TrySetResult(); }
+        await using var produced = await first.WaitAsync(TimeSpan.FromSeconds(5));
+        await using var shared = await legacy!.WaitAsync(TimeSpan.FromSeconds(5));
+        if (other is not null) await other.DisposeAsync();
+        Assert.Equal(produced.Path, shared.Path);
+        Assert.Equal(1, producerCalls);
+        Assert.Equal(new byte[] { 1, 2, 3 }, await File.ReadAllBytesAsync(shared.Path));
+    }
+
+    [Fact]
+    public async Task AdmittedCancellationDeletesAndRefundsOutput()
+    {
+        using var cache = Manager("settings", 192 * 1024);
+        using var cancellation = new CancellationTokenSource();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var acquisition = cache.AcquirePreparedOutputAsync("generated", "cancelled", ".data", async (output, token) =>
+        {
+            await output.WriteAsync(new byte[ChunkBytes].AsMemory(), token);
+            entered.TrySetResult();
+            await Task.Delay(Timeout.Infinite, token);
+        }, HasBytes, cancellation.Token);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => acquisition);
+        Assert.Equal(0, PhysicalBytes());
+        using var available = CacheStorageBudget.ForRoot(Location).Acquire(Path.Combine(Location, "probe.data"), 0, ChunkBytes);
+        Assert.NotNull(available); available.Complete(0);
+    }
+
+    [Fact]
+    public async Task AdmittedZeroPolicyFailsBeforeCallingProducer()
+    {
+        using var cache = Manager("settings", 0);
+        int calls = 0;
+        var failure = await Assert.ThrowsAsync<IOException>(() => cache.AcquirePreparedOutputAsync(
+            "generated", "disabled", ".data", (_, _) => { calls++; return Task.CompletedTask; }, HasBytes));
+        Assert.Equal("CacheStorageLimit", failure.Data["ErrorCode"]);
+        Assert.Equal(0, calls);
+        Assert.Equal(0, PhysicalBytes());
+    }
+
+    [Fact]
+    public async Task AdmittedHitSharesTheExistingPreparedNamespace()
+    {
+        using var cache = Manager("settings", 1024 * 1024);
+        string path;
+        await using (var legacy = await cache.AcquirePreparedAsync("generated", "existing", ".data",
+            (destination, token) => File.WriteAllBytesAsync(destination, [1, 2, 3], token), HasBytes)) path = legacy.Path;
+        await using var hit = await cache.AcquirePreparedOutputAsync("generated", "existing", ".data",
+            (_, _) => throw new InvalidOperationException("A valid hit must not produce again."), HasBytes);
+        Assert.Equal(path, hit.Path);
+        Assert.Equal(new byte[] { 1, 2, 3 }, await File.ReadAllBytesAsync(hit.Path));
+    }
+
+    [Fact]
+    public async Task AdmittedLiveLeaseSurvivesZeroPolicyUntilRelease()
+    {
+        using var cache = Manager("settings", 1024 * 1024);
+        var lease = await cache.AcquirePreparedOutputAsync("generated", "leased", ".data",
+            async (output, token) => await output.WriteAsync(new byte[] { 8, 9 }.AsMemory(), token), HasBytes);
+        try
+        {
+            await cache.SetLimitAsync(0);
+            Assert.Equal(new byte[] { 8, 9 }, await File.ReadAllBytesAsync(lease.Path));
+        }
+        finally { await lease.DisposeAsync(); }
+        Assert.False(File.Exists(lease.Path));
+        Assert.Equal(0, PhysicalBytes());
+        Assert.Equal(0, cache.UsageBytes);
+    }
+
+    private static async Task<bool> HasBytes(string path, CancellationToken token) =>
+        (await File.ReadAllBytesAsync(path, token)).Length > 0;
+
+    private ArchiveSnapshot Snapshot() => new(Path.Combine(root, "source", "generated.idx"), "generated-output-index",
+        IndexLayout.SupportedVersion, 0, [0x41], 0, [], [], new FileStamp(true, "index", 1, 1, 1, true), "generated-output-stamp", []);
 
     public void Dispose() { if (Directory.Exists(root)) Directory.Delete(root, true); }
 }

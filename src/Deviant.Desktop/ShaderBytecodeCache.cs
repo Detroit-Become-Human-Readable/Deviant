@@ -109,19 +109,32 @@ public sealed partial class ShaderBytecodeCache(CacheManager? diskCache = null, 
                 }
                 else
                 {
-                    await using var file = await bundleDiskCache.AcquirePreparedAsync("shaders", key, ".shader",
-                        async (path, cancellation) =>
-                        {
-                            var code = await Compile(cancellation).ConfigureAwait(false); produced = true;
-                            await WriteAsync(path, key, code, cancellation).ConfigureAwait(false);
-                        }, async (path, cancellation) =>
-                        {
-                            try { _ = await ReadAsync(path, key, cancellation).ConfigureAwait(false); return true; }
-                            catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException)
-                            { return false; }
-                        }, linked.Token).ConfigureAwait(false);
-                    bytes = await ReadAsync(file.Path, key, linked.Token).ConfigureAwait(false);
-                    AssetLoadDiagnostics.Cache("ShaderBytecodeDiskCache", key, !produced);
+                    byte[]? compiled = null;
+                    // Compiler failures can carry the same native code as an optional cache write.
+                    Exception? compileFailure = null;
+                    try
+                    {
+                        await using var file = await bundleDiskCache.AcquirePreparedOutputAsync("shaders", key, ".shader",
+                            async (stream, cancellation) =>
+                            {
+                                try { compiled = await Compile(cancellation).ConfigureAwait(false); }
+                                catch (Exception error) { compileFailure = error; throw; }
+                                produced = true;
+                                await WriteAsync(stream, key, compiled, cancellation).ConfigureAwait(false);
+                            }, async (path, cancellation) =>
+                            {
+                                try { _ = await ReadAsync(path, key, cancellation).ConfigureAwait(false); return true; }
+                                catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException)
+                                { return false; }
+                            }, linked.Token).ConfigureAwait(false);
+                        bytes = await ReadAsync(file.Path, key, linked.Token).ConfigureAwait(false);
+                        AssetLoadDiagnostics.Cache("ShaderBytecodeDiskCache", key, !produced);
+                    }
+                    catch (IOException error) when (!ReferenceEquals(error, compileFailure) && OptionalDiskCapacity(error))
+                    {
+                        linked.Token.ThrowIfCancellationRequested();
+                        bytes = compiled ?? await Compile(linked.Token).ConfigureAwait(false);
+                    }
                 }
                 linked.Token.ThrowIfCancellationRequested();
                 var memory = budget.Reserve(checked(bytes.Length + 512L), "retained shader bytecode");
@@ -163,15 +176,17 @@ public sealed partial class ShaderBytecodeCache(CacheManager? diskCache = null, 
             BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(24, 4)) != bytes.Length)
             throw new InvalidDataException("The compiled shader bytecode is invalid or exceeds its size limit.");
     }
-    private static async Task WriteAsync(string path, string key, byte[] bytes, CancellationToken token)
+    private static async Task WriteAsync(Stream stream, string key, byte[] bytes, CancellationToken token)
     {
         ValidateBytecode(bytes); var header = new byte[HeaderLength]; "DSHADER1"u8.CopyTo(header);
         Convert.FromHexString(key).CopyTo(header, 8); SHA256.HashData(bytes).CopyTo(header, 40);
         BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(72), bytes.Length);
-        await using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.Asynchronous);
         await stream.WriteAsync(header, token).ConfigureAwait(false); await stream.WriteAsync(bytes, token).ConfigureAwait(false);
         await stream.FlushAsync(token).ConfigureAwait(false);
     }
+    private static bool OptionalDiskCapacity(IOException error) =>
+        error.Data["ErrorCode"] is "CacheStorageLimit" || (error.HResult & 0xffff) is 112 or 39;
+
     private static async Task<byte[]> ReadAsync(string path, string key, CancellationToken token)
     {
         await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous);

@@ -36,12 +36,7 @@ public sealed partial class AudioExplorerSession
         if (result is null)
         {
             Interlocked.Exchange(ref enrichmentComplete, 0);
-            await featureGate.WaitAsync(token).ConfigureAwait(false);
-            try
-            {
-                await Task.Run(() => featureStore.ReplaceAssets(AssetFamily, Array.Empty<AssetDescriptor>(), token), token).ConfigureAwait(false);
-            }
-            finally { featureGate.Release(); }
+            await RestoreRecoveryCountAsync(token).ConfigureAwait(false);
             return;
         }
         await LoadDialogueHeadersAsync(featureStore, featureKey, Snapshot, result.Catalog, token).ConfigureAwait(false);

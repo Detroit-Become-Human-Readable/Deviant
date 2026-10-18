@@ -96,7 +96,7 @@ public sealed class MidiTests
     }
 
     [Fact]
-    public async Task PreMidiSnapshotIsRebuiltAndExistingAliasesAreRetained()
+    public async Task OldSnapshotHeadRebuildKeepsVerifiedMidiCheckpointAndAliases()
     {
         using var fixture = FormatsFixtureBuilder.CreateEmpty(); using var work = FormatsFixtureBuilder.CreateEmpty();
         fixture.AddResource(65, 1, Wrap(MakeMidi(0, 1))); fixture.WriteIndex();
@@ -127,7 +127,10 @@ public sealed class MidiTests
         var phases = new List<string>();
         await using var reopened = await AudioExplorerSession.OpenStagedAsync(fixture.IndexPath, cache, aliases, tools,
             new ImmediateProgress<AudioExplorerProgress>(progress => phases.Add(progress.Phase)), CancellationToken.None, startEnrichment: false);
-        Assert.Empty((await reopened.QueryAsync(new(Codec: "MIDI"))).Rows);
+        var checkpoint = Assert.Single((await reopened.QueryAsync(new(Codec: "MIDI"))).Rows);
+        Assert.Equal(identity, checkpoint.Identity);
+        Assert.Equal("Saved sequence", checkpoint.UserAlias);
+        Assert.Equal(new MidiMetadata(0, 1, 480), checkpoint.Media.Midi);
         Assert.False(reopened.IsEnrichmentComplete);
         await reopened.EnrichmentTask;
         var row = Assert.Single((await reopened.QueryAsync(new(Codec: "MIDI"))).Rows);

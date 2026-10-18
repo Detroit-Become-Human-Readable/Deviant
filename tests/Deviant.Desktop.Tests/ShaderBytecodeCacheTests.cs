@@ -110,14 +110,49 @@ public sealed class ShaderBytecodeCacheTests
         }
     }
 
-    [Fact]
-    public async Task ZeroDiskBudgetUsesTemporaryArtifactAndRetainsOnlyBoundedMemory()
+    [Theory]
+    [InlineData(0)]
+    [InlineData(100)]
+    public async Task UnavailableDiskCapacityKeepsCompiledBytecodeHotWithoutRecompiling(long limit)
     {
-        using var fixture = new Fixture(limit: 0); var budget = new AssetMemoryBudget();
+        using var fixture = new Fixture(limit); var budget = new AssetMemoryBudget(); int compilations = 0;
+        Task<byte[]> Compile(CancellationToken token)
+        { token.ThrowIfCancellationRequested(); compilations++; return Task.FromResult(Bytecode(1)); }
         using (var cache = new ShaderBytecodeCache(fixture.Disk))
-        using (var lease = await cache.AcquireAsync(Request(), budget, _ => Task.FromResult(Bytecode(1))))
-        { Assert.Equal(Bytecode(1), lease.Bytecode.ToArray()); Assert.Equal(0, fixture.Disk.ActivePreviewLeases); }
-        Assert.Equal(0, budget.UsedBytes); Assert.Empty(Directory.EnumerateFiles(fixture.Root, "*.shader", SearchOption.AllDirectories));
+        {
+            using (var first = await cache.AcquireAsync(Request(), budget, Compile))
+                Assert.Equal(Bytecode(1), first.Bytecode.ToArray());
+            using (var second = await cache.AcquireAsync(Request(), budget, Compile))
+                Assert.Equal(Bytecode(1), second.Bytecode.ToArray());
+            Assert.Equal(1, compilations);
+            Assert.Equal(Bytecode(1).Length + 512, cache.HotBytes);
+            Assert.Equal(0, fixture.Disk.ActivePreviewLeases);
+            Assert.Empty(Directory.EnumerateFiles(fixture.Root, "*.shader", SearchOption.AllDirectories));
+            Assert.Empty(Directory.EnumerateFiles(fixture.Root, "*.tmp", SearchOption.AllDirectories));
+        }
+        Assert.Equal(0, budget.UsedBytes);
+    }
+
+    [Theory]
+    [InlineData(0, 112)]
+    [InlineData(0, 39)]
+    [InlineData(1024, 112)]
+    [InlineData(1024, 39)]
+    [InlineData(1024, 5)]
+    public async Task CompilerIoFailurePropagatesWithoutRetryOrRetainedBytecode(long limit, int nativeCode)
+    {
+        using var fixture = new Fixture(limit); var budget = new AssetMemoryBudget(); int compilations = 0;
+        using var cache = new ShaderBytecodeCache(fixture.Disk);
+        var expected = new IOException("The generated compiler failed.", unchecked((int)0x80070000) | nativeCode);
+        var actual = await Assert.ThrowsAsync<IOException>(() => cache.AcquireAsync(Request(), budget, _ =>
+        { compilations++; throw expected; }));
+        Assert.Same(expected, actual);
+        Assert.Equal(1, compilations);
+        Assert.Equal(0, cache.HotBytes);
+        Assert.Equal(0, budget.UsedBytes);
+        Assert.Equal(0, fixture.Disk.ActivePreviewLeases);
+        Assert.Empty(Directory.EnumerateFiles(fixture.Root, "*.shader", SearchOption.AllDirectories));
+        Assert.Empty(Directory.EnumerateFiles(fixture.Root, "*.tmp", SearchOption.AllDirectories));
     }
 
     private static ShaderBytecodeRequest Request() => new("float4 main() : SV_TARGET { return 1; }", "main", "ps_5_0", 0,

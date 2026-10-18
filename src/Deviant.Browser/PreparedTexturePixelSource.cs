@@ -60,8 +60,8 @@ public sealed class PreparedTexturePixelSource : ITexturePixelSource, IDisposabl
         if (!string.Equals(Hash(surface.Rgba8.Span, token), header.RgbaSha256, StringComparison.Ordinal))
             throw Changed("The resident RGBA hash does not match the requested backing.");
         var cacheKey = CacheManager.PreparedKey(Category, Profile, key);
-        var lease = await cache.AcquirePreparedAsync(Category, cacheKey, ".pixels",
-            (path, cancellation) => WriteAsync(path, header, surface.Rgba8, budget, cancellation),
+        var lease = await cache.AcquirePreparedOutputAsync(Category, cacheKey, ".pixels",
+            (output, cancellation) => WriteAsync(output, header, surface.Rgba8, budget, cancellation),
             (path, cancellation) => ValidArtifactAsync(path, key, budget, header, cancellation), token).ConfigureAwait(false);
         return await OpenCachedAsync(lease, key, budget, header, token).ConfigureAwait(false);
     }
@@ -281,7 +281,7 @@ public sealed class PreparedTexturePixelSource : ITexturePixelSource, IDisposabl
         return new(header, offset, after, retained);
     }
 
-    private static async Task WriteAsync(string path, Header header, ReadOnlyMemory<byte> pixels,
+    private static async Task WriteAsync(Stream file, Header header, ReadOnlyMemory<byte> pixels,
         AssetMemoryBudget budget, CancellationToken token)
     {
         using var scratch = budget.Reserve(MaximumHeaderBytes * 4L + 8192, "texture pixel backing writer");
@@ -290,7 +290,8 @@ public sealed class PreparedTexturePixelSource : ITexturePixelSource, IDisposabl
         var prefix = new byte[PrefixBytes]; "DVPIX001"u8.CopyTo(prefix);
         BinaryPrimitives.WriteInt32LittleEndian(prefix.AsSpan(8), 1);
         BinaryPrimitives.WriteInt32LittleEndian(prefix.AsSpan(12), json.Length);
-        await using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1, FileOptions.Asynchronous);
+        using var timing = AssetLoadDiagnostics.Measure("PreparedTexturePixelsWrite", header.Key,
+            requestedBytes: checked(PrefixBytes + (long)json.Length + pixels.Length + 32));
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         hash.AppendData(prefix); hash.AppendData(json);
         await file.WriteAsync(prefix, token).ConfigureAwait(false); await file.WriteAsync(json, token).ConfigureAwait(false);

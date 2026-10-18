@@ -43,6 +43,30 @@ public sealed class ShaderBytecodeBundleTests
         Assert.Equal(0, budget.UsedBytes); Assert.Equal(0, fixture.Disk.ActivePreviewLeases);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(100)]
+    public async Task UnavailableDiskCapacitySkipsBundleAndKeepsCompiledConsumersUsable(long limit)
+    {
+        using var fixture = new Fixture(limit); var budget = new AssetMemoryBudget(); int compilations = 0;
+        using (var cache = new ShaderBytecodeCache(fixture.Disk))
+        {
+            using var shader = await cache.AcquireAsync(Request("pixel"), budget, token =>
+            { token.ThrowIfCancellationRequested(); compilations++; return Task.FromResult(Code(1)); });
+            long retained = budget.UsedBytes;
+            Assert.False(await cache.PrepareBundleAsync(BundleKey, [shader], budget));
+            Assert.Equal(retained, budget.UsedBytes);
+            Assert.Equal(Code(1), shader.Bytecode.ToArray());
+            using var reused = await cache.AcquireAsync(Request("pixel"), budget, UnexpectedCompile);
+            Assert.Equal(Code(1), reused.Bytecode.ToArray());
+            Assert.Equal(1, compilations);
+            Assert.Equal(0, fixture.Disk.ActivePreviewLeases);
+            Assert.Empty(Directory.EnumerateFiles(fixture.Root, "*.shbundle", SearchOption.AllDirectories));
+            Assert.Empty(Directory.EnumerateFiles(fixture.Root, "*.tmp", SearchOption.AllDirectories));
+        }
+        Assert.Equal(0, budget.UsedBytes);
+    }
+
     [Fact]
     public async Task LaterCompleteCaptureReplacesAnEarlierSubsetForTheSameSceneProfile()
     {
@@ -266,7 +290,7 @@ public sealed class ShaderBytecodeBundleTests
     {
         public string Root { get; } = Path.Combine(Path.GetTempPath(), "deviant-shader-bundle-" + Guid.NewGuid().ToString("N"));
         public CacheManager Disk { get; }
-        public Fixture() => Disk = new(Path.Combine(Root, "settings"), new(Path.Combine(Root, "cache"), 20L * 1024 * 1024 * 1024));
+        public Fixture(long limit = 20L * 1024 * 1024 * 1024) => Disk = new(Path.Combine(Root, "settings"), new(Path.Combine(Root, "cache"), limit));
         public void Dispose() { Disk.Dispose(); if (Directory.Exists(Root)) Directory.Delete(Root, true); }
     }
     private sealed class BundleObserver(Action<AssetLoadMeasurement> receive) : IObserver<KeyValuePair<string, object?>>
