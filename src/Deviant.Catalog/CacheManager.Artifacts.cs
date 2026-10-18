@@ -161,7 +161,7 @@ public sealed partial class CacheManager
                     RefreshChangedPaths();
                     var size = new FileInfo(temp).Length;
                     Evict(size, path);
-                    fallback = LimitBytes == 0 || size > LimitBytes || TrackedArtifactBytes > LimitBytes - size;
+                    fallback = LimitBytes == 0 || size > LimitBytes || TrackedUsageBytes > LimitBytes - size;
                     if (!fallback)
                     {
                         lock (leaseGate)
@@ -307,7 +307,6 @@ public sealed partial class CacheManager
         finally { operation.Release(); }
     }
     private long TrackedUsageBytes { get { lock (leaseGate) return totalBytes; } }
-    private long TrackedArtifactBytes { get { lock (leaseGate) return previewBytes + preparedBytes; } }
     public long AccountingReconciliations { get { lock (leaseGate) return accountingReconciliations; } }
     private long GetUsage(CacheUsage kind)
     {
@@ -487,13 +486,13 @@ public sealed partial class CacheManager
     private void Evict(long required, string? exclude)
     {
         EnsureAccounting(); RefreshChangedPaths();
-        if (required <= LimitBytes && TrackedArtifactBytes <= LimitBytes - required) return;
+        if (required <= LimitBytes && TrackedUsageBytes <= LimitBytes - required) return;
         KeyValuePair<string, CacheFile>[] candidates;
         lock (leaseGate) candidates = catalog.Where(p => (p.Value.Preview || p.Value.Prepared) && p.Key != exclude)
             .OrderBy(p => p.Value.LastWriteUtc).ToArray();
         foreach (var candidate in candidates)
         {
-            if (required <= LimitBytes && TrackedArtifactBytes <= LimitBytes - required) break;
+            if (required <= LimitBytes && TrackedUsageBytes <= LimitBytes - required) break;
             lock (leaseGate)
             {
                 if (leases.ContainsKey(candidate.Key)) continue;

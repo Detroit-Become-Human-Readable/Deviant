@@ -35,6 +35,7 @@ public partial class StringsView
         catch (OperationCanceledException) { if (ReferenceEquals(session, current)) terminal = "Cancelled"; }
         catch (Exception error)
         {
+            Deviant.Assets.WorkflowDiagnostics.Failure("Strings.Index", error);
             if (ReferenceEquals(session, current)) { terminal = "Failed"; Status.Text = error.Message; }
         }
         finally

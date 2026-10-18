@@ -10,6 +10,7 @@ public partial class AudioWindow
     {
         var failure = new InvalidOperationException($"Closing {operation} failed.", error);
         closeFailures.Add(failure);
+        Deviant.Assets.WorkflowDiagnostics.Failure("Workspace.Close", failure);
         Trace.TraceError("{0}", failure);
     }
 

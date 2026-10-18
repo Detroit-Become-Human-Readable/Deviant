@@ -12,6 +12,7 @@ public partial class AudioWindow
         if (textureBrowseFailures.Count == 64) textureBrowseFailures.RemoveAt(0);
         textureBrowseFailures.Add(error);
         Trace.TraceError("Texture browsing: {0}", error);
+        Deviant.Assets.WorkflowDiagnostics.Failure("Textures.Browse", error);
     }
 
     private async Task DrainTextureBrowseWorkAsync()

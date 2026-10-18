@@ -109,6 +109,7 @@ public sealed partial class NativeModelSession
                 }
                 catch (Exception error) when (error is IOException or ArgumentException or OverflowException)
                 {
+                    WorkflowDiagnostics.Failure("Model.Material", error, identity.Key, partial: true);
                     material = NeutralMaterial(frame, error is ArchiveException archive ? archive.Code : "MaterialUnavailable", token);
                 }
             }
@@ -138,7 +139,8 @@ public sealed partial class NativeModelSession
                         surfaces.Add(nativeTexture, surface);
                     }
                     catch (Exception error) when (error is IOException or ArgumentException or OverflowException)
-                    { issues.Add(new(nativeTexture, error is TextureFormatException format ? format.Code : error is ArchiveException archive ? archive.Code : "MaterialTextureUnavailable", error.Message)); continue; }
+                    { WorkflowDiagnostics.Failure("Model.Texture", error, nativeTexture.Key, partial: true);
+                        issues.Add(new(nativeTexture, error is TextureFormatException format ? format.Code : error is ArchiveException archive ? archive.Code : "MaterialTextureUnavailable", error.Message)); continue; }
                 }
                 else AssetLoadDiagnostics.Cache("TextureCache", nativeTexture.Key, true);
                 if (material.Bindings.Any(binding => binding.SlotOrdinal == request.Key && binding.Role == MaterialTextureRole.Normal) && surface.Surface.IsSrgb)

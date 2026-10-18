@@ -203,7 +203,7 @@ public partial class AudioWindow
                 charactersView.SetStatus("Indexing cancelled");
             }
         }
-        catch (Exception error) { System.Diagnostics.Trace.TraceError(error.ToString()); if (IsCurrent()) charactersView.SetStatus(error.Message); }
+        catch (Exception error) { Deviant.Assets.WorkflowDiagnostics.Failure("Characters.Load", error); System.Diagnostics.Trace.TraceError(error.ToString()); if (IsCurrent()) charactersView.SetStatus(error.Message); }
         finally
         {
             if (IsCurrent()) charactersView.SetIndexingState(true, false);

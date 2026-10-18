@@ -895,7 +895,7 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
                     catch (OperationCanceledException) { throw; }
                     catch (ArchiveException exception) when (exception.Code == "SourceChanged") { throw; }
                     catch (Exception exception) when (exception is IOException or InvalidDataException or ArgumentException or OverflowException)
-                    { lock (gate) blockers.Add("Container read: " + exception.Message); }
+                    { WorkflowDiagnostics.Failure("Textures.Owner", exception, identity.Key, partial: true); lock (gate) blockers.Add("Container read: " + exception.Message); }
                 }
                 bool anotherPass;
                 lock (gate) anotherPass = enrichmentRequested;
@@ -910,7 +910,7 @@ public sealed partial class TextureDiscoverySession : ITextureDiscoveryCatalog
             lock (gate) enrichmentComplete = true;
         }
         catch (OperationCanceledException) when (enrichmentCancellation.IsCancellationRequested) { }
-        catch (Exception exception) { lock (gate) blockers.Add(exception.Message); }
+        catch (Exception exception) { WorkflowDiagnostics.Failure("Textures.Index", exception); lock (gate) blockers.Add(exception.Message); }
         finally
         {
             lock (gate)

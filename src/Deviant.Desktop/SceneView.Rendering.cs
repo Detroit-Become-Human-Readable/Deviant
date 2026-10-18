@@ -103,7 +103,7 @@ public partial class SceneView
     private void InitializeRendering()
     {
         SceneViewport.MeshSelectionChanged += (_, selected) => SelectMeshes(selected);
-        SceneViewport.RenderFailed += (_, error) => { RenderStatus.Text = "Unable to render scene"; Advanced.Text = error.ToString(); };
+        SceneViewport.RenderFailed += (_, error) => { WorkflowDiagnostics.Failure("Scene.Render", error, section?.Descriptor.Identity.Key); RenderStatus.Text = "Unable to render scene"; Advanced.Text = error.ToString(); };
         SceneViewport.LoadProgressChanged += (_, progress) => UpdateRenderLoadingProgress(progress);
     }
 
@@ -226,6 +226,7 @@ public partial class SceneView
         CancellationTokenSource cancellation, long generation, AssetMemoryBudget? expectedBudget = null)
     {
         RenderAssetSnapshot? candidate = null;
+        using var diagnostic = WorkflowDiagnostics.Begin("Scene.Load", request.Section.Descriptor.Identity.Key);
         using var foreground = ForegroundWorkProvider?.Invoke();
         var previousSnapshot = renderSnapshot;
         var viewportTouched = false;
@@ -247,7 +248,10 @@ public partial class SceneView
             using var progress = new CoalescedDispatcherProgress<RenderLoadProgress>(Dispatcher, value =>
             {
                 if (generation == renderGeneration && !cancellation.IsCancellationRequested)
+                {
+                    diagnostic?.Progress(value.Stage, value.Completed, value.Total > 0 ? value.Total : null, "parts");
                     UpdateRenderLoadingProgress(value);
+                }
             });
             try { await LoadCandidateAsync(); }
             catch (ArchiveException error) when (IsLargeWorkloadLimit(error.Code) && !request.AllowLargeData)
@@ -329,18 +333,21 @@ public partial class SceneView
         }
         catch (OperationCanceledException)
         {
+            diagnostic?.Cancel();
             if (viewportTouched) await RestorePreviousSnapshotAsync();
             SetActivityTerminal("Cancelled");
             throw;
         }
-        catch
+        catch (Exception error)
         {
+            diagnostic?.Fail(error, error is ArchiveException archive ? archive.Code : null, partial: viewportTouched);
             if (viewportTouched) await RestorePreviousSnapshotAsync();
             SetActivityTerminal("Failed");
             throw;
         }
         finally
         {
+            diagnostic?.Complete();
             candidate?.Dispose();
             provisionalLease?.Dispose();
             if (generation == renderGeneration)

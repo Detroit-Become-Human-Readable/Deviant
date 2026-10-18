@@ -291,26 +291,55 @@ public sealed partial class LocalizationSession : IAsyncDisposable
         ValidateQuery(query);
         var assetQuery = ToAssetQuery(query);
         await featureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { return await QueryUnderFeatureGateAsync(assetQuery, cancellationToken).ConfigureAwait(false); }
+        finally { featureGate.Release(); }
+    }
+
+    internal async Task<IReadOnlyList<ResourceIdentity>> CapturePublishedPointerIdentitiesAsync(ResourceIdentity source,
+        CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ThrowIfDisposed();
+        var query = new LocalizationQuery(Source: source, Kind: LocalizationRecordKind.Pointer,
+            Limit: LocalizationAudioLookup.PointerPageSize);
+        ValidateQuery(query);
+        var identities = new List<ResourceIdentity>();
+        await featureGate.WaitAsync(token).ConfigureAwait(false);
         try
+        {
+            long offset = 0;
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                var page = await QueryUnderFeatureGateAsync(ToAssetQuery(query with { Offset = offset }), token).ConfigureAwait(false);
+                identities.AddRange(page.Records.Where(record => record.PointerKind == 1 && record.PointerPayloadBase64 is not null)
+                    .Select(record => record.Identity));
+                offset += page.Records.Count;
+                if (page.Records.Count == 0 || offset >= page.Total) break;
+            }
+        }
+        finally { featureGate.Release(); }
+        return identities.AsReadOnly();
+    }
+
+    private async Task<LocalizationPage> QueryUnderFeatureGateAsync(AssetQuery assetQuery, CancellationToken token)
+    {
+        lock (stateGate)
+            if (unavailable) throw new ArchiveException("LocalizationUnavailable", "Localization indexing did not finish.");
+        LocalizationGenerationQueryPage<LocalizationRecord> page;
+        if (stagedGeneration is { IsActive: true } staged)
+            page = await Task.Run(() => featureStore.QueryStagedLocalizationPage<LocalizationRecord>(staged, assetQuery, token), token).ConfigureAwait(false);
+        else if (publishedGeneration is { IsActive: true } published && published.SearchProjectionMatches)
+            page = await Task.Run(() => featureStore.QueryLocalizationPage<LocalizationGenerationHead, LocalizationRecord>(published, assetQuery, token), token).ConfigureAwait(false);
+        else
         {
             lock (stateGate)
                 if (unavailable) throw new ArchiveException("LocalizationUnavailable", "Localization indexing did not finish.");
-            LocalizationGenerationQueryPage<LocalizationRecord> page;
-            if (stagedGeneration is { IsActive: true } staged)
-                page = await Task.Run(() => featureStore.QueryStagedLocalizationPage<LocalizationRecord>(staged, assetQuery, cancellationToken), cancellationToken).ConfigureAwait(false);
-            else if (publishedGeneration is { IsActive: true } published && published.SearchProjectionMatches)
-                page = await Task.Run(() => featureStore.QueryLocalizationPage<LocalizationGenerationHead, LocalizationRecord>(published, assetQuery, cancellationToken), cancellationToken).ConfigureAwait(false);
-            else
-            {
-                lock (stateGate)
-                    if (unavailable) throw new ArchiveException("LocalizationUnavailable", "Localization indexing did not finish.");
-                return new(0, Array.Empty<LocalizationRecord>());
-            }
-            lock (stateGate)
-                if (unavailable) throw new ArchiveException("LocalizationUnavailable", "Localization indexing did not finish.");
-            return new(page.Total, page.Records);
+            return new(0, Array.Empty<LocalizationRecord>());
         }
-        finally { featureGate.Release(); }
+        lock (stateGate)
+            if (unavailable) throw new ArchiveException("LocalizationUnavailable", "Localization indexing did not finish.");
+        return new(page.Total, page.Records);
     }
 
     public async Task<IReadOnlyList<LocalizationRecord>> GetRecordsAsync(IEnumerable<ResourceIdentity> identities,

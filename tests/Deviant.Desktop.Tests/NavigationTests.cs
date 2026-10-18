@@ -17,6 +17,55 @@ namespace Deviant.Desktop.Tests;
 public sealed class NavigationTests
 {
     [Fact]
+    public void ArchiveOpeningFailureIsAvailableToDiagnosticsBeforeStatusCleanup() => WorkspaceCommitTests.Run((window, fixture) =>
+    {
+        string logRoot = Path.Combine(Path.GetDirectoryName(fixture.Index)!, "diagnostic-records");
+        var previous = WorkflowDiagnostics.Current;
+        var log = new LocalDiagnosticLog(logRoot, "generated-build");
+        try
+        {
+            WorkflowDiagnostics.Current = log;
+            File.WriteAllBytes(fixture.Index, new byte[4]);
+            Pump(window.OpenArchiveAsync(fixture.Index));
+            Pump(log.FlushAsync());
+            var failure = Assert.IsType<WorkflowDiagnosticEvent>(log.LastFailure);
+            Assert.Equal("Failed", failure.State); Assert.NotEmpty(failure.Exception!);
+            Assert.Equal("Workspace.Open", failure.Operation); Assert.Equal("Opening archive", failure.Phase);
+            Assert.Contains("Exception", failure.ExceptionType!);
+            using var dialog = new DiagnosticWindowScope(log);
+            Assert.Contains(failure.OperationId.ToString(), dialog.Details.Text);
+            Assert.Contains("Operation: Workspace.Open", dialog.Details.Text);
+        }
+        finally { WorkflowDiagnostics.Current = previous; Pump(log.DisposeAsync().AsTask()); }
+    });
+
+    private sealed class DiagnosticWindowScope : IDisposable
+    {
+        private readonly DiagnosticsWindow window;
+        public TextBox Details { get; }
+        public DiagnosticWindowScope(LocalDiagnosticLog log)
+        {
+            window = new DiagnosticsWindow(log);
+            window.Show();
+            Details = (TextBox)typeof(DiagnosticsWindow).GetField("details", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+        }
+        public void Dispose() => window.Close();
+    }
+
+    [Fact]
+    public void ClosingAnAlreadyDrainedWorkspaceDoesNotReenterItsClosingEvent() => WorkspaceCommitTests.Run((window, _) =>
+    {
+        Pump((Task)Invoke(window, "DrainCacheUsersAsync", CancellationToken.None)!);
+        Pump((Task)Invoke(window, "CloseOwnedResourcesAsync")!);
+        bool insideClose = true;
+        window.Closed += (_, _) => Assert.False(insideClose);
+        window.Close();
+        insideClose = false;
+        Pump(WindowTestLifetime.WaitClosedAsync(window));
+        Assert.True(WindowTestLifetime.IsClosed(window));
+    });
+
+    [Fact]
     public void HomeOpeningDoesNotRestoreUnrelatedAudioMetadata() => WorkspaceCommitTests.Run((window, fixture) =>
     {
         DiscoveryFixture.WriteIndex(fixture.Index, [(999u, new byte[] { 1, 2, 3 })]);

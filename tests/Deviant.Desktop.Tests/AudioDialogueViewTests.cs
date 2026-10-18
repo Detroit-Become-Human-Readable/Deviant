@@ -104,7 +104,7 @@ public sealed class AudioDialogueViewTests
         var view = ShowView(out var window);
         try
         {
-            view.SetResult(CreateResult(occurrences: []));
+            view.SetResult(CreateResult(occurrences: [], diagnostics: []));
             Assert.Equal("No dialogue linked.", Named<TextBlock>(view, "EmptyMessage").Text);
             Assert.Equal(Visibility.Visible, Named<TextBlock>(view, "EmptyMessage").Visibility);
             Assert.Empty(Named<ListView>(view, "Occurrences").Items);
@@ -137,7 +137,7 @@ public sealed class AudioDialogueViewTests
         try
         {
             Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "EmptyMessage").Visibility);
-            view.SetResult(CreateResult(occurrences: []));
+            view.SetResult(CreateResult(occurrences: [], diagnostics: []));
             view.SetStatus(message);
 
             Assert.Equal(message, Named<TextBlock>(view, "Status").Text);
@@ -151,7 +151,7 @@ public sealed class AudioDialogueViewTests
 
             view.SetStatus(string.Empty);
             Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "EmptyMessage").Visibility);
-            view.SetResult(CreateResult(occurrences: []));
+            view.SetResult(CreateResult(occurrences: [], diagnostics: []));
             Assert.Equal(Visibility.Visible, Named<TextBlock>(view, "EmptyMessage").Visibility);
             Assert.Equal("No dialogue linked.", Named<TextBlock>(view, "EmptyMessage").Text);
             Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "Status").Visibility);
@@ -249,6 +249,58 @@ public sealed class AudioDialogueViewTests
         Pump();
         return view;
     }
+
+    [Fact]
+    public void PartialEmptyLookupDoesNotClaimThatNoDialogueExists() => RunSta(() =>
+    {
+        var view = ShowView(out var window);
+        try
+        {
+            view.SetResult(CreateResult(occurrences: [], diagnostics:
+                [new("LocalizationPending", "Generated indexing activity", LocalizationReferenceLinkStatus.Unresolved, [])]) with { IsComplete = false });
+            Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "EmptyMessage").Visibility);
+            Assert.Contains("Indexing", Named<TextBlock>(view, "Status").Text);
+        }
+        finally { window.Close(); }
+    });
+
+    [Fact]
+    public void EmptyLookupWithUnresolvedEvidenceDoesNotClaimAbsence() => RunSta(() =>
+    {
+        var view = ShowView(out var window);
+        try
+        {
+            view.SetResult(CreateResult(occurrences: [], diagnostics:
+                [new("ReferenceUnavailable", "Generated reference failure", LocalizationReferenceLinkStatus.Unresolved, [])]));
+            Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "EmptyMessage").Visibility);
+            Assert.Contains("unavailable", Named<TextBlock>(view, "Status").Text, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { window.Close(); }
+    });
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void IncompleteVerificationDoesNotClaimIndexingIsRunning(bool hasMatches) => RunSta(() =>
+    {
+        var view = ShowView(out var window);
+        try
+        {
+            var result = CreateResult(occurrences: hasMatches ? null : [], diagnostics:
+                [new("CoverageUnavailable", "Generated input verification failure", LocalizationReferenceLinkStatus.Unresolved, [])])
+                with { IsComplete = false };
+            view.SetResult(result);
+            Assert.Equal(hasMatches ? "Partial dialogue results." : "Dialogue unavailable.", Named<TextBlock>(view, "Status").Text);
+            Assert.Equal(Visibility.Collapsed, Named<TextBlock>(view, "EmptyMessage").Visibility);
+            Assert.Equal(hasMatches ? 3 : 0, Named<ListView>(view, "Occurrences").Items.Count);
+            if (hasMatches)
+            {
+                Named<ListView>(view, "Occurrences").SelectedIndex = 0;
+                Assert.Same(result.Occurrences[0], view.SelectedOccurrence);
+            }
+        }
+        finally { window.Close(); }
+    });
 
     private static LocalizationAudioLookupResult CreateResult(string? longText = null,
         IReadOnlyList<LocalizationAudioTextOccurrence>? occurrences = null,

@@ -276,7 +276,7 @@ public partial class AudioWindow : Window, IAssetNavigator
             if(stringsMode&&!token.IsCancellationRequested) await stringsView.LoadAsync(opened.Snapshot,cache.Location,token);
         }
         catch (OperationCanceledException) { if (generation == openGeneration) SetBusy(false, "Open cancelled"); }
-        catch (Exception ex) { if (generation == openGeneration) SetBusy(false, ex.Message); }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Workspace.Open", ex, phase: "Opening archive"); if (generation == openGeneration) SetBusy(false, ex.Message); }
         finally
         {
             if (generation == openGeneration) { indexOpeningActive = false; RefreshActivity(); RefreshWorkspaceNavigation(); }
@@ -297,7 +297,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     {
         try { await opened.EnrichmentTask; }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { _ = Dispatcher.BeginInvoke(() => { if (ReferenceEquals(session, opened)) HomeStatus.Text = StatusText.Text = ex.Message; }); }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); _ = Dispatcher.BeginInvoke(() => { if (ReferenceEquals(session, opened)) HomeStatus.Text = StatusText.Text = ex.Message; }); }
         if (ReferenceEquals(session, opened)&&!closingInProgress&&(currentView is "audio" or "home"))
             await Dispatcher.InvokeAsync(async () => { UpdateFilterChoices(opened); UpdateExplorerGroups(); await QueryAsync(resetOffset: false); }).Task.Unwrap();
         if (ReferenceEquals(session, opened) && !closingInProgress)
@@ -355,7 +355,7 @@ public partial class AudioWindow : Window, IAssetNavigator
             UpdateSelectedDetails();
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { if (generation == queryGeneration && currentView == "audio" && !foregroundBusy) StatusText.Text = ex.Message; }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); if (generation == queryGeneration && currentView == "audio" && !foregroundBusy) StatusText.Text = ex.Message; }
     }
 
     private AudioExplorerQuery ReadQuery(long offset, int limit)
@@ -479,7 +479,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     {
         if (session is null || CurrentRow is not { } row) return;
         try { var draft=AliasBox.Text; await session.SetAliasAsync(row.Identity,draft); aliasDrafts.Saved(row.Identity,draft); await QueryAsync(false); }
-        catch (Exception ex) { StatusText.Text = ex.Message; }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); StatusText.Text = ex.Message; }
     }
     private async void RemoveAlias_Click(object sender, RoutedEventArgs e)
     { if (session is not null && CurrentRow is { } row) { await session.SetAliasAsync(row.Identity, null); aliasDrafts.Saved(row.Identity,null); await QueryAsync(false); } }
@@ -533,7 +533,7 @@ public partial class AudioWindow : Window, IAssetNavigator
             playbackTimer.Start(); SetBusy(false, partial ? "Partial preview · original fragment" : "Preview ready");
         }
         catch (OperationCanceledException) { if (request == previewRequestVersion && ReferenceEquals(current, session) && !indexOpeningActive && !closingInProgress) SetBusy(false, "Preview cancelled"); }
-        catch (Exception ex) { if (request == previewRequestVersion && ReferenceEquals(current, session) && !indexOpeningActive && !closingInProgress) SetBusy(false, ex.Message); }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); if (request == previewRequestVersion && ReferenceEquals(current, session) && !indexOpeningActive && !closingInProgress) SetBusy(false, ex.Message); }
         finally
         {
             if (pendingPreview is not null) await pendingPreview.DisposeAsync();
@@ -543,7 +543,7 @@ public partial class AudioWindow : Window, IAssetNavigator
         }
     }
 
-    private async void Pause_Click(object sender, RoutedEventArgs e) { try { await Task.Run(player.Toggle); PauseButton.Content = player.State == NAudio.Wave.PlaybackState.Paused ? "Resume" : "Pause"; } catch (Exception ex) { StatusText.Text = ex.Message; } }
+    private async void Pause_Click(object sender, RoutedEventArgs e) { try { await Task.Run(player.Toggle); PauseButton.Content = player.State == NAudio.Wave.PlaybackState.Paused ? "Resume" : "Pause"; } catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); StatusText.Text = ex.Message; } }
     private async void Stop_Click(object sender, RoutedEventArgs e) => await StopPlaybackAsync();
     private async Task StopPlaybackAsync(bool cancelPendingPreview = true)
     {
@@ -582,7 +582,7 @@ public partial class AudioWindow : Window, IAssetNavigator
         PlayTime.Text = $"{TimeSpan.FromSeconds(Math.Max(0, position)).ToString(@"m\:ss", CultureInfo.InvariantCulture)} / {TimeSpan.FromSeconds(Math.Max(0, length)).ToString(@"m\:ss", CultureInfo.InvariantCulture)}";
         if (length > 0 && position >= length - .05 && player.State == NAudio.Wave.PlaybackState.Stopped && activePreview is not null) await StopPlaybackAsync();
         }
-        catch (Exception ex) { StatusText.Text = ex.Message; }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); StatusText.Text = ex.Message; }
         finally { tickingPlayback = false; }
     }
     private void Seek_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -598,7 +598,7 @@ public partial class AudioWindow : Window, IAssetNavigator
         if (!seeking || player.State == NAudio.Wave.PlaybackState.Stopped) { seeking = false; return; }
         var target = pendingSeek;
         try { await Task.Run(() => player.Position = target); }
-        catch (Exception ex) { StatusText.Text = ex.Message; }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); StatusText.Text = ex.Message; }
         finally { seeking = false; }
     }
     private void Volume_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e) { if (IsLoaded) player.Volume = (float)e.NewValue; }
@@ -606,7 +606,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     {
         if (updatingDevices || !IsLoaded || DeviceBox.SelectedItem is not AudioOutputDevice device) return;
         try { await Task.Run(() => player.OutputDeviceId = string.IsNullOrEmpty(device.Id) ? null : device.Id); }
-        catch (Exception ex) { StatusText.Text = ex.Message; }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); StatusText.Text = ex.Message; }
     }
     private async Task LoadDevicesAsync()
     {
@@ -623,7 +623,7 @@ public partial class AudioWindow : Window, IAssetNavigator
             }
             finally { updatingDevices=false; }
         }
-        catch (Exception ex) { StatusText.Text = "Output devices unavailable: " + ex.Message; }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); StatusText.Text = "Output devices unavailable: " + ex.Message; }
     }
 
     private async void ExportSelected_Click(object sender, RoutedEventArgs e) => await TrackJobAsync(ExportSelectedCoreAsync);
@@ -642,7 +642,7 @@ public partial class AudioWindow : Window, IAssetNavigator
         var token = jobCancellation.Token; SetBusy(true, "Preparing matching export…");
         try { var rows = await current.ReadMatchingAsync(ReadQuery(0, 10000), cancellationToken: token); await ExportAsync(current.Review(rows), cancellationToken: token); }
         catch (OperationCanceledException) { SetBusy(false, "Export cancelled."); }
-        catch (Exception ex) { SetBusy(false, ex.Message); }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); SetBusy(false, ex.Message); }
         finally { if (jobCancellation?.Token == token) { jobCancellation.Dispose(); jobCancellation = null; } }
     }
     private async void ExportPartial_Click(object sender, RoutedEventArgs e) => await TrackJobAsync(ExportPartialCoreAsync);
@@ -672,7 +672,7 @@ public partial class AudioWindow : Window, IAssetNavigator
             SetBusy(false, "Bank output retained; manifest write failed.");
         }
         catch (OperationCanceledException) { SetBusy(false, "Bank export cancelled."); }
-        catch (Exception ex) { SetBusy(false, ex.Message); }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); SetBusy(false, ex.Message); }
         finally { jobCancellation?.Dispose(); jobCancellation = null; }
     }
 
@@ -707,7 +707,7 @@ public partial class AudioWindow : Window, IAssetNavigator
             SetBusy(false, "Outputs retained; manifest write failed.");
         }
         catch (OperationCanceledException) { SetBusy(false, "Export cancelled."); }
-        catch (Exception ex) { SetBusy(false, ex.Message); }
+        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); SetBusy(false, ex.Message); }
         finally
         {
             if (ownsJobCancellation && jobCancellation is not null) { jobCancellation.Dispose(); jobCancellation = null; }
@@ -827,7 +827,7 @@ public partial class AudioWindow : Window, IAssetNavigator
         {
             closeApproved = true;
             CloseStage = closeFailures.Count == 0 ? "Closed" : "Closed with errors";
-            Close();
+            _ = Dispatcher.BeginInvoke(new Action(Close), DispatcherPriority.Normal);
         }
     }
     private async Task ClearSceneSessionAsync()

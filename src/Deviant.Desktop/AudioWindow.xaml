@@ -33,6 +33,7 @@
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                     <StackPanel x:Name="StringsPlayerSummary" Visibility="Collapsed" Orientation="Horizontal" VerticalAlignment="Center"><TextBlock x:Name="StringsPlayingLabel" Margin="6,0"/><Button Content="Pause" Click="Pause_Click"/><Button Content="Stop" Click="Stop_Click"/></StackPanel>
                     <Button Content="Cache" Click="Cache_Click" />
+                    <Button Content="Diagnostics" Click="Diagnostics_Click" />
                     <Button x:Name="AdvancedButton" Visibility="Collapsed" Content="Advanced" Click="Advanced_Click" />
                 </StackPanel>
             </DockPanel>

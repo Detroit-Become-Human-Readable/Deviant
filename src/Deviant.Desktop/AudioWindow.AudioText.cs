@@ -70,7 +70,7 @@ public partial class AudioWindow
         var owner = DialogueAudioOwner(row) ?? throw new InvalidOperationException("This clip has no dialogue link.");
         var headers = current.Catalog.DialogueHeaderAssociations.Where(link => link.AudioResolution.Candidates.Contains(owner))
             .Select(link => link.HeaderIdentity).Distinct().ToArray();
-        if (headers.Length == 0) { audioDialogueView.SetStatus("No dialogue linked."); return; }
+        if (headers.Length == 0) { audioDialogueView.SetStatus(current.AreDialogueHeadersReady ? "No dialogue linked." : "Reading dialogue links…"); return; }
         audioDialogueCancellation?.Cancel();
         using var own = CancellationTokenSource.CreateLinkedTokenSource(token, audioDialogueSelection.Token, navigationCancellation.Token);
         audioDialogueCancellation = own; jobCancellation = own;
@@ -98,36 +98,37 @@ public partial class AudioWindow
         ResourceIdentity audio, ResourceIdentity[] headers, long generation, CancellationToken token)
     {
         audioDialogueView.SetStatus("Reading dialogue…");
-        var finished = false;
+        using var diagnostic = WorkflowDiagnostics.Begin("Audio.Dialogue", audio.Key);
         try
         {
             if (stringsView.CurrentSession?.Snapshot.IndexContentId != owner.Snapshot.IndexContentId ||
                 stringsView.CurrentSession?.Snapshot.PhysicalSourceStamp != owner.Snapshot.PhysicalSourceStamp)
                 await stringsView.LoadAsync(owner.Snapshot, cache.Location, token);
-            else await stringsView.RetryIndexingAsync(token);
+            else
+                // StringsView owns and drains the retry; selected lookup uses already published rows.
+                _ = stringsView.RetryIndexingAsync(navigationCancellation.Token);
             var localization = stringsView.CurrentSession ?? throw new InvalidOperationException("Dialogue is unavailable.");
-            await localization.EnrichmentTask.WaitAsync(token);
             token.ThrowIfCancellationRequested();
-            if (!AudioDialogueCurrent(owner, row.Identity, generation)) return;
-            using var progress = new CoalescedProgress<LocalizationAudioLookupProgress>(value => Dispatcher.BeginInvoke(() =>
-            {
-                if (!finished && AudioDialogueCurrent(owner, row.Identity, generation) && !token.IsCancellationRequested)
-                {
-                    audioDialogueView.SetStatus(value.TotalResources > 0
-                        ? $"Reading dialogue · {value.CompletedResources:N0} / {value.TotalResources:N0}" : "Reading dialogue…");
-                    audioDialogueActivity = new(true, "Reading dialogue", value.CompletedResources, value.TotalResources);
-                    RefreshActivity();
-                }
-            }));
-            await audioDialogueLookup.BuildAsync(localization, progress, token);
+            if (!AudioDialogueCurrent(owner, row.Identity, generation)) { diagnostic?.Cancel(); return; }
+            diagnostic?.Progress("Reading dialogue", 0, null, "occurrences");
             var result = await audioDialogueLookup.FindAudioAsync(localization, audio, headers, token);
             token.ThrowIfCancellationRequested();
-            finished = true;
             if (AudioDialogueCurrent(owner, row.Identity, generation)) audioDialogueView.SetResult(result);
+            diagnostic?.Progress("Dialogue available", result.Occurrences.Count, null, "occurrences");
+            bool unresolved = result.Occurrences.Count == 0 && result.Diagnostics.Any(issue => issue.Status is
+                LocalizationReferenceLinkStatus.Unresolved or LocalizationReferenceLinkStatus.Ambiguous);
+            if (result.IsComplete && !unresolved) diagnostic?.Complete(); else diagnostic?.Partial();
         }
-        catch (OperationCanceledException) { if (AudioDialogueCurrent(owner, row.Identity, generation)) audioDialogueView.SetStatus("Cancelled"); }
-        catch (Exception error) { if (AudioDialogueCurrent(owner, row.Identity, generation)) audioDialogueView.SetStatus(error.Message); }
-        finally { finished = true; }
+        catch (OperationCanceledException)
+        {
+            diagnostic?.Cancel();
+            if (AudioDialogueCurrent(owner, row.Identity, generation)) audioDialogueView.SetStatus("Cancelled");
+        }
+        catch (Exception error)
+        {
+            diagnostic?.Fail(error, error is ArchiveException archive ? archive.Code : null);
+            if (AudioDialogueCurrent(owner, row.Identity, generation)) audioDialogueView.SetStatus(error.Message);
+        }
     }
 
     private async Task OpenAudioDialogueOccurrenceAsync(LocalizationAudioTextOccurrence occurrence, CancellationToken token)

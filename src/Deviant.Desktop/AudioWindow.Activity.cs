@@ -104,6 +104,7 @@ public partial class AudioWindow
         if (active) StatusText.Text = FormatActivity(stage, completed, total);
         else if ((workspaceActivityDisplayed || childChanged) && childActivity is { IsActive: false, Stage.Length: > 0 } settled) StatusText.Text = settled.Stage;
         else if (workspaceActivityDisplayed) StatusText.Text = currentView == "audio" ? audioResultStatus : "Ready";
+        UpdateDiagnosticActivity(active, stage, completed, total);
         workspaceActivityDisplayed = active;
         displayedChildActivity = childActivity;
         displayedActivityView = currentView;
@@ -168,6 +169,7 @@ public partial class AudioWindow
 
     private void DisposeActivity()
     {
+        diagnosticActivity?.Dispose(); diagnosticActivity = null;
         activityTimer.Stop();
         audioUpdates?.Dispose();
         archiveProgress?.Dispose();

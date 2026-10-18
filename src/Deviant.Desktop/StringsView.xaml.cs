@@ -90,6 +90,7 @@ public partial class StringsView:UserControl,IAsyncDisposable
   catch(OperationCanceledException){EndActivity(activity,ReferenceEquals(current,session)?"Cancelled":null);}
   catch(Exception e)
   {
+   Deviant.Assets.WorkflowDiagnostics.Failure("Strings.Index",e);
    EndActivity(activity,ReferenceEquals(current,session)?"Failed":null);
    await Dispatcher.InvokeAsync(()=>{if(ReferenceEquals(current,session))Status.Text=e.Message;});
   }
@@ -119,7 +120,7 @@ public partial class StringsView:UserControl,IAsyncDisposable
    var previous=(Rows.SelectedItem as LocalizationRecord)?.Identity;
    refreshing=true;try{Rows.ItemsSource=page.Records;foreach(var row in page.Records.Where(r=>selected.Contains(r.Identity)))Rows.SelectedItems.Add(row);if(previous is not null&&page.Records.FirstOrDefault(r=>r.Identity==previous) is{}restored)Rows.SelectedItem=restored;}finally{refreshing=false;}
    Page.Text=$"{(page.Total==0?0:offset+1):N0}–{Math.Min(offset+page.Records.Count,page.Total):N0} / {page.Total:N0}";Status.Text=current.IsEnrichmentComplete?$"{page.Total:N0} strings":$"{page.Total:N0} strings · indexing";UpdateChoices();await UpdateDetailsAsync();}
-  catch(OperationCanceledException){if(generation==queryGeneration)terminal="Cancelled";}catch(Exception e){if(generation==queryGeneration){Status.Text=e.Message;terminal="Failed";}}
+  catch(OperationCanceledException){if(generation==queryGeneration)terminal="Cancelled";}catch(Exception e){Deviant.Assets.WorkflowDiagnostics.Failure("Strings.Operation",e);if(generation==queryGeneration){Status.Text=e.Message;terminal="Failed";}}
   finally{EndActivity(activity,terminal);}
  }
  private void FiltersChanged(object sender,RoutedEventArgs e){if(refreshing)return;queryCancellation?.Cancel();offset=0;debounce.Stop();debounce.Start();}
@@ -145,7 +146,7 @@ public partial class StringsView:UserControl,IAsyncDisposable
   string? terminal=null;
   try{var variants=await current.GetVariantsAsync(row.Identity,token);var others=await current.GetOtherOccurrencesAsync(row.Identity,token);if(generation==detailGeneration&&ReferenceEquals(current,session)){Variants.ItemsSource=variants;var sourceLabels=current.Sources.ToDictionary(source=>source.Identity.Ordinal,source=>source.Label);OtherOccurrences.ItemsSource=others.Select(record=>new{Source=sourceLabels.GetValueOrDefault(record.ResourceOrdinal,"Source"),record.Language,record.Text});var duplicates=variants.GroupBy(r=>r.RawLanguageCode).Sum(g=>Math.Max(0,g.Count()-1));OccurrenceSummary.Text=$"{variants.Count:N0} language occurrences · {duplicates:N0} duplicates";}}
   catch(OperationCanceledException){if(generation==detailGeneration&&ReferenceEquals(current,session))terminal="Cancelled";}
-  catch(Exception error){if(generation==detailGeneration&&ReferenceEquals(current,session)){Status.Text=error.Message;terminal="Failed";}}
+  catch(Exception error){Deviant.Assets.WorkflowDiagnostics.Failure("Strings.Operation",error);if(generation==detailGeneration&&ReferenceEquals(current,session)){Status.Text=error.Message;terminal="Failed";}}
   finally{EndActivity(activity,terminal);}
  }
  private async void Previous_Click(object sender,RoutedEventArgs e){if(offset>=100){offset-=100;await RefreshAsync();}}
@@ -161,7 +162,7 @@ public partial class StringsView:UserControl,IAsyncDisposable
   var task=current.ExportAsync(selection,dialog.FilterIndex==2?LocalizationExportFormat.Csv:LocalizationExportFormat.Json,dialog.FileName,cancellationToken:token);activeJob=task;
   try{var report=await task;Status.Text=$"{report.Manifest.CompletedCount:N0} completed · {report.Manifest.FailedCount:N0} failed · {report.Manifest.CancelledCount:N0} cancelled";EndActivity(activity,report.Manifest.CancelledCount>0?"Cancelled":null);}
   catch(OperationCanceledException){Status.Text="Export cancelled";EndActivity(activity,"Cancelled");}
-  catch(Exception e){Status.Text=e.Message;EndActivity(activity,"Failed");}
+  catch(Exception e){Deviant.Assets.WorkflowDiagnostics.Failure("Strings.Operation",e);Status.Text=e.Message;EndActivity(activity,"Failed");}
   finally{activeJob=null;jobCancellation.Dispose();jobCancellation=null;}
  }
  private void Cancel_Click(object sender,RoutedEventArgs e)=>CancelActivity();

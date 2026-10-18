@@ -31,7 +31,10 @@ public sealed record LocalizationAudioTextOccurrence(LocalizationRecord TextOccu
 public sealed record LocalizationAudioLookupResult(ResourceIdentity AudioIdentity,
     IReadOnlyList<ResourceIdentity> DialogueHeaderIdentities,
     IReadOnlyList<LocalizationAudioTextOccurrence> Occurrences,
-    IReadOnlyList<LocalizationAudioLookupIssue> Diagnostics);
+    IReadOnlyList<LocalizationAudioLookupIssue> Diagnostics)
+{
+    public bool IsComplete { get; init; } = true;
+}
 
 /// <summary>Builds and queries a same-archive index from verified dialogue headers to localization pointers.</summary>
 public sealed class LocalizationAudioLookup
@@ -205,6 +208,8 @@ public sealed class LocalizationAudioLookup
     {
         ArgumentNullException.ThrowIfNull(session);ArgumentNullException.ThrowIfNull(exactTopLevelAudioIdentity);
         ArgumentNullException.ThrowIfNull(exactHeaderIdentities);cancellationToken.ThrowIfCancellationRequested();
+        await using var indexLease=await session.AcquirePayloadVerificationAsync(Array.Empty<ResourceIdentity>(),cancellationToken).ConfigureAwait(false);
+        indexLease.EnsureUnchanged();
         var snapshot=session.Snapshot;
         var audioRecord=FindTopLevelResource(snapshot,exactTopLevelAudioIdentity,1033,"audio");
         var audioResolution=new ArchiveResourceResolver(snapshot).Resolve(new ResourceReference(IdentifierNamespace.Archive,
@@ -216,26 +221,35 @@ public sealed class LocalizationAudioLookup
 
         var headers=exactHeaderIdentities.DistinctBy(identity=>identity.Key).ToArray();
         foreach(var header in headers)FindTopLevelResource(snapshot,header,4091,"dialogue header");
+        var completeAtStart=session.IsEnrichmentComplete;
+        var sourceVerification=completeAtStart
+            ?await session.AcquireAudioLookupSourceVerificationAsync(indexLease,cancellationToken).ConfigureAwait(false):null;
+        await using var coverageLease=sourceVerification?.Lease;
         var contentId=session.MetadataContentId;
-        if(string.IsNullOrEmpty(contentId))throw new ArchiveException("LocalizationPending","Text indexing is not ready.");
         var pointerHeaders=new Dictionary<string,(ResourceIdentity Pointer,List<ResourceIdentity> Headers)>(StringComparer.Ordinal);
-        foreach(var header in headers)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var pointers=await session.GetAudioLookupCandidatesAsync(header,IndexVersion,contentId,cancellationToken).ConfigureAwait(false);
-            foreach(var pointer in pointers)
-            {
-                if(!pointerHeaders.TryGetValue(pointer.Key,out var item))item=(pointer,[]);
-                if(!item.Headers.Any(existing=>existing.Key==header.Key))item.Headers.Add(header);
-                pointerHeaders[pointer.Key]=item;
-            }
-        }
-
         var output=new List<LocalizationAudioTextOccurrence>();
         var diagnostics=new List<LocalizationAudioLookupIssue>();
-        var buildIssues=await session.GetAudioLookupIssuesAsync(IndexVersion,contentId,cancellationToken).ConfigureAwait(false);
-        diagnostics.AddRange(buildIssues.Select(issue=>new LocalizationAudioLookupIssue(issue.Code,DescribeCachedIssue(issue),
-            issue.Status,issue.SourceResources,Count:issue.Count)));
+        if(sourceVerification is { UnverifiedSources.Count:>0 })
+            diagnostics.Add(new("LocalizationSourceUnavailable","Some localization sources could not be verified.",
+                LocalizationReferenceLinkStatus.Unresolved,sourceVerification.UnverifiedSources));
+        if(completeAtStart&&!string.IsNullOrEmpty(contentId)&&
+           await session.IsAudioLookupReadyAsync(IndexVersion,contentId,cancellationToken).ConfigureAwait(false))
+        {
+            foreach(var header in headers)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var pointers=await session.GetAudioLookupCandidatesAsync(header,IndexVersion,contentId,cancellationToken).ConfigureAwait(false);
+                foreach(var pointer in pointers)AddCandidate(pointerHeaders,pointer,header);
+            }
+            var buildIssues=await session.GetAudioLookupIssuesAsync(IndexVersion,contentId,cancellationToken).ConfigureAwait(false);
+            diagnostics.AddRange(buildIssues.Select(issue=>new LocalizationAudioLookupIssue(issue.Code,DescribeCachedIssue(issue),
+                issue.Status,issue.SourceResources,Count:issue.Count)));
+        }
+        else if(headers.Length>0)
+            await FindAvailableCandidatesAsync(session,headers,pointerHeaders,diagnostics,indexLease,cancellationToken).ConfigureAwait(false);
+        if(!completeAtStart)
+            diagnostics.Add(new("LocalizationPending","Localization indexing is incomplete.",
+                LocalizationReferenceLinkStatus.Unresolved,Array.Empty<ResourceIdentity>()));
         if(headers.Length==0)
             diagnostics.Add(new("DialogueHeaderUnavailable","No exact dialogue header is linked to this audio resource.",
                 LocalizationReferenceLinkStatus.Unmatched,Array.Empty<ResourceIdentity>()));
@@ -260,7 +274,7 @@ public sealed class LocalizationAudioLookup
                     [new ResourceIdentity(snapshot.IndexContentId,pointerIdentity.Ordinal)],pointerIdentity));
         }
         await using var sourceLease=validPointers.Count==0?null:await session.AcquirePayloadVerificationAsync(
-            validPointers.Select(pointer=>new ResourceIdentity(snapshot.IndexContentId,pointer.Ordinal)),cancellationToken).ConfigureAwait(false);
+            validPointers.Select(pointer=>new ResourceIdentity(snapshot.IndexContentId,pointer.Ordinal)),cancellationToken,indexLease).ConfigureAwait(false);
         sourceLease?.EnsureUnchanged();
         if(validPointers.Count>0)
         {
@@ -337,9 +351,66 @@ public sealed class LocalizationAudioLookup
             }
         }
         sourceLease?.EnsureUnchanged();
-        return new(exactTopLevelAudioIdentity,headers,output.AsReadOnly(),diagnostics.AsReadOnly());
+        coverageLease?.EnsureUnchanged();
+        indexLease.EnsureUnchanged();
+        return new(exactTopLevelAudioIdentity,headers,output.AsReadOnly(),diagnostics.AsReadOnly())
+        { IsComplete=completeAtStart&&sourceVerification is { UnverifiedSources.Count:0 } };
     }
 
+    private async Task FindAvailableCandidatesAsync(LocalizationSession session,IReadOnlyList<ResourceIdentity> headers,
+        Dictionary<string,(ResourceIdentity Pointer,List<ResourceIdentity> Headers)> candidates,
+        List<LocalizationAudioLookupIssue> diagnostics,LocalizationPayloadVerificationLease indexLease,CancellationToken token)
+    {
+        var headerKeys=headers.Select(header=>header.Key).ToHashSet(StringComparer.Ordinal);
+        foreach(var resource in session.Resources.OrderBy(resource=>resource.Ordinal))
+        {
+            token.ThrowIfCancellationRequested();
+            var source=new ResourceIdentity(session.Snapshot.IndexContentId,resource.Ordinal);
+            var identities=await session.CapturePublishedPointerIdentitiesAsync(source,token).ConfigureAwait(false);
+            if(identities.Count==0)continue;
+            await using var sourceLease=await session.AcquirePayloadVerificationAsync([source],token,indexLease).ConfigureAwait(false);
+            sourceLease.EnsureUnchanged();
+            LocalizationReferenceReadResult references;
+            try{references=await referenceReader.ReadAsync(session.Snapshot,source,token).ConfigureAwait(false);}
+            catch(ArchiveException error) when(IsReferenceDataIssue(error.Code))
+            {
+                diagnostics.Add(new(error.Code,error.Message,LocalizationReferenceLinkStatus.Unresolved,[source]));
+                continue;
+            }
+            if(references.Status!=LocalizationReferenceReadStatus.Verified)
+            {
+                diagnostics.Add(new("ReferenceContainerMissing","The localization source has no supported reference table.",
+                    LocalizationReferenceLinkStatus.Unmatched,[source]));
+                continue;
+            }
+            foreach(var batch in Batch(identities,PointerPageSize))
+            {
+                token.ThrowIfCancellationRequested();
+                var pointers=await session.GetRecordsAsync(batch,token).ConfigureAwait(false);
+                if(pointers.Count<batch.Count)
+                    diagnostics.Add(new("PointerOccurrenceUnavailable","Some pointer occurrences are no longer available in this text index.",
+                        LocalizationReferenceLinkStatus.Unresolved,[source],Count:batch.Count-pointers.Count));
+                foreach(var link in LocalizationDiscovery.ResolvePointerReferences(pointers,references.Relationships))
+                {
+                    if(link.Status==LocalizationReferenceLinkStatus.Linked&&link.TargetResourceType==4091&&
+                       link.TargetResource is { } header&&headerKeys.Contains(header.Key))
+                        AddCandidate(candidates,link.Occurrence.Identity,header);
+                    else if(link.Status!=LocalizationReferenceLinkStatus.Linked)
+                        diagnostics.Add(new("PointerReference"+link.Status,DescribePointerStatus(link.Status),
+                            link.Status,[source],link.Occurrence.Identity));
+                }
+            }
+            sourceLease.EnsureUnchanged();
+        }
+        indexLease.EnsureUnchanged();
+    }
+    private static void AddCandidate(Dictionary<string,(ResourceIdentity Pointer,List<ResourceIdentity> Headers)> candidates,
+        ResourceIdentity pointer,ResourceIdentity header)
+    {
+        if(!candidates.TryGetValue(pointer.Key,out var item))item=(pointer,[]);
+        if(!item.Headers.Any(existing=>existing.Key==header.Key))item.Headers.Add(header);
+        candidates[pointer.Key]=item;
+    }
     private static ResourceRecord FindTopLevelResource(ArchiveSnapshot snapshot,ResourceIdentity identity,uint requiredType,string label)
     {
         if(identity.IndexContentId!=snapshot.IndexContentId||identity.MemberPath is not null||identity.Ordinal<0||identity.Ordinal>=snapshot.Records.Count)

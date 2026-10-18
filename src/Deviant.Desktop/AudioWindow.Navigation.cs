@@ -47,7 +47,7 @@ public partial class AudioWindow
     private CancellationTokenSource navigationCancellation=new();
     private (long Generation,CancellationToken Token) BeginNavigation()
     {workspacePreparation?.NotifyActivity();navigationCancellation.Cancel();navigationCancellation.Dispose();navigationCancellation=new();PauseCommonGroupsForNavigation();return(++navigationGeneration,navigationCancellation.Token);}
-    private void NavigationError(Exception error){HomeStatus.Text=StatusText.Text=LibraryEmpty.Text=error.Message;}
+    private void NavigationError(Exception error){Deviant.Assets.WorkflowDiagnostics.Failure("Workspace.Navigation",error);HomeStatus.Text=StatusText.Text=LibraryEmpty.Text=error.Message;}
 
     private void InitializeNavigation()
     {

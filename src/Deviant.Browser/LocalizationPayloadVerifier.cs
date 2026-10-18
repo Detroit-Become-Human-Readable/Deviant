@@ -21,9 +21,19 @@ public sealed class LocalizationPayloadVerifier
             revisionProvider ?? new FileRevisionProvider(), cancellationToken, verifiedIndexLease), cancellationToken);
     }
 
+    internal Task<LocalizationPayloadVerificationLease> MonitorVolumesAsync(ArchiveSnapshot snapshot,
+        IReadOnlyList<ResourceRecord> eligibleResourceRows, CancellationToken token,
+        LocalizationPayloadVerificationLease verifiedIndexLease)
+    {
+        if(!MetadataCacheSourcePolicy.CanReuseStampHead(snapshot))
+            throw new ArgumentException("Native source stamps are required for volume monitoring.",nameof(snapshot));
+        return Task.Run(()=>VerifyCoreAsync(snapshot,new Dictionary<long,string>(),eligibleResourceRows,
+            new FileRevisionProvider(),token,verifiedIndexLease,verifyDigests:false),token);
+    }
     private static async Task<LocalizationPayloadVerificationLease> VerifyCoreAsync(ArchiveSnapshot snapshot,
         IReadOnlyDictionary<long, string> expectedDigests, IReadOnlyList<ResourceRecord> eligibleResourceRows,
-        ISourceRevisionProvider revisions, CancellationToken token, LocalizationPayloadVerificationLease? verifiedIndexLease)
+        ISourceRevisionProvider revisions, CancellationToken token, LocalizationPayloadVerificationLease? verifiedIndexLease,
+        bool verifyDigests = true)
     {
         SafeFileHandle? indexHandle = null;
         var volumeHandles = new Dictionary<uint, (VolumeSource Source, SafeFileHandle Handle)>();
@@ -72,9 +82,9 @@ public sealed class LocalizationPayloadVerifier
                 volumeHandles.Add(volume.Package, (volume, handle));
             }
 
-            var digestsMatch = expectedDigests.Count == validatedRows.Count;
+            var digestsMatch = !verifyDigests || expectedDigests.Count == validatedRows.Count;
             var hashBuffer = new byte[HashBufferSize];
-            foreach (var (row, volume) in validatedRows)
+            if(verifyDigests)foreach (var (row, volume) in validatedRows)
             {
                 token.ThrowIfCancellationRequested();
                 var handle = volumeHandles[row.Package].Handle;

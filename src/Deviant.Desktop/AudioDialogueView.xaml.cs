@@ -62,6 +62,10 @@ public partial class AudioDialogueView : UserControl
         occurrenceView = CollectionViewSource.GetDefaultView(occurrences);
         occurrenceView.Filter = MatchesLanguage;
         Occurrences.ItemsSource = occurrenceView;
+        if (!value.IsComplete) SetStatus(value.Diagnostics.Any(issue => issue.Code == "LocalizationPending")
+            ? "Indexing dialogue…" : occurrences.Length > 0 ? "Partial dialogue results." : "Dialogue unavailable.");
+        else if (occurrences.Length == 0 && value.Diagnostics.Any(issue => issue.Status is
+            LocalizationReferenceLinkStatus.Unresolved or LocalizationReferenceLinkStatus.Ambiguous)) SetStatus("Dialogue unavailable.");
         UpdateEmptyMessage();
         Advanced.Text = BuildAdvanced(value, null);
     }

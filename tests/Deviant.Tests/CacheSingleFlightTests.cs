@@ -121,7 +121,7 @@ public sealed class CacheSingleFlightTests : IDisposable
     [Fact]
     public async Task PreparedArtifactsSharePreviewQuotaAndEvictionHonorsPins()
     {
-        using var cache = Create(3);
+        using var cache = Create(103);
         await File.WriteAllBytesAsync(Path.Combine(cache.Location, "catalog.bin"), new byte[100]);
         var preview = await cache.AcquireAsync("one", Produce);
         string previewPath = preview.Path;

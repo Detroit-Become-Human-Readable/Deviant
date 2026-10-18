@@ -7,12 +7,14 @@ public sealed class AssetStorageTests : IDisposable
 {
     private readonly string root = Path.Combine(Path.GetTempPath(), "deviant-storage-" + Guid.NewGuid().ToString("N"));
     public AssetStorageTests() => Directory.CreateDirectory(root);
-    [Fact] public async Task PreviewQuotaDoesNotChargeMetadataBytes()
+    [Fact] public async Task OverBudgetMetadataKeepsNewPreviewsTemporary()
     {
-        var cache=new CacheManager(Path.Combine(root,"settings"),new(Path.Combine(root,"cache"),8));
+        using var cache=new CacheManager(Path.Combine(root,"settings"),new(Path.Combine(root,"cache"),8));
         await File.WriteAllBytesAsync(Path.Combine(cache.Location,"catalog.sqlite3"),new byte[100]);
         await using var preview=await cache.AcquireAsync("one",(p,t)=>File.WriteAllBytesAsync(p,new byte[8],t));
-        Assert.StartsWith(cache.Location,preview.Path); Assert.Equal(8,cache.PreviewUsageBytes); Assert.Equal(100,cache.MetadataUsageBytes);
+        Assert.False(preview.Path.StartsWith(cache.Location, StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(0,cache.PreviewUsageBytes); Assert.Equal(100,cache.MetadataUsageBytes);
+        Assert.Equal(8, new FileInfo(preview.Path).Length);
     }
     [Fact] public async Task AliasSurvivesRestartClearAndRelocationAndDoesNotCrossRevision()
     {
