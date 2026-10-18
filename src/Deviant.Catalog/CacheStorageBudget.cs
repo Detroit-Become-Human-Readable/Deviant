@@ -25,8 +25,9 @@ internal sealed class CacheStorageBudget
     private readonly MemoryMappedViewAccessor state;
     private readonly object managerGate = new();
     private readonly Dictionary<long, long> managers = [];
-    private readonly Dictionary<string, (long Epoch, long Length)> fileLengths = new(OperatingSystem.IsWindows()
+    private readonly Dictionary<string, long> fileLengths = new(OperatingSystem.IsWindows()
         ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+    private long cachedEpoch = -1;
     private readonly Dictionary<string, long> unlinkedCharges = new(StringComparer.Ordinal);
     private readonly int slot;
     private long nextManager;
@@ -198,8 +199,9 @@ internal sealed class CacheStorageBudget
             // Another connection may have extended a shared sidecar before this lock was acquired.
             bool unlinked = IsUnlinkedTemporary(path);
             long epoch = state.ReadInt64(32);
-            if (!unlinked && fileLengths.TryGetValue(path, out var cached) && cached.Epoch == epoch)
-                previousLength = cached.Length;
+            if (cachedEpoch != epoch) { fileLengths.Clear(); cachedEpoch = epoch; }
+            if (!unlinked && fileLengths.TryGetValue(path, out var cached))
+                previousLength = cached;
             else
             {
                 try { previousLength = new FileInfo(path).Length; unlinked = false; }
@@ -235,10 +237,12 @@ internal sealed class CacheStorageBudget
     private static bool IsUnlinkedTemporary(string path) => !OperatingSystem.IsWindows() &&
         Path.GetFileName(path).StartsWith(".sqlite-temp-", StringComparison.Ordinal);
 
-    private long AdvanceEpoch()
+    private long AdvanceEpoch(bool invalidateLengths = true)
     {
         long epoch = unchecked(state.ReadInt64(32) + 1);
         state.Write(32, epoch);
+        cachedEpoch = epoch;
+        if (invalidateLengths) fileLengths.Clear();
         return epoch;
     }
 
@@ -341,11 +345,14 @@ internal sealed class CacheStorageBudget
                 if (actualLength == 0) budget.unlinkedCharges.Remove(path);
                 else budget.unlinkedCharges[path] = actualLength;
             }
-            long epoch = budget.AdvanceEpoch();
+            // This process knows exactly which path changed while holding the
+            // root mutex. Other path lengths survive; foreign mutations and
+            // filesystem censuses invalidate the whole local map.
+            budget.AdvanceEpoch(invalidateLengths: false);
             if (!unlinked)
             {
                 if (budget.fileLengths.Count >= 1024) budget.fileLengths.Clear();
-                budget.fileLengths[path] = (epoch, actualLength);
+                budget.fileLengths[path] = actualLength;
             }
             complete = true;
         }
