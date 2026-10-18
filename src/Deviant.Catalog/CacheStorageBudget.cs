@@ -329,6 +329,7 @@ internal sealed class CacheStorageBudget
     {
         private CacheStorageBudget? current = owner;
         private bool complete;
+        public long ReservedLength => checked(previousLength + reservation);
         public void Complete(long actualLength)
         {
             var budget = current ?? throw new ObjectDisposedException(nameof(WriteLease));

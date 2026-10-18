@@ -7,6 +7,7 @@ namespace Deviant.Catalog;
 
 internal interface ICacheStorageWriteLease : IDisposable
 {
+    long ReservedLength { get; }
     // If reconciliation fails, Dispose must leave accounting dirty/conservative
     // until the owner can inventory it again; it must not refund unseen growth.
     void Complete(long actualLength);
@@ -322,16 +323,25 @@ internal static unsafe class CacheStorageVfs
         var current = !OperatingSystem.IsWindows() && state.DeleteOnClose ? FileLength(state, real) : 0;
         var requested = operation switch
         {
-            0 => checked(offset + amount),
+            0 => Round(checked(offset + amount), state.Chunk),
             1 => Round(offset, state.Chunk),
             2 => Round(*(long*)buffer, state.Chunk),
             _ => current
         };
         using var lease = state.Registration.Reserve(state.Path, current, requested);
         if (lease == null) return Full;
+        if (operation == 0)
+        {
+            var result = state.Original->Write(real, buffer, amount, offset);
+            // A successful OS write fits the admitted extent. Keep its upper
+            // bound charged; size observations reconcile any unused padding.
+            // Failed writes still need the actual partial native file length.
+            if (result == Ok) lease.Complete(lease.ReservedLength);
+            else CompleteFile(lease, state, real);
+            return result;
+        }
         try
         {
-            if (operation == 0) return state.Original->Write(real, buffer, amount, offset);
             if (operation == 1) return state.Original->Truncate(real, offset);
             var result = state.Original->FileControl(real, operation == 2 ? SizeHint : ChunkSize, buffer);
             if (operation == 3 && result == Ok) state.Chunk = Math.Max(0, *(int*)buffer);
