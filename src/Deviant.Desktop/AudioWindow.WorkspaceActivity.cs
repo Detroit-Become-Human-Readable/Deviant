@@ -15,6 +15,10 @@ public partial class AudioWindow
             switch (currentView)
             {
                 case "strings": stringsView.CancelActivity(); break;
+                case "audio":
+                    if (pendingDialogueRefresh is not null) stringsView.CancelActivity();
+                    Cancel_Click(sender, e);
+                    break;
                 case "characters":
                     CancelCharacterIndexing(); characterBindingCancellation?.Cancel(); charactersView.CancelPreview();
                     try { await Task.WhenAll(characterCatalogTasks.Concat(characterBindingTasks).ToArray()); } catch { }

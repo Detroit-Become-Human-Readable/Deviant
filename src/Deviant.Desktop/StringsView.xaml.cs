@@ -28,6 +28,7 @@ public partial class StringsView:UserControl,IAsyncDisposable
  public LocalizationRecord? SelectedRecord=>Rows.SelectedItem as LocalizationRecord;
  public event EventHandler? SelectedRecordChanged;
  public event EventHandler? ChoicesChanged;
+ public event EventHandler? EnrichmentFinished;
  public IReadOnlyDictionary<string,string> CaptureFilter()=>new Dictionary<string,string>{{"search",Search.Text},{"language",Languages.SelectedItem as string??"All languages"},{"kind",Kinds.SelectedIndex.ToString()},{"status",Statuses.SelectedIndex.ToString()},{"source",Sources.SelectedItem is LocalizationSourceChoice{Identity.Ordinal:>=0} source?source.Identity.Key:""},{"sort",((SortBox.SelectedItem as AssetSortChoice)?.Sort??AssetSort.Default).ToString()},{"descending",(Descending.IsChecked==true).ToString()}};
  public async Task ApplyFilterAsync(IReadOnlyDictionary<string,string> values,CancellationToken token=default)
  {
@@ -94,7 +95,7 @@ public partial class StringsView:UserControl,IAsyncDisposable
    EndActivity(activity,ReferenceEquals(current,session)?"Failed":null);
    await Dispatcher.InvokeAsync(()=>{if(ReferenceEquals(current,session))Status.Text=e.Message;});
   }
-  finally{if(enrichmentActivityId==activity)enrichmentActivityId=0;}
+  finally{if(enrichmentActivityId==activity)enrichmentActivityId=0;if(ReferenceEquals(current,session))EnrichmentFinished?.Invoke(this,EventArgs.Empty);}
  }
  private void Updated(object? sender,LocalizationSessionUpdate update)
  {_=Dispatcher.InvokeAsync(()=>{if(!ReferenceEquals(sender,session))return;choicesPending=true;Status.Text=$"{update.RecordCount:N0} strings · {update.CompletedResources:N0} / {update.TotalResources:N0} sources";if(enrichmentActivityId!=0)UpdateActivity(enrichmentActivityId,"Indexing strings",update.CompletedResources,update.TotalResources);if(!debounce.IsEnabled)debounce.Start();});}

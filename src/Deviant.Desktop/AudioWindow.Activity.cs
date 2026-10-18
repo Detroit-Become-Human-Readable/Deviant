@@ -123,7 +123,7 @@ public partial class AudioWindow
         "characters" when characterBindingTasks.Any(task => !task.IsCompleted) => new(true, "Reading model details"),
         "characters" when modelView.IsLoading => new(true, modelView.ActivityProgress.Stage, modelView.ActivityProgress.Completed, modelView.ActivityProgress.Total),
         "characters" => new(charactersView.IsPreviewLoading, charactersView.ActivityStatus),
-        "audio" when audioDialogueTasks.Any(task => !task.IsCompleted) => stringsView.ActivityProgress.IsActive
+        "audio" when pendingDialogueRefresh is not null || audioDialogueTasks.Any(task => !task.IsCompleted) => stringsView.ActivityProgress.IsActive
             ? stringsView.ActivityProgress : audioDialogueActivity with { IsActive = true },
         "animation" => animationView.ActivityProgress,
         "shader" => shaderView.ActivityProgress,

@@ -46,7 +46,7 @@ public partial class AudioWindow
     private async Task DrainLibraryTasksAsync(){while(libraryTasks.Count>0){var batch=libraryTasks.ToArray();try{await Task.WhenAll(batch);}catch{}foreach(var task in batch)libraryTasks.Remove(task);}}
     private CancellationTokenSource navigationCancellation=new();
     private (long Generation,CancellationToken Token) BeginNavigation()
-    {workspacePreparation?.NotifyActivity();navigationCancellation.Cancel();navigationCancellation.Dispose();navigationCancellation=new();PauseCommonGroupsForNavigation();return(++navigationGeneration,navigationCancellation.Token);}
+    {pendingDialogueRefresh=null;workspacePreparation?.NotifyActivity();navigationCancellation.Cancel();navigationCancellation.Dispose();navigationCancellation=new();PauseCommonGroupsForNavigation();return(++navigationGeneration,navigationCancellation.Token);}
     private void NavigationError(Exception error){Deviant.Assets.WorkflowDiagnostics.Failure("Workspace.Navigation",error);HomeStatus.Text=StatusText.Text=LibraryEmpty.Text=error.Message;}
 
     private void InitializeNavigation()
@@ -62,6 +62,7 @@ public partial class AudioWindow
         recordsView.OpenCategoryRequested += OpenRecordCategory;
         stringsView.SelectedRecordChanged += (_, _) => SelectionForLibraryChanged();
         stringsView.ChoicesChanged += (_, _) => UpdateExplorerGroups();
+        stringsView.EnrichmentFinished += (_, _) => RefreshPendingAudioDialogue();
         animationView.SelectedResourceChanged+=(_,_)=>SelectionForLibraryChanged();shaderView.SelectedResourceChanged+=(_,_)=>SelectionForLibraryChanged();
         referencesView.SelectedResourceChanged+=(_,_)=>SelectionForLibraryChanged();
         referencesView.RelatedNavigator=NavigateArchiveReferenceAsync;

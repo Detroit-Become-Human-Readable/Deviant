@@ -49,6 +49,75 @@ public sealed class StringsEnrichmentNavigationTests
         finally { progress.Release.TrySetResult(); }
     });
 
+    [Theory]
+    [InlineData("complete")]
+    [InlineData("navigate")]
+    [InlineData("selection")]
+    [InlineData("cancel")]
+    public void SelectedDialogueRefreshesAfterIndexingUnlessNavigationChanged(string action) => WorkspaceCommitTests.Run((window, fixture) =>
+    {
+        DiscoveryFixture.WriteLinkedStrings(fixture.Index);
+        Pump(window.OpenArchiveAsync(fixture.Index));
+        Pump(window.OpenHomeViewAsync("audio"));
+        Wait(() => window.CurrentRows.Count == 1);
+        var row = Assert.Single(window.CurrentRows);
+        ((ListView)window.FindName("MediaList")).SelectedItem = row;
+        var progress = new ProducerGate();
+        window.StringsBrowser.LocalizationSessionFactoryOverride = (snapshot, cache, _, token, revisions) =>
+            LocalizationSession.OpenAsync(snapshot, cache, progress, token, revisions);
+        try
+        {
+            var lookup = window.FindSelectedAudioTextAsync();
+            Pump(progress.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+            Pump(Task.WhenAny(lookup, Task.Delay(TimeSpan.FromSeconds(2))));
+            Assert.True(lookup.IsCompleted, "Selected dialogue waited for global indexing.");
+            Pump(lookup);
+            var early = Assert.IsType<LocalizationAudioLookupResult>(window.AudioDialogueBrowser.CurrentResult);
+            Assert.False(early.IsComplete);
+            var current = Assert.IsType<LocalizationSession>(window.StringsBrowser.CurrentSession);
+            if (action == "navigate") Pump(window.OpenHomeViewAsync("home"));
+            if (action == "selection") ((ListView)window.FindName("MediaList")).SelectedItem = null;
+            if (action == "cancel")
+            {
+                var cancel = (Button)window.FindName("WorkspaceCancelButton");
+                Assert.Equal(System.Windows.Visibility.Visible, cancel.Visibility);
+                cancel.RaiseEvent(new(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
+            }
+            progress.Release.TrySetResult();
+            if (action == "cancel")
+            {
+                Assert.ThrowsAny<OperationCanceledException>(() => Pump(current.EnrichmentTask));
+                Wait(() => ((TextBlock)window.AudioDialogueBrowser.FindName("Status")).Text.Contains("cancelled", StringComparison.OrdinalIgnoreCase));
+                Assert.Same(early, window.AudioDialogueBrowser.CurrentResult);
+            }
+            else Pump(current.EnrichmentTask);
+            if (action == "navigate")
+            {
+                Pump(Task.Delay(400));
+                Assert.Same(early, window.AudioDialogueBrowser.CurrentResult);
+            }
+            else if (action == "selection")
+            {
+                Pump(Task.Delay(400));
+                Assert.Null(window.AudioDialogueBrowser.CurrentResult);
+            }
+            else if (action == "complete")
+            {
+                Pump(WaitForCompletedResult());
+                Assert.True(window.AudioDialogueBrowser.CurrentResult?.IsComplete == true,
+                    "The selected dialogue remained incomplete after indexing finished.");
+                Assert.Single(window.AudioDialogueBrowser.CurrentResult!.Occurrences);
+            }
+            async Task WaitForCompletedResult()
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                try { while (window.AudioDialogueBrowser.CurrentResult?.IsComplete != true) await Task.Delay(10, timeout.Token); }
+                catch (OperationCanceledException) { }
+            }
+        }
+        finally { progress.Release.TrySetResult(); }
+    });
+
     private sealed class ProducerGate : IProgress<LocalizationReadProgress>
     {
         private int entered;

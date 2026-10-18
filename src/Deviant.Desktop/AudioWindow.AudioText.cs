@@ -16,6 +16,9 @@ public partial class AudioWindow
     private SourceRevision? audioDialogueRevision;
     private long audioDialogueGeneration;
     private DialogueReturnContext? dialogueReturnContext;
+    private PendingDialogueRefresh? pendingDialogueRefresh;
+    private sealed record PendingDialogueRefresh(AudioExplorerSession Owner, AudioExplorerRow Row,
+        LocalizationSession Localization, long Generation, CancellationToken RequestToken, CancellationToken NavigationToken);
     private WorkspaceActivityProgress audioDialogueActivity = new(false, "Ready");
     public AudioDialogueView AudioDialogueBrowser => audioDialogueView;
 
@@ -42,6 +45,7 @@ public partial class AudioWindow
         if (row is null && suppressSelectionTracking) return;
         if (audioDialogueIdentity != row?.Identity || audioDialogueRevision != row?.Descriptor.Revision)
         {
+            pendingDialogueRefresh = null;
             audioDialogueSelection.Cancel(); audioDialogueSelection.Dispose(); audioDialogueSelection = new();
             audioDialogueCancellation?.Cancel(); ++audioDialogueGeneration;
             audioDialogueIdentity = row?.Identity; audioDialogueRevision = row?.Descriptor.Revision;
@@ -71,12 +75,13 @@ public partial class AudioWindow
         var headers = current.Catalog.DialogueHeaderAssociations.Where(link => link.AudioResolution.Candidates.Contains(owner))
             .Select(link => link.HeaderIdentity).Distinct().ToArray();
         if (headers.Length == 0) { audioDialogueView.SetStatus(current.AreDialogueHeadersReady ? "No dialogue linked." : "Reading dialogue links…"); return; }
+        pendingDialogueRefresh = null;
         audioDialogueCancellation?.Cancel();
         using var own = CancellationTokenSource.CreateLinkedTokenSource(token, audioDialogueSelection.Token, navigationCancellation.Token);
         audioDialogueCancellation = own; jobCancellation = own;
         audioDialogueActivity = new(true, "Reading dialogue");
         var generation = ++audioDialogueGeneration;
-        var task = FindAudioDialogueCoreAsync(current, row, owner, headers, generation, own.Token);
+        var task = FindAudioDialogueCoreAsync(current, row, owner, headers, generation, own.Token, token);
         audioDialogueTasks.Add(task);
         RefreshActivity();
         try { await task; }
@@ -95,7 +100,7 @@ public partial class AudioWindow
         ReferenceEquals(session, owner) && CurrentRow?.Identity == identity && generation == audioDialogueGeneration;
 
     private async Task FindAudioDialogueCoreAsync(AudioExplorerSession owner, AudioExplorerRow row,
-        ResourceIdentity audio, ResourceIdentity[] headers, long generation, CancellationToken token)
+        ResourceIdentity audio, ResourceIdentity[] headers, long generation, CancellationToken token, CancellationToken requestToken)
     {
         audioDialogueView.SetStatus("Reading dialogue…");
         using var diagnostic = WorkflowDiagnostics.Begin("Audio.Dialogue", audio.Key);
@@ -113,7 +118,15 @@ public partial class AudioWindow
             diagnostic?.Progress("Reading dialogue", 0, null, "occurrences");
             var result = await audioDialogueLookup.FindAudioAsync(localization, audio, headers, token);
             token.ThrowIfCancellationRequested();
-            if (AudioDialogueCurrent(owner, row.Identity, generation)) audioDialogueView.SetResult(result);
+            if (AudioDialogueCurrent(owner, row.Identity, generation))
+            {
+                audioDialogueView.SetResult(result);
+                if (!result.IsComplete && result.Diagnostics.Any(issue => issue.Code == "LocalizationPending"))
+                {
+                    pendingDialogueRefresh = new(owner, row, localization, generation, requestToken, navigationCancellation.Token);
+                    RefreshPendingAudioDialogue();
+                }
+            }
             diagnostic?.Progress("Dialogue available", result.Occurrences.Count, null, "occurrences");
             bool unresolved = result.Occurrences.Count == 0 && result.Diagnostics.Any(issue => issue.Status is
                 LocalizationReferenceLinkStatus.Unresolved or LocalizationReferenceLinkStatus.Ambiguous);
@@ -128,6 +141,42 @@ public partial class AudioWindow
         {
             diagnostic?.Fail(error, error is ArchiveException archive ? archive.Code : null);
             if (AudioDialogueCurrent(owner, row.Identity, generation)) audioDialogueView.SetStatus(error.Message);
+        }
+    }
+
+    private void RefreshPendingAudioDialogue()
+    {
+        if (pendingDialogueRefresh is not { } pending || !pending.Localization.EnrichmentTask.IsCompleted) return;
+        pendingDialogueRefresh = null;
+        var task = RefreshCompletedAudioDialogueAsync(pending);
+        audioDialogueTasks.Add(task);
+        _ = ObserveDialogueRefreshAsync(task);
+    }
+
+    private async Task ObserveDialogueRefreshAsync(Task task)
+    {
+        try { await task; }
+        finally { audioDialogueTasks.Remove(task); RefreshActivity(); }
+    }
+
+    private async Task RefreshCompletedAudioDialogueAsync(PendingDialogueRefresh pending)
+    {
+        await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.Background);
+        if (!AudioDialogueCurrent(pending.Owner, pending.Row.Identity, pending.Generation) ||
+            pending.RequestToken.IsCancellationRequested || pending.NavigationToken.IsCancellationRequested) return;
+        try
+        {
+            if (pending.Localization.EnrichmentTask.IsCanceled)
+                audioDialogueView.SetStatus("Dialogue indexing cancelled.");
+            else if (pending.Localization.EnrichmentTask.IsFaulted || !pending.Localization.IsEnrichmentComplete)
+                audioDialogueView.SetStatus("Dialogue unavailable.");
+            else await RunAudioDialogueLookupAsync(pending.RequestToken);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception error)
+        {
+            WorkflowDiagnostics.Failure("Audio.Dialogue", error);
+            if (AudioDialogueCurrent(pending.Owner, pending.Row.Identity, pending.Generation)) audioDialogueView.SetStatus(error.Message);
         }
     }
 
@@ -172,6 +221,7 @@ public partial class AudioWindow
 
     private async Task ClearAudioDialogueAsync()
     {
+        pendingDialogueRefresh = null;
         audioDialogueSelection.Cancel(); audioDialogueCancellation?.Cancel(); ++audioDialogueGeneration;
         var pending = audioDialogueTasks.ToArray();
         try { await Task.WhenAll(pending); } catch { }

@@ -43,6 +43,7 @@ public partial class StringsView
             if (enrichmentActivityId == activity) enrichmentActivityId = 0;
             if (ReferenceEquals(localizationRetryCancellation, own)) localizationRetryCancellation = null;
             EndActivity(activity, terminal);
+            if (ReferenceEquals(current, session)) EnrichmentFinished?.Invoke(this, EventArgs.Empty);
         }
     }
 
