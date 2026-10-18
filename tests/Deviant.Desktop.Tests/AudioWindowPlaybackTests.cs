@@ -136,6 +136,8 @@ public sealed class AudioWindowPlaybackTests
                 Pump(Task.WhenAll(paging, refresh));
                 Assert.Equal(0, window.CurrentRows[0].Identity.Ordinal);
                 Assert.Equal(Visibility.Visible, Named<Grid>(window, "HomeHost").Visibility);
+                Invoke(window, "ShowBrowse", "audio");
+                Pump(WaitUntilAsync(() => window.CurrentRows[0].Identity.Ordinal == 100));
             }
             finally
             {

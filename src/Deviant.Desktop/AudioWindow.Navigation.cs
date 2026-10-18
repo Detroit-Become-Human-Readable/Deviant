@@ -132,6 +132,7 @@ public partial class AudioWindow
     private void ShowBrowse(string view)
     {
         if (!RequireWorkspaceNavigation()) return;
+        var enteringAudio = view == "audio" && currentView != "audio";
         SelectLibraryTab();
         if (view != "audio") { audioDialogueCancellation?.Cancel(); CancelAudioQueries(); }
         if (view != "physics") SuspendPhysics();
@@ -141,7 +142,11 @@ public partial class AudioWindow
         if (view != "buffer") PauseCommonGroupsForNavigation();
         currentView = view;
         if (view == "records") recordsView.SetCategories(inspectionNavigation.Children);
-        if (view == "audio") EnsureAudioEnrichment();
+        if (view == "audio")
+        {
+            EnsureAudioEnrichment();
+            if (enteringAudio) _ = TrackLibraryTask(QueryAsync(resetOffset: false));
+        }
         HomeHost.Visibility = LibraryHost.Visibility = Visibility.Collapsed; ContentHost.Visibility = Visibility.Visible;
         AudioLayout.Visibility = view == "audio" ? Visibility.Visible : Visibility.Collapsed;
         RecordsHost.Visibility = view == "records" ? Visibility.Visible : Visibility.Collapsed;
