@@ -26,6 +26,7 @@
     <Project Path="src/Deviant.Export.Models/Deviant.Export.Models.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Fixtures/CachePolicyWorker/CachePolicyWorker.csproj" />
     <Project Path="tests/Deviant.Audio.Tests/Deviant.Audio.Tests.csproj" />
     <Project Path="tests/Deviant.Localization.Tests/Deviant.Localization.Tests.csproj" />
     <Project Path="tests/Deviant.Tests/Deviant.Tests.csproj" />

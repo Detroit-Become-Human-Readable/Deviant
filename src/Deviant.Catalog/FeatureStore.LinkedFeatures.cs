@@ -370,7 +370,7 @@ public sealed partial class FeatureStore
         {
             ObjectDisposedException.ThrowIf(linkedReadDisposed, this);
             own = CancellationTokenSource.CreateLinkedTokenSource(token, linkedReadLifetime.Token);
-            read = new(new SqliteConnectionStringBuilder { DataSource = path, Mode = SqliteOpenMode.ReadOnly, Pooling = false }.ToString());
+            read = CreateReaderConnection();
             linkedReadConnections.Add(read);
         }
         try

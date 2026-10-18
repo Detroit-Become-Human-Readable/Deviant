@@ -19,17 +19,29 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
     private long countDataVersion = -1;
     public static FeatureStore Open(ArchiveSnapshot snapshot, string? cacheRoot = null)
     {
+        CacheStorageBudget.ClearFailure();
         cacheRoot ??= Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Deviant", "cache");
         if (DirectoryBoundary.IsWithin(cacheRoot, snapshot.SourceRoot)) throw new ArchiveException("UnsafeCache", "Cache must be outside the archive directory.");
         Directory.CreateDirectory(cacheRoot);
         var key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(IndexLayout.ParserVersion + "\n" + SourceIdentity.IndexCacheKey(snapshot.IndexContentId)))).ToLowerInvariant();
-        return new(Path.Combine(cacheRoot, "catalog-" + key + ".sqlite3"), SourceIdentity.DerivedCacheKey(snapshot.IndexContentId, snapshot.PhysicalSourceStamp));
+        try { return new(Path.Combine(cacheRoot, "catalog-" + key + ".sqlite3"), SourceIdentity.DerivedCacheKey(snapshot.IndexContentId, snapshot.PhysicalSourceStamp)); }
+        catch (SqliteException error) when (error.SqliteErrorCode == 13) { throw CacheStorageBudget.StorageFailure(error); }
     }
     private FeatureStore(string path, string revision)
     {
         this.path = path;
         this.revision = revision;
-        connection = new(new SqliteConnectionStringBuilder { DataSource = path, Mode = SqliteOpenMode.ReadWriteCreate, Pooling = false }.ToString());
+        var storage = CacheStorageBudget.ForRoot(Path.GetDirectoryName(path)!);
+        var builder = new SqliteConnectionStringBuilder { DataSource = path, Mode = SqliteOpenMode.ReadWriteCreate, Pooling = false };
+        if (storage.Limit == 0)
+        {
+            builder.DataSource = "deviant-features-" + Guid.NewGuid().ToString("N");
+            builder.Mode = SqliteOpenMode.Memory; builder.Cache = SqliteCacheMode.Shared;
+        }
+        else builder.Vfs = storage.Vfs;
+        connection = new(builder.ToString());
+        try
+        {
         connection.Open();
         connection.CreateFunction<string, string, bool>("deviant_contains", static (text, term) => text.Contains(term, StringComparison.OrdinalIgnoreCase), isDeterministic: true);
         connection.CreateFunction<string,string>("deviant_natural",static text=>Deviant.Assets.NaturalOrder.Key(text),isDeterministic:true);
@@ -64,6 +76,15 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
         using var temporary=connection.CreateCommand();temporary.CommandText="CREATE TEMP TABLE asset_replacement_keys(identity TEXT PRIMARY KEY); CREATE INDEX IF NOT EXISTS assets_v2_lookup ON assets_v2(revision,family,lookup_key,bank,sort_key,identity)";temporary.ExecuteNonQuery();
         InitializeLocalizationStreamedGroups();
         InitializeLinkedFeatures();
+        }
+        catch { connection.Dispose(); throw; }
+    }
+
+    private SqliteConnection CreateReaderConnection()
+    {
+        var builder = new SqliteConnectionStringBuilder(connection.ConnectionString);
+        if (builder.Mode != SqliteOpenMode.Memory) builder.Mode = SqliteOpenMode.ReadOnly;
+        return new(builder.ToString());
     }
     public T? Load<T>(string key, string version, CancellationToken token = default)
     {
@@ -459,6 +480,12 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
             lock (gate)
             {
                 try { Checkpoint(); }
+                catch (SqliteException error) when (error.SqliteErrorCode == 13)
+                {
+                    // Committed WAL frames remain recoverable when checkpoint duplication needs more space.
+                    Deviant.Assets.AssetLoadDiagnostics.Counters("CacheCheckpointDeferred", revision,
+                        new Dictionary<string, long> { ["SqliteError"] = error.SqliteErrorCode });
+                }
                 finally { connection.Dispose(); disposed = true; }
             }
         }

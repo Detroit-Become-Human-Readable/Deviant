@@ -39,8 +39,7 @@ public sealed partial class FeatureStore
         bool registered = false;
         try
         {
-            read = new SqliteConnection(new SqliteConnectionStringBuilder
-            { DataSource = path, Mode = SqliteOpenMode.ReadOnly, Pooling = false }.ToString());
+            read = CreateReaderConnection();
             read.Open();
             lock (textureReadLifetimeGate)
             {

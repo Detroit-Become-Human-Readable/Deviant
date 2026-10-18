@@ -395,8 +395,7 @@ public sealed partial class FeatureStore
     {
         ObjectDisposedException.ThrowIf(characterReadClosed, this);
         if (characterReadConnection is not null) return characterReadConnection;
-        var read = new SqliteConnection(new SqliteConnectionStringBuilder
-        { DataSource = path, Mode = SqliteOpenMode.ReadOnly, Pooling = false }.ToString());
+        var read = CreateReaderConnection();
         read.Open();
         read.CreateFunction<string, string, bool>("deviant_contains", static (text, term) => text.Contains(term, StringComparison.OrdinalIgnoreCase), isDeterministic: true);
         characterReadConnection = read; return read;

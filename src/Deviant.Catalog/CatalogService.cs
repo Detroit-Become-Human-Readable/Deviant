@@ -33,16 +33,19 @@ public static class CatalogService
         if (IsWithin(cacheRoot, sourceRoot))
             throw new ArchiveException("UnsafeCache", "The catalog cache must be outside the selected archive directory.");
         Directory.CreateDirectory(cacheRoot);
+        var storage = CacheStorageBudget.ForRoot(cacheRoot);
+        if (storage.Limit == 0) return OpenInMemory(snapshot, cancellationToken);
         var key = SourceIdentity.DerivedCacheKey(snapshot.IndexContentId, snapshot.PhysicalSourceStamp);
         var indexKey = SourceIdentity.IndexCacheKey(snapshot.IndexContentId);
         var fileKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(IndexLayout.ParserVersion + "\n" + indexKey))).ToLowerInvariant();
         var indexCacheRoot = Path.Combine(cacheRoot, "raw-index-v1");
         Directory.CreateDirectory(indexCacheRoot);
         var dbPath = Path.Combine(indexCacheRoot, "catalog-" + fileKey + ".sqlite3");
-        var connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = dbPath, Mode = SqliteOpenMode.ReadWriteCreate, Pooling = false }.ToString());
-        connection.Open();
+        var connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = dbPath, Mode = SqliteOpenMode.ReadWriteCreate,
+            Pooling = false, Vfs = storage.Vfs }.ToString());
         try
         {
+            connection.Open();
             ExecuteInterruptible(connection, cancellationToken, () =>
             {
                 using var pragma = connection.CreateCommand();
@@ -81,6 +84,15 @@ public static class CatalogService
             progress?.Report(new(reused ? "Catalog cache ready" : "Catalog index ready", snapshot.Records.Count, snapshot.Records.Count));
             // Keep the reader's fresh snapshot authoritative for validity; the SQLite cache is used for indexed queries.
             return new SqliteResourceCatalog(connection, snapshot, key, reused, snapshot.Records);
+        }
+        catch (Exception error) when (!cancellationToken.IsCancellationRequested &&
+            (error is SqliteException { SqliteErrorCode: 13 } || error is IOException { InnerException: SqliteException { SqliteErrorCode: 13 } }))
+        {
+            connection.Dispose();
+            AssetLoadDiagnostics.Counters("CatalogMemoryFallback", snapshot.IndexContentId,
+                new Dictionary<string, long> { ["StorageLimitBytes"] = storage.Limit, ["Rows"] = snapshot.Records.Count });
+            progress?.Report(new("Catalog index ready", snapshot.Records.Count, snapshot.Records.Count));
+            return OpenInMemory(snapshot, cancellationToken);
         }
         catch
         {
@@ -198,6 +210,7 @@ public static class CatalogService
 
     internal static T ExecuteInterruptible<T>(SqliteConnection connection, CancellationToken token, Func<T> operation)
     {
+        CacheStorageBudget.ClearFailure();
         token.ThrowIfCancellationRequested();
         using var registration = token.CanBeCanceled
             ? token.Register(static state =>
@@ -216,6 +229,10 @@ public static class CatalogService
         catch (SqliteException ex) when (token.IsCancellationRequested)
         {
             throw new OperationCanceledException("SQLite operation was interrupted.", ex, token);
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == 13)
+        {
+            throw CacheStorageBudget.StorageFailure(ex);
         }
     }
 

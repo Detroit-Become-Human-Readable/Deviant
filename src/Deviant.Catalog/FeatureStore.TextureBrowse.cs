@@ -52,8 +52,7 @@ public sealed partial class FeatureStore
         {
             ObjectDisposedException.ThrowIf(textureReadDisposed, this);
             own = CancellationTokenSource.CreateLinkedTokenSource(token, textureReadLifetime.Token);
-            read = new(new SqliteConnectionStringBuilder
-            { DataSource = path, Mode = SqliteOpenMode.ReadOnly, Pooling = false }.ToString());
+            read = CreateReaderConnection();
             activeTextureReadConnections.Add(read);
         }
         try

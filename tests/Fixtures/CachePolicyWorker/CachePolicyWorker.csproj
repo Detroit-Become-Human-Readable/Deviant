@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><AssemblyName>CachePolicyWorker</AssemblyName>
+    <UseAppHost>false</UseAppHost><CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../src/Deviant.Catalog/Deviant.Catalog.csproj" ReferenceOutputAssembly="false" />
+    <Reference Include="Deviant.Catalog">
+      <HintPath>../../../src/Deviant.Catalog/bin/$(Configuration)/$(TargetFramework)/Deviant.Catalog.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

@@ -20,6 +20,7 @@ public sealed partial class CacheManager : IDisposable
     private readonly string settingsPath;
     private TaskCompletionSource drained = NewSignal();
     private CacheSettings settings;
+    private CacheStorageBudget.ManagerLease storagePolicy;
     public CacheManager(string? settingsRoot = null, CacheSettings? initial = null)
     {
         settingsRoot ??= Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Deviant", "settings");
@@ -29,6 +30,7 @@ public sealed partial class CacheManager : IDisposable
             ?? new(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Deviant", "cache"));
         settings = settings with { Location = Path.GetFullPath(settings.Location) };
         ValidateLimit(settings.LimitBytes); ValidateWorkers(settings.Workers); ValidateLocation(Location); Directory.CreateDirectory(Location);
+        storagePolicy = CacheStorageBudget.AttachManager(Location, LimitBytes);
     }
     public string Location => settings.Location;
     public long LimitBytes => settings.LimitBytes;
@@ -175,7 +177,21 @@ public sealed partial class CacheManager : IDisposable
     private async Task SaveSettingsAsync(CacheSettings next, CancellationToken token)
     {
         var temp = settingsPath + ".tmp";
-        try { await File.WriteAllTextAsync(temp, JsonSerializer.Serialize(next), token).ConfigureAwait(false); token.ThrowIfCancellationRequested(); File.Move(temp, settingsPath, true); settings = next; }
+        var previous = settings;
+        var relocated = !string.Equals(previous.Location, next.Location, StringComparison.OrdinalIgnoreCase);
+        var policy = relocated ? CacheStorageBudget.AttachManager(next.Location, next.LimitBytes) : storagePolicy;
+        if (!relocated) policy.UpdateLimit(next.LimitBytes);
+        try
+        {
+            await File.WriteAllTextAsync(temp, JsonSerializer.Serialize(next), token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested(); File.Move(temp, settingsPath, true); settings = next;
+            if (relocated) { var old = storagePolicy; storagePolicy = policy; old.Dispose(); }
+        }
+        catch
+        {
+            if (relocated) policy.Dispose(); else policy.UpdateLimit(previous.LimitBytes);
+            throw;
+        }
         finally { if (File.Exists(temp)) File.Delete(temp); }
     }
     private static IEnumerable<string> Files(string root)

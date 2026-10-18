@@ -157,6 +157,7 @@ public sealed partial class CacheManager
                 await operation.WaitAsync(token).ConfigureAwait(false);
                 try
                 {
+                    using var storage = CacheStorageBudget.ForRoot(location).BeginManagedMutation();
                     ValidateLocation(Path.GetDirectoryName(path)!);
                     RefreshChangedPaths();
                     var size = new FileInfo(temp).Length;
@@ -216,7 +217,12 @@ public sealed partial class CacheManager
     }
     private static string TemporaryPath(string extension) =>
         Path.Combine(Path.GetTempPath(), "Deviant-preview-" + Guid.NewGuid().ToString("N") + extension);
-    private static void DeleteTemporary(string path) { if (File.Exists(path)) File.Delete(path); }
+    private void DeleteTemporary(string path)
+    {
+        if (!File.Exists(path)) return;
+        using var storage = IsLexicallyWithin(path, Location) ? CacheStorageBudget.ForRoot(Location).BeginManagedMutation() : null;
+        File.Delete(path);
+    }
 
     private async Task<string> BeginAcquisitionAsync(CancellationToken token)
     {
@@ -303,7 +309,7 @@ public sealed partial class CacheManager
     public async Task ReconcileAsync(CancellationToken token = default)
     {
         await operation.WaitAsync(token).ConfigureAwait(false);
-        try { token.ThrowIfCancellationRequested(); RebuildCatalog(token); }
+        try { token.ThrowIfCancellationRequested(); RebuildCatalog(token); CacheStorageBudget.ForRoot(Location).Reconcile(); }
         finally { operation.Release(); }
     }
     private long TrackedUsageBytes { get { lock (leaseGate) return totalBytes; } }
@@ -475,6 +481,7 @@ public sealed partial class CacheManager
     }
     private void DeleteEntry(string path)
     {
+        using var storage = CacheStorageBudget.ForRoot(Location).BeginManagedMutation();
         lock (leaseGate)
         {
             if (leases.ContainsKey(path)) throw new IOException("A cached artifact is in use.");
@@ -493,17 +500,20 @@ public sealed partial class CacheManager
         foreach (var candidate in candidates)
         {
             if (required <= LimitBytes && TrackedUsageBytes <= LimitBytes - required) break;
-            lock (leaseGate)
-            {
-                if (leases.ContainsKey(candidate.Key)) continue;
-                ObserveFile(candidate.Key);
-                if (catalog.ContainsKey(candidate.Key)) DeleteEntry(candidate.Key);
-            }
+            lock (leaseGate) if (leases.ContainsKey(candidate.Key)) continue;
+            ObserveFile(candidate.Key);
+            bool exists;
+            lock (leaseGate) exists = catalog.ContainsKey(candidate.Key);
+            if (exists) DeleteEntry(candidate.Key);
         }
     }
     public void Dispose()
     {
-        lock (leaseGate) { disposed = true; watcher?.Dispose(); watcher = null; }
+        lock (leaseGate)
+        {
+            if (!disposed) { disposed = true; watcher?.Dispose(); watcher = null; }
+        }
+        storagePolicy.Dispose();
         GC.SuppressFinalize(this);
     }
     ~CacheManager() { watcher?.Dispose(); }
