@@ -20,6 +20,7 @@ foreach ($name in @('ww2ogg','revorb','vgmstream')) {
     New-Item -ItemType Directory -Path (Join-Path $destinationRoot $name) -Force | Out-Null
 }
 $ww = $trees['ww2ogg']
+& (Join-Path $PSScriptRoot 'Patch-Ww2Ogg.ps1') -SourceDirectory $ww -SourceArchive (Join-Path $sourceRoot 'ww2ogg.zip')
 & (Join-Path $toolchain 'bin/gcc.exe') -O2 -c (Join-Path $ww 'src/crc.c') -o (Join-Path $buildRoot 'crc.o')
 if ($LASTEXITCODE -ne 0) { throw 'ww2ogg CRC build failed' }
 & (Join-Path $toolchain 'bin/g++.exe') -O2 -std=c++98 (Join-Path $ww 'src/ww2ogg.cpp') (Join-Path $ww 'src/wwriff.cpp') (Join-Path $ww 'src/codebook.cpp') (Join-Path $buildRoot 'crc.o') -static -o (Join-Path $destinationRoot 'ww2ogg/ww2ogg.exe')

@@ -567,7 +567,8 @@ public sealed partial class CacheManager
             else { changedPaths.Add(path); if (rescan) rescanPaths.Add(path); }
         }
     }
-    private static bool IsTemporaryEntry(string path) => path.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase);
+    private bool IsTemporaryEntry(string path) => path.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase) &&
+        !IsLexicallyWithin(path, Path.Combine(Location, ScratchDirectory));
     private void RefreshChangedPaths()
     {
         string[] paths;

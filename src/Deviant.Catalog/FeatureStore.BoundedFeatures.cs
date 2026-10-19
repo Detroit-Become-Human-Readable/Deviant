@@ -140,6 +140,7 @@ public sealed partial class FeatureStore
         var preparedAssets = new PreparedBoundedAssetRow[writes.Count];
         for (var index = 0; index < writes.Count; index++)
         {
+            token.ThrowIfCancellationRequested();
             preparedAssets[index] = PrepareBoundedAssetRow(writes[index].Asset);
             totalBytes = checked(totalBytes + System.Text.Encoding.UTF8.GetByteCount(preparedAssets[index].Payload));
             if (totalBytes > MaximumBoundedFeatureBatchBytes) throw new InvalidDataException("The bounded publication batch exceeds its configured size limit.");

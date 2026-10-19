@@ -57,7 +57,7 @@ $bundleSources = Join-Path $destinationRoot 'sources'
 $bundleBuild = Join-Path $destinationRoot 'build'
 New-Item -ItemType Directory -Path $bundleSources,$bundleBuild,(Join-Path $destinationRoot 'ffmpeg') -Force | Out-Null
 Copy-Item -Path (Join-Path $sources '*') -Destination $bundleSources -Force
-foreach ($name in @('Build-AudioTools.ps1','Build-RemuxTools.ps1','Build-Vgmstream.ps1','Seal-AudioTools.ps1')) {
+foreach ($name in @('Build-AudioTools.ps1','Build-RemuxTools.ps1','Patch-Ww2Ogg.ps1','Build-Vgmstream.ps1','Seal-AudioTools.ps1')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination $bundleBuild
 }
 

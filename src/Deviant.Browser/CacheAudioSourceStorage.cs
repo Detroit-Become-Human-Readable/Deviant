@@ -4,8 +4,15 @@ using Deviant.Catalog;
 
 namespace Deviant.Browser;
 
-internal sealed class CacheAudioSourceStorage(CacheManager cache) : IAudioSourceStorage
+internal sealed class CacheAudioSourceStorage(CacheManager cache) : IAudioSourceStorage, IAudioScratchStorage
 {
+    public async Task<AudioSourceLease> CreateAsync(string extension, Func<Stream, CancellationToken, Task> producer,
+        Func<string, CancellationToken, Task<bool>> validator, CancellationToken cancellationToken = default)
+    {
+        var cached = await cache.AcquireScratchOutputAsync(extension, producer, validator, cancellationToken).ConfigureAwait(false);
+        return await PinAsync(cached, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task<AudioSourceLease> AcquireAsync(AudioSourceKey source, Func<Stream, CancellationToken, Task> producer,
         CancellationToken cancellationToken = default)
     {
@@ -21,6 +28,11 @@ internal sealed class CacheAudioSourceStorage(CacheManager cache) : IAudioSource
                 return input.Length == source.Length && StringComparer.OrdinalIgnoreCase.Equals(source.PayloadSha256,
                     Convert.ToHexString(await SHA256.HashDataAsync(input, token).ConfigureAwait(false)));
             }, cancellationToken).ConfigureAwait(false);
+        return await PinAsync(cached, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<AudioSourceLease> PinAsync(CacheLease cached, CancellationToken cancellationToken)
+    {
         try
         {
             cancellationToken.ThrowIfCancellationRequested();

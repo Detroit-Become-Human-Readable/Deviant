@@ -12,6 +12,13 @@ public interface IAudioSourceStorage
         CancellationToken cancellationToken = default);
 }
 
+/// <summary>Admits temporary producer output and retains it until its native consumer finishes.</summary>
+public interface IAudioScratchStorage
+{
+    Task<AudioSourceLease> CreateAsync(string extension, Func<Stream, CancellationToken, Task> producer,
+        Func<string, CancellationToken, Task<bool>> validator, CancellationToken cancellationToken = default);
+}
+
 /// <summary>Holds the decoder input open for reading until the operation releases its storage lease.</summary>
 public sealed class AudioSourceLease : IAsyncDisposable
 {

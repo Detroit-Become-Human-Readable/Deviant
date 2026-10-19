@@ -35,7 +35,7 @@ $configuration = @('--disable-autodetect','--disable-gpl','--disable-nonfree','-
     '--enable-libvorbis','--enable-encoder=libvorbis,pcm_s16le,pcm_s24le,pcm_f32le',
     '--enable-decoder=vorbis,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le',
     '--enable-demuxer=wav,ogg','--enable-muxer=wav,ogg','--enable-parser=vorbis',
-    '--enable-protocol=file','--enable-filter=anull,aformat,aresample,amix,adelay,atrim,asetpts,volume,apad,concat,pan,asetrate,aloop,afade',
+    '--enable-protocol=file,pipe','--enable-filter=anull,aformat,aresample,amix,adelay,atrim,asetpts,volume,apad,concat,pan,asetrate,aloop,afade',
     '--target-os=mingw32','--arch=x86_64','--cc=gcc','--cxx=g++','--prefix=./installed','--pkg-config-flags=--static')
 $ffmpegBuild = Join-Path $buildRoot 'ffmpeg-build'
 New-Item -ItemType Directory -Path $ffmpegBuild -Force | Out-Null

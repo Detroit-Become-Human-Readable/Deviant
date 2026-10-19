@@ -56,8 +56,8 @@ public partial class AudioWindow
                 dialogueReturnContext = null;
         }
         var owner = row is null ? null : DialogueAudioOwner(row);
-        FindDialogueButton.IsEnabled = owner is not null && session?.IsEnrichmentComplete == true && session.AreDialogueHeadersReady &&
-            session.HasDialogueLink(owner) != false;
+        FindDialogueButton.IsEnabled = owner is not null && session is { AreDialogueHeadersReady: true } current &&
+            current.HasDialogueLink(owner) != false;
         ReturnToTextButton.Visibility = dialogueReturnContext is null ? Visibility.Collapsed : Visibility.Visible;
         if (row is null) audioDialogueView.SetStatus("Select a clip");
         else if (owner is not null && session?.HasDialogueLink(owner) is null && audioDialogueView.CurrentResult is null)

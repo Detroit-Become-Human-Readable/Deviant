@@ -159,7 +159,7 @@ internal sealed class AudioCacheWindow : Window
         panel.Children.Add(new TextBlock { Text = "Location", FontWeight = FontWeights.SemiBold });
         panel.Children.Add(location); panel.Children.Add(usage);
         var limitPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 6) };
-        limitPanel.Children.Add(new TextBlock { Text = "Preview quota (GB)", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) });
+        limitPanel.Children.Add(new TextBlock { Text = "Disk cache limit (GB)", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) });
         limit.Text = (cache.LimitBytes / (1024d * 1024 * 1024)).ToString("0.##", CultureInfo.InvariantCulture);
         limitPanel.Children.Add(limit); var save = new Button { Content = "Save limit", Margin = new Thickness(8, 0, 0, 0) };
         save.Click += async (_, _) => await SaveLimitAsync(); limitPanel.Children.Add(save); panel.Children.Add(limitPanel);

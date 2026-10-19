@@ -29,9 +29,13 @@ public sealed partial class AudioExplorerSession
         async Task FlushAsync()
         {
             if(batch.Count==0)return;
+            using var timing=AssetLoadDiagnostics.Measure("AudioRecoveryCheckpoint");
             var persisted=await Task.Run(()=>featureStore.PublishBoundedAssetsBatch(batch,token),token).ConfigureAwait(false);
             if(persisted.Count!=batch.Count)
                 throw new ArchiveException("AudioRecoveryOwnershipConflict","A saved audio entry belongs to another asset family.");
+            if(AssetLoadDiagnostics.CountersEnabled)
+                AssetLoadDiagnostics.Counters("AudioRecoveryCheckpoint",null,new Dictionary<string,long>
+                { ["Rows"]=batch.Count,["PayloadBytes"]=batchBytes });
             batch.Clear();batchBytes=0;
         }
         foreach(var entry in media)

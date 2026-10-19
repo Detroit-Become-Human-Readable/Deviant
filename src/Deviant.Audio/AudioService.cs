@@ -133,93 +133,105 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
         MediaPolicy.RequireConversion(media);
         EnsureExpectedWavSize(media, WavFormat.Pcm16, allowFragment: false);
         await using var workspace = new OperationWorkspace(catalog.Fingerprint);
-        progress?.Report(new AudioProgress("Materializing source", Detail: media.DisplayName));
-        await using var sourceLease = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
-        var source = sourceLease.Path;
-        var candidate = Path.Combine(workspace.DirectoryPath, "ww2ogg-output.ogg");
-        var diagnostics = new List<string>();
-        var remuxPossible = paths.Ww2Ogg is not null && paths.Revorb is not null;
-        AudioWavMetadata? expectedFrames = null;
-        if (remuxPossible)
+        await using var artifacts = new AudioArtifactScope();
+        try
         {
-            if (paths.VgmstreamCli is not null)
+            progress?.Report(new AudioProgress("Materializing source", Detail: media.DisplayName));
+            var sourceLease = artifacts.Add(await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false));
+            var source = sourceLease.Path;
+            var diagnostics = new List<string>();
+            var remuxPossible = paths.Ww2Ogg is not null && paths.Revorb is not null;
+            AudioWavMetadata? expectedFrames = null;
+            AudioSourceLease? decodedSource = null;
+            if (remuxPossible)
             {
-                var expectedWav = Path.Combine(workspace.DirectoryPath, "expected-source.wav");
-                var sourceDecode = await _processes.RunAsync(new ProcessRequest(paths.VgmstreamCli, ["-i", "-W", "1", "-o", expectedWav, source], workspace.DirectoryPath,
-                    Timeout: TimeSpan.FromHours(2), MonitoredOutputFiles: [expectedWav], MaximumOutputFileBytes: _limits.MaximumWavFileBytes), cancellationToken).ConfigureAwait(false);
-                if (sourceDecode.ExitCode == 0 && File.Exists(expectedWav) && new FileInfo(expectedWav).Length > 0)
+                if (paths.VgmstreamCli is not null)
                 {
-                    EnsureFileWithinLimit(expectedWav, _limits.MaximumWavFileBytes, "Measured source WAV exceeds the RIFF output-size limit.");
-                    expectedFrames = ReadWavMetadata(expectedWav);
-                    EnsureWav(expectedFrames);
-                }
-                else diagnostics.Add("Could not measure source sample frames with vgmstream before attempting packet remux: " + JoinDiagnostic(sourceDecode));
-            }
-            progress?.Report(new AudioProgress("Reconstructing Wwise Vorbis", Detail: "ww2ogg"));
-            var codebooks = new[] { paths.PackedCodebooks, paths.PackedCodebooksAoTuV, null }
-                .Where(path => path is null || File.Exists(path)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            var optionSets = new[] { Array.Empty<string>(), new[] { "--full-setup" }, new[] { "--no-mod-packets" }, new[] { "--full-setup", "--no-mod-packets" } };
-            foreach (var codebook in codebooks)
-            {
-                foreach (var optionSet in optionSets)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    if (File.Exists(candidate)) File.Delete(candidate);
-                    var args = new List<string> { source, "-o", candidate };
-                    if (codebook is not null) args.AddRange(["--pcb", codebook]);
-                    args.AddRange(optionSet);
-                    var remux = await _processes.RunAsync(new ProcessRequest(paths.Ww2Ogg!, args, workspace.DirectoryPath,
-                        Timeout: TimeSpan.FromMinutes(10), MonitoredOutputFiles: [candidate], MaximumOutputFileBytes: _limits.MaximumOggFileBytes), cancellationToken).ConfigureAwait(false);
-                    if (remux.ExitCode != 0 || !File.Exists(candidate) || new FileInfo(candidate).Length == 0)
+                    try
                     {
-                        diagnostics.Add("ww2ogg attempt failed: " + JoinDiagnostic(remux));
-                        continue;
+                        decodedSource = artifacts.Add(await DecodeScratchAsync(media, source, workspace.DirectoryPath, progress, cancellationToken).ConfigureAwait(false));
+                        expectedFrames = ReadWavMetadata(decodedSource.Path);
                     }
-                    EnsureFileWithinLimit(candidate, _limits.MaximumOggFileBytes, "Remuxed Ogg exceeds the configured output-size limit.");
-                    var revorb = await _processes.RunAsync(new ProcessRequest(paths.Revorb!, [candidate], workspace.DirectoryPath,
-                        Timeout: TimeSpan.FromMinutes(10), MonitoredOutputFiles: [candidate], MaximumOutputFileBytes: _limits.MaximumOggFileBytes), cancellationToken).ConfigureAwait(false);
-                    var validation = await DecodeOggForValidationAsync(candidate, workspace.DirectoryPath, "remux-validation.wav", cancellationToken).ConfigureAwait(false);
-                    if (validation.Metadata is { } remuxMetadata && validation.Stream is { } remuxStream &&
-                        FramesMatchOptional(expectedFrames, remuxStream) && DecoderLengthMatches(remuxMetadata, remuxStream))
-                        return await CommitOggAsync(candidate, destinationOgg, "ww2ogg + revorb (Wwise Vorbis remux)", [], AudioOperation.WwiseVorbisRemux, remuxMetadata, remuxStream, cancellationToken).ConfigureAwait(false);
-                    if (validation.Stream is { } remuxInfo && expectedFrames is { } expected && !FramesMatch(expected, remuxInfo))
-                        diagnostics.Add($"Remux final-granule mismatch: {DescribeFrameMismatch(expected, remuxInfo)}");
-                    else if (validation.Metadata is { } remuxDecoded && validation.Stream is { } parsedStream && !DecoderLengthMatches(remuxDecoded, parsedStream))
-                        diagnostics.Add($"Remux decoded length does not match its Vorbis granule: {DescribeDecoderMismatch(remuxDecoded, parsedStream)}");
-                    else diagnostics.Add("ww2ogg output failed complete FFmpeg/Ogg validation: " + validation.Diagnostic + (revorb.ExitCode == 0 ? "" : "; revorb: " + JoinDiagnostic(revorb)));
+                    catch (AudioToolException error) when (CanRetryNativeFailure(error))
+                    { diagnostics.Add("Could not measure source sample frames with vgmstream before attempting packet remux: " + error.Message); }
+                }
+                progress?.Report(new AudioProgress("Reconstructing Wwise Vorbis", Detail: "ww2ogg"));
+                var codebooks = new[] { paths.PackedCodebooks, paths.PackedCodebooksAoTuV, null }
+                    .Where(path => path is null || File.Exists(path)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                var optionSets = new[] { Array.Empty<string>(), new[] { "--full-setup" }, new[] { "--no-mod-packets" }, new[] { "--full-setup", "--no-mod-packets" } };
+                foreach (var codebook in codebooks)
+                {
+                    foreach (var optionSet in optionSets)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var args = new List<string> { "--stdout", source };
+                        if (codebook is not null) args.AddRange(["--pcb", codebook]);
+                        args.AddRange(optionSet);
+                        await using var attempt = new AudioArtifactScope();
+                        try
+                        {
+                            var remuxed = attempt.Add(await CreateScratchAsync(".ogg", workspace.DirectoryPath, async (output, token) =>
+                            {
+                                var remux = await _processes.RunBinaryAsync(new ProcessRequest(paths.Ww2Ogg!, args, workspace.DirectoryPath,
+                                    Timeout: TimeSpan.FromMinutes(10)), output, _limits.MaximumOggFileBytes, token).ConfigureAwait(false);
+                                EnsureSuccess(remux, "ww2ogg attempt failed");
+                            }, cancellationToken).ConfigureAwait(false));
+                            var initialValidation = await DecodeOggForValidationAsync(remuxed.Path, workspace.DirectoryPath, cancellationToken).ConfigureAwait(false);
+                            if (initialValidation.Metadata is { } initialMetadata && initialValidation.Stream is { } initialStream &&
+                                FramesMatchOptional(expectedFrames, initialStream) && DecoderLengthMatches(initialMetadata, initialStream))
+                                return await CommitOggAsync(remuxed.Path, destinationOgg, "ww2ogg (Wwise Vorbis remux)", [],
+                                    AudioOperation.WwiseVorbisRemux, initialMetadata, initialStream, cancellationToken).ConfigureAwait(false);
+                            var repaired = attempt.Add(await CreateScratchAsync(".ogg", workspace.DirectoryPath, async (output, token) =>
+                            {
+                                var revorb = await _processes.RunBinaryAsync(new ProcessRequest(paths.Revorb!, [remuxed.Path, "-"], workspace.DirectoryPath,
+                                    Timeout: TimeSpan.FromMinutes(10)), output, _limits.MaximumOggFileBytes, token).ConfigureAwait(false);
+                                EnsureSuccess(revorb, "ReVorb attempt failed");
+                            }, cancellationToken).ConfigureAwait(false));
+                            var candidate = repaired.Path;
+                            var validation = await DecodeOggForValidationAsync(candidate, workspace.DirectoryPath, cancellationToken).ConfigureAwait(false);
+                            if (validation.Metadata is { } remuxMetadata && validation.Stream is { } remuxStream &&
+                                FramesMatchOptional(expectedFrames, remuxStream) && DecoderLengthMatches(remuxMetadata, remuxStream))
+                                return await CommitOggAsync(candidate, destinationOgg, "ww2ogg + revorb (Wwise Vorbis remux)", [], AudioOperation.WwiseVorbisRemux, remuxMetadata, remuxStream, cancellationToken).ConfigureAwait(false);
+                            if (validation.Stream is { } remuxInfo && expectedFrames is { } expected && !FramesMatch(expected, remuxInfo))
+                                diagnostics.Add($"Remux final-granule mismatch: {DescribeFrameMismatch(expected, remuxInfo)}");
+                            else if (validation.Metadata is { } remuxDecoded && validation.Stream is { } parsedStream && !DecoderLengthMatches(remuxDecoded, parsedStream))
+                                diagnostics.Add($"Remux decoded length does not match its Vorbis granule: {DescribeDecoderMismatch(remuxDecoded, parsedStream)}");
+                            else diagnostics.Add("ww2ogg output failed complete FFmpeg/Ogg validation: " + validation.Diagnostic);
+                        }
+                        catch (AudioToolException error) when (CanRetryNativeFailure(error)) { diagnostics.Add(error.Message); }
+                        catch (Exception error) { attempt.Failure = error; throw; }
+                    }
                 }
             }
-        }
-        else diagnostics.Add("ww2ogg and revorb are not both available; using the decode/re-encode path.");
+            else diagnostics.Add("ww2ogg and revorb are not both available; using the decode/re-encode path.");
 
-        RequireTool(paths.VgmstreamCli, "vgmstream-cli (required for fallback decode)");
-        RequireTool(paths.Ffmpeg, "ffmpeg with libvorbis (required for fallback encoding)");
-        progress?.Report(new AudioProgress("Decoding source for re-encoding"));
-        var wav = Path.Combine(workspace.DirectoryPath, "fallback.wav");
-        var decode = await _processes.RunAsync(new ProcessRequest(paths.VgmstreamCli!, ["-i", "-W", "1", "-o", wav, source], workspace.DirectoryPath,
-            Timeout: TimeSpan.FromHours(2), MonitoredOutputFiles: [wav], MaximumOutputFileBytes: _limits.MaximumWavFileBytes), cancellationToken).ConfigureAwait(false);
-        EnsureSuccess(decode, "vgmstream fallback decode failed");
-        EnsureFile(wav, "vgmstream did not create fallback WAV data.");
-        EnsureFileWithinLimit(wav, _limits.MaximumWavFileBytes, "Decoded WAV exceeds the RIFF output-size limit.");
-        EnsureWav(ReadWavMetadata(wav));
-        var encoded = Path.Combine(workspace.DirectoryPath, "fallback.ogg");
-        progress?.Report(new AudioProgress("Encoding Ogg Vorbis", Detail: "quality 5; lossy re-encode"));
-        var ffmpeg = await _processes.RunAsync(new ProcessRequest(paths.Ffmpeg!, ["-v", "error", "-y", "-i", wav,
-            "-map", "0:a:0", "-c:a", "libvorbis", "-q:a", "5", "-f", "ogg", encoded], workspace.DirectoryPath,
-            Timeout: TimeSpan.FromHours(2), MonitoredOutputFiles: [encoded], MaximumOutputFileBytes: _limits.MaximumOggFileBytes), cancellationToken).ConfigureAwait(false);
-        EnsureSuccess(ffmpeg, "FFmpeg Ogg Vorbis encode failed");
-        EnsureFileWithinLimit(encoded, _limits.MaximumOggFileBytes, "Encoded Ogg exceeds the configured output-size limit.");
-        var fallbackValidation = await DecodeOggForValidationAsync(encoded, workspace.DirectoryPath, "fallback-validation.wav", cancellationToken).ConfigureAwait(false);
-        var fallbackSourceMetadata = ReadWavMetadata(wav);
-        if (fallbackValidation.Metadata is not { } fallbackMetadata || fallbackValidation.Stream is not { } fallbackStream)
-            throw new AudioToolException("The encoded Ogg file failed complete decode validation.",
-                string.Join(Environment.NewLine, diagnostics.Append(fallbackValidation.Diagnostic).Where(value => !string.IsNullOrWhiteSpace(value))));
-        if (!FramesMatch(fallbackSourceMetadata, fallbackStream) || !DecoderLengthMatches(fallbackMetadata, fallbackStream))
-            throw new AudioToolException("The encoded Ogg stream does not preserve the source sample range.",
-                string.Join(Environment.NewLine, diagnostics.Append(DescribeFrameMismatch(fallbackSourceMetadata, fallbackStream))
-                    .Append(DescribeDecoderMismatch(fallbackMetadata, fallbackStream))));
-        return await CommitOggAsync(encoded, destinationOgg, "vgmstream decode + FFmpeg libvorbis re-encode q5",
-            diagnostics, AudioOperation.Reencode, fallbackMetadata, fallbackStream, cancellationToken).ConfigureAwait(false);
+            RequireTool(paths.VgmstreamCli, "vgmstream-cli (required for fallback decode)");
+            RequireTool(paths.Ffmpeg, "ffmpeg with libvorbis (required for fallback encoding)");
+            progress?.Report(new AudioProgress("Decoding source for re-encoding"));
+            decodedSource ??= artifacts.Add(await DecodeScratchAsync(media, source, workspace.DirectoryPath, progress, cancellationToken).ConfigureAwait(false));
+            var wav = decodedSource.Path;
+            progress?.Report(new AudioProgress("Encoding Ogg Vorbis", Detail: "quality 5; lossy re-encode"));
+            var encodedLease = artifacts.Add(await CreateScratchAsync(".ogg", workspace.DirectoryPath, async (output, token) =>
+            {
+                var ffmpeg = await _processes.RunBinaryAsync(new ProcessRequest(paths.Ffmpeg!, ["-v", "error", "-nostdin", "-i", wav,
+                    "-map", "0:a:0", "-c:a", "libvorbis", "-q:a", "5", "-f", "ogg", "pipe:1"], workspace.DirectoryPath,
+                    Timeout: TimeSpan.FromHours(2)), output, _limits.MaximumOggFileBytes, token).ConfigureAwait(false);
+                EnsureSuccess(ffmpeg, "FFmpeg Ogg Vorbis encode failed");
+            }, cancellationToken).ConfigureAwait(false));
+            var encoded = encodedLease.Path;
+            var fallbackValidation = await DecodeOggForValidationAsync(encoded, workspace.DirectoryPath, cancellationToken).ConfigureAwait(false);
+            var fallbackSourceMetadata = ReadWavMetadata(wav);
+            if (fallbackValidation.Metadata is not { } fallbackMetadata || fallbackValidation.Stream is not { } fallbackStream)
+                throw new AudioToolException("The encoded Ogg file failed complete decode validation.",
+                    string.Join(Environment.NewLine, diagnostics.Append(fallbackValidation.Diagnostic).Where(value => !string.IsNullOrWhiteSpace(value))));
+            if (!FramesMatch(fallbackSourceMetadata, fallbackStream) || !DecoderLengthMatches(fallbackMetadata, fallbackStream))
+                throw new AudioToolException("The encoded Ogg stream does not preserve the source sample range.",
+                    string.Join(Environment.NewLine, diagnostics.Append(DescribeFrameMismatch(fallbackSourceMetadata, fallbackStream))
+                        .Append(DescribeDecoderMismatch(fallbackMetadata, fallbackStream))));
+            return await CommitOggAsync(encoded, destinationOgg, "vgmstream decode + FFmpeg libvorbis re-encode q5",
+                diagnostics, AudioOperation.Reencode, fallbackMetadata, fallbackStream, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception error) { artifacts.Failure = error; throw; }
     }
 
     public async Task<AudioRenderResult> RenderAsync(
@@ -574,26 +586,36 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
         }
     }
 
-    private async Task<OggValidationResult> DecodeOggForValidationAsync(string input, string workspace, string outputName, CancellationToken cancellationToken)
+    private async Task<OggValidationResult> DecodeOggForValidationAsync(string input, string workspace, CancellationToken cancellationToken)
     {
         if (paths.Ffmpeg is null || !File.Exists(input) || new FileInfo(input).Length < 27 || new FileInfo(input).Length > _limits.MaximumOggFileBytes)
             return new OggValidationResult(null, null, "ffmpeg or a complete Ogg file is unavailable.");
-        var wavPath = Path.Combine(workspace, outputName);
-        var result = await _processes.RunAsync(new ProcessRequest(paths.Ffmpeg,
-            ["-v", "error", "-xerror", "-y", "-i", input, "-map", "0:a:0", "-c:a", "pcm_s16le", "-f", "wav", wavPath],
-            workspace, Timeout: TimeSpan.FromHours(1), MonitoredOutputFiles: [wavPath], MaximumOutputFileBytes: _limits.MaximumWavFileBytes), cancellationToken).ConfigureAwait(false);
-        if (result.ExitCode != 0 || !File.Exists(wavPath) || new FileInfo(wavPath).Length == 0)
-            return new OggValidationResult(null, null, JoinDiagnostic(result));
         try
         {
-            EnsureFileWithinLimit(wavPath, _limits.MaximumWavFileBytes, "Ogg validation WAV exceeds the RIFF output-size limit.");
-            var metadata = ReadWavMetadata(wavPath);
-            EnsureWav(metadata);
-            EnsureWavFormat(metadata, WavFormat.Pcm16);
-            var stream = ReadOggVorbisInfo(input);
-            return new OggValidationResult(metadata, stream, null);
+            await using var artifacts = new AudioArtifactScope();
+            try
+            {
+                var capture = artifacts.Add(await CreateScratchAsync(".wav", workspace, async (output, token) =>
+                {
+                    var result = await _processes.RunBinaryAsync(new ProcessRequest(paths.Ffmpeg,
+                        ["-v", "error", "-xerror", "-nostdin", "-i", input, "-map", "0:a:0", "-map_metadata", "-1",
+                         "-c:a", "pcm_s16le", "-rf64", "never", "-write_bext", "0", "-write_peak", "off", "-f", "wav", "pipe:1"],
+                        workspace, Timeout: TimeSpan.FromHours(1)), output, _limits.MaximumWavFileBytes, token).ConfigureAwait(false);
+                    EnsureSuccess(result, "FFmpeg Ogg validation failed");
+                    token.ThrowIfCancellationRequested();
+                    NormalizeSuccessfulFfmpegWaveCapture(output);
+                    var decoded = ReadWavMetadata(output);
+                    EnsureWav(decoded);
+                    EnsureWavFormat(decoded, WavFormat.Pcm16);
+                }, cancellationToken).ConfigureAwait(false));
+                var metadata = ReadWavMetadata(capture.Path);
+                var stream = ReadOggVorbisInfo(input);
+                return new OggValidationResult(metadata, stream, null);
+            }
+            catch (Exception error) { artifacts.Failure = error; throw; }
         }
-        catch (Exception exception) when (exception is AudioToolException or InvalidDataException or EndOfStreamException)
+        catch (Exception exception) when ((exception is AudioToolException or InvalidDataException or EndOfStreamException) &&
+            !HasArtifactFailure(exception))
         { return new OggValidationResult(null, null, exception.Message); }
     }
 
@@ -657,7 +679,6 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
         var destination = Path.GetFullPath(destinationOgg);
         Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
         var staging = Path.Combine(Path.GetDirectoryName(destination)!, $".{Path.GetFileName(destination)}.{Guid.NewGuid():N}.tmp.ogg");
-        var validationWav = Path.Combine(Path.GetDirectoryName(destination)!, $".{Path.GetFileName(destination)}.{Guid.NewGuid():N}.validation.wav");
         try
         {
             var result = await _processes.RunAsync(new ProcessRequest(paths.Ffmpeg!, ["-v", "error", "-y", "-i", source,
@@ -665,7 +686,7 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
                 Timeout: TimeSpan.FromHours(2), MonitoredOutputFiles: [staging], MaximumOutputFileBytes: _limits.MaximumOggFileBytes), cancellationToken).ConfigureAwait(false);
             EnsureSuccess(result, "FFmpeg Ogg Vorbis encode failed");
             EnsureFileWithinLimit(staging, _limits.MaximumOggFileBytes, "Encoded Ogg exceeds the configured output-size limit.");
-            var validation = await DecodeOggForValidationAsync(staging, Path.GetDirectoryName(staging)!, Path.GetFileName(validationWav), cancellationToken).ConfigureAwait(false);
+            var validation = await DecodeOggForValidationAsync(staging, Path.GetDirectoryName(staging)!, cancellationToken).ConfigureAwait(false);
             if (validation.Metadata is not { } outputMetadata || validation.Stream is not { } outputStream)
                 throw new AudioToolException("The encoded Ogg file did not pass complete decode validation.", validation.Diagnostic);
             if (!FramesMatch(metadata, outputStream) || !DecoderLengthMatches(outputMetadata, outputStream))
@@ -682,7 +703,6 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
         finally
         {
             if (File.Exists(staging)) File.Delete(staging);
-            if (File.Exists(validationWav)) File.Delete(validationWav);
         }
     }
 
@@ -691,7 +711,10 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
 
     private static void EnsureSuccess(ProcessResult result, string operation)
     {
-        if (result.ExitCode != 0) throw new AudioToolException(operation + $" (exit code {result.ExitCode}).", JoinDiagnostic(result));
+        if (result.ExitCode == 0) return;
+        var error = new AudioToolException(operation + $" (exit code {result.ExitCode}).", JoinDiagnostic(result));
+        error.Data["NativeExitCode"] = result.ExitCode;
+        throw error;
     }
 
     private static void EnsureFile(string path, string message)
