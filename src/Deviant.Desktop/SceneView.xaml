@@ -65,14 +65,17 @@
      </StackPanel>
     </StackPanel>
     <local:AssetViewport x:Name="SceneViewport" Grid.Row="1"/>
-    <Grid x:Name="ViewportLoadingOverlay" Grid.Row="1" Background="#B3000000" Visibility="Collapsed">
-     <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*" MaxWidth="320"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-     <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="12">
-      <local:ProcessingAnimation x:Name="ViewportProcessing" Width="128" Height="128" HorizontalAlignment="Center"/>
-      <ProgressBar x:Name="ViewportLoadingProgress" Height="8" Minimum="0" Maximum="1" IsIndeterminate="True" Margin="0,20,0,12"/>
-      <TextBlock x:Name="ViewportLoadingStage" Foreground="#DFE6EF" TextAlignment="Center" TextWrapping="Wrap"/>
-      <TextBlock x:Name="ViewportLoadingCount" Foreground="#DFE6EF" TextAlignment="Center" Margin="0,6,0,0" Visibility="Collapsed"/>
-     </StackPanel>
+    <Grid x:Name="ViewportLoadingOverlay" Grid.Row="1" VerticalAlignment="Bottom" Visibility="Collapsed">
+     <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="3*" MaxWidth="380"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+     <Grid Grid.Column="1" Background="#B3000000" Margin="0,0,0,12">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+      <local:ProcessingAnimation x:Name="ViewportProcessing" Width="48" Height="48" Margin="12" VerticalAlignment="Center"/>
+      <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,12,12,12">
+       <ProgressBar x:Name="ViewportLoadingProgress" Height="8" Minimum="0" Maximum="1" IsIndeterminate="True" Margin="0,0,0,8"/>
+       <TextBlock x:Name="ViewportLoadingStage" Foreground="#DFE6EF" TextAlignment="Center" TextWrapping="Wrap"/>
+       <TextBlock x:Name="ViewportLoadingCount" Foreground="#DFE6EF" TextAlignment="Center" Margin="0,6,0,0" Visibility="Collapsed"/>
+      </StackPanel>
+     </Grid>
     </Grid>
    </Grid>
    <GridSplitter Grid.Column="3" Width="8" HorizontalAlignment="Stretch" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" VerticalAlignment="Stretch"/>

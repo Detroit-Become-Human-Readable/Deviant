@@ -126,10 +126,9 @@ public partial class SceneView
         var viewportLoading = sectionLoadingActive || renderLoadingActive || scenePipelineActive || regionsLoadingActive;
         var hasGeometry = SceneViewport.VisiblePartCount > 0;
         ViewportLoadingOverlay.Visibility = viewportLoading ? Visibility.Visible : Visibility.Collapsed;
-        ViewportLoadingOverlay.VerticalAlignment = hasGeometry ? VerticalAlignment.Bottom : VerticalAlignment.Stretch;
         ViewportLoadingOverlay.IsHitTestVisible = false;
         SceneViewport.IsEnabled = !viewportLoading || hasGeometry;
-        var showAnimation = viewportLoading && !hasGeometry && largeLoadDecision is null;
+        var showAnimation = viewportLoading && largeLoadDecision is null;
         ViewportProcessing.IsActive = showAnimation;
         ViewportProcessing.Visibility = showAnimation ? Visibility.Visible : Visibility.Collapsed;
         ViewportLoadingProgress.Visibility = largeLoadDecision is null ? Visibility.Visible : Visibility.Collapsed;
