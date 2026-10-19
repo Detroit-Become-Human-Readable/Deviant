@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net10.0</TargetFramework><IsTestProject>true</IsTestProject><IsPackable>false</IsPackable></PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="../../src/Deviant.Browser/Deviant.Browser.csproj" />
     <ProjectReference Include="../../src/Deviant.Formats.Scenes/Deviant.Formats.Scenes.csproj" />
     <ProjectReference Include="../../src/Deviant.Assets/Deviant.Assets.csproj" />
     <ProjectReference Include="../../src/Deviant.Formats.Containers/Deviant.Formats.Containers.csproj" />

@@ -131,6 +131,9 @@ public sealed partial class AudioExplorerSession
                 if (media.Identity != stored.Asset.Identity || stored.Asset.Revision != new SourceRevision(Snapshot.IndexContentId, Snapshot.PhysicalSourceStamp) ||
                     !stored.Asset.Metadata.TryGetValue("audio.source-label", out var sourceLabel))
                     throw new InvalidDataException("The cached audio row does not match its source projection.");
+                if (media.Completeness == MediaCompleteness.Unverified &&
+                    media.State is (MediaState.CompleteEmbedded or MediaState.CompleteExternal) && MediaPolicy.CanPreview(media))
+                    media.SourceDeclarationProcessingComplete = true;
                 labelsByIdentity[media.Identity.Key] = sourceLabel;
                 var descriptor = Describe(media, sourceLabel);
                 var row = new AudioExplorerRow(descriptor, media, aliases.Get(media.Identity), UserBankLabel(media));
@@ -146,6 +149,9 @@ public sealed partial class AudioExplorerSession
     private void RememberBrowseRow(AudioExplorerRow row, long serializedBytes)
     {
         var key = row.Identity.Key;
+        if(row.SourceMedia is null&&browseRows.TryGetValue(key,out var resident)&&resident.SelectedSourceVerified&&
+            resident.Descriptor.Revision==row.Descriptor.Revision&&resident.Descriptor.GroupKey==row.Descriptor.GroupKey&&
+            SourceLabel(resident.Descriptor)==SourceLabel(row.Descriptor)) return;
         if (!browseRows.ContainsKey(key)) browseRowOrder.Enqueue(key);
         retainedBrowseBytes -= browseRowBytes.GetValueOrDefault(key);
         // Allow for UTF-16 strings, object/list overhead and references in the decoded metadata.
@@ -176,7 +182,7 @@ public sealed partial class AudioExplorerSession
         lock (catalogGate)
         {
             if (mediaByIdentity.TryGetValue(identity.Key, out media!)) return true;
-            if (browseRows.TryGetValue(identity.Key, out var row)) { media = row.Media; return true; }
+            if (browseRows.TryGetValue(identity.Key, out var row) && row.SourceMedia is { } selected) { media = selected; return true; }
             return false;
         }
     }

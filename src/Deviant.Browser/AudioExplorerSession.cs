@@ -387,6 +387,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         Languages = stagedLanguages.Order(StringComparer.OrdinalIgnoreCase).ToArray();
         Codecs = stagedCodecs.Order(StringComparer.OrdinalIgnoreCase).ToArray();
         ChannelCounts = stagedChannels.Order().ToArray();
+        MergeRecoveryFilterChoices();
     }
 
     private void UpdateStagedMediaFilter(MediaEntry media)
@@ -526,7 +527,6 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         ThrowIfDisposed();
         var cachedPage = await ReadBrowsePageAsync(query, cancellationToken).ConfigureAwait(false);
         if (cachedPage is not null) return cachedPage;
-        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
         if (!IsCatalogLoaded && !hasCachedAudioSnapshot)
             return await ReadRecoveryPageAsync(query, cancellationToken).ConfigureAwait(false);
         var assetQuery = ToAssetQuery(query);
@@ -572,16 +572,11 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
     public async Task SetAliasAsync(ResourceIdentity identity, string? alias, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
+        var selected = await PrepareSelectedMediaAsync(identity, cancellationToken).ConfigureAwait(false);
         await featureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            MediaEntry media;
-            lock (catalogGate)
-            {
-                if (identity.IndexContentId != Snapshot.IndexContentId || !mediaByIdentity.TryGetValue(identity.Key, out media!))
-                    throw new InvalidOperationException("The selected media identity does not belong to this audio catalog revision.");
-            }
+            var media = selected.Media;
             await aliases.SetAsync(identity, alias, cancellationToken).ConfigureAwait(false);
             var descriptor = Describe(media);
             await Task.Run(() => featureStore.UpsertAssets([descriptor], cancellationToken), cancellationToken).ConfigureAwait(false);
@@ -594,15 +589,9 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        if (!HasKnownMedia(identity, out _)) await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
-        MediaEntry media;
-        AssetCapabilities capabilities;
-        lock (catalogGate)
-        {
-            if (identity.IndexContentId != Snapshot.IndexContentId || !HasKnownMedia(identity, out media!))
-                throw new AudioToolException("The selected media identity does not belong to this audio catalog revision.");
-            capabilities = Describe(media).Capabilities;
-        }
+        var selected = await PrepareSelectedMediaAsync(identity, cancellationToken).ConfigureAwait(false);
+        var media = selected.Media;
+        var capabilities = selected.Descriptor.Capabilities;
         if (media.Completeness == MediaCompleteness.Fragment && !partialPreview)
             throw new AudioToolException("Choose Partial preview to audition this fragment.");
         if (partialPreview && media.Completeness != MediaCompleteness.Fragment)
@@ -660,10 +649,10 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
 
     public AudioExportReview Review(IReadOnlyList<AudioExplorerRow> rows)
     {
+        ArgumentNullException.ThrowIfNull(rows);
         ThrowIfDisposed();
-        EnsureAudioInitialized();
-        if (!IsEnrichmentComplete && rows.Count > 0)
-            throw new ArchiveException("ClassificationPending", "Audio rows are not exportable until source declarations finish loading.");
+        if (rows.Any(row => !row.IsHydrated || !IsCatalogLoaded && !row.SelectedSourceVerified))
+            throw new ArchiveException("AudioSourceDetailsRequired", "Load the selected clips before reviewing their export.");
         var byteTotal = 0L;
         foreach (var row in rows) byteTotal = checked(byteTotal + Math.Max(0, row.Media.Slice.Length));
         return new(Snapshot, rows, byteTotal,
@@ -722,9 +711,11 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(identityKeys);
-        var keys = identityKeys.ToArray();
-        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
-        return await Task.Run<IReadOnlyList<AudioExplorerRow>>(() => ResolveSelectionKeys(keys), cancellationToken).ConfigureAwait(false);
+        var keys = identityKeys.Distinct(StringComparer.Ordinal).ToArray();
+        var rows = new List<AudioExplorerRow>(keys.Length);
+        foreach (var page in keys.Chunk(128))
+            rows.AddRange(await PrepareSelectedMediaAsync(page, cancellationToken).ConfigureAwait(false));
+        return rows.AsReadOnly();
     }
 
     public async Task<AudioExportReport> ExportAsync(AudioExportReview review, AudioExportOptions options,
@@ -733,14 +724,13 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(review);
         ArgumentNullException.ThrowIfNull(options);
         ThrowIfDisposed();
-        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
         if (!ReferenceEquals(review.Snapshot, Snapshot) || review.Snapshot.IndexContentId != Snapshot.IndexContentId ||
             review.Snapshot.PhysicalSourceStamp != Snapshot.PhysicalSourceStamp)
             throw new ArchiveException("StaleReview", "The export review belongs to a different archive revision. Review the selection again.");
-        if (!IsEnrichmentComplete)
-            throw new ArchiveException("ClassificationPending", "Conversion is disabled until source declarations finish loading.");
+        var selectedRows = await ReadSelectionAsync(review.Rows.Select(row => row.Identity.Key), cancellationToken).ConfigureAwait(false);
+        review = Review(selectedRows);
         var request = new AudioExportRequest(review.Snapshot,
-            review.Rows.Select(row => new AudioExportSource(row.Identity, row.Media)).ToArray(), IsEnrichmentComplete);
+            review.Rows.Select(row => new AudioExportSource(row.Identity, row.Media)).ToArray(), true);
         var toolRoots = new[] { AppContext.BaseDirectory, Environment.CurrentDirectory, audioTools.ConfiguredDirectory,
             audioTools.VgmstreamCli, audioTools.Ffmpeg, audioTools.Ffprobe, audioTools.Ww2Ogg, audioTools.Revorb,
             audioTools.PackedCodebooks, audioTools.PackedCodebooksAoTuV }
@@ -789,6 +779,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         try { await Task.WhenAll(started).ConfigureAwait(false); }
         catch { /* Disposal drains a failed enrichment just as it drains cancellation. */ }
         await WaitForSharedFeatureLeasesAsync().ConfigureAwait(false);
+        await DisposeSelectedMediaSourcesAsync().ConfigureAwait(false);
         await featureGate.WaitAsync().ConfigureAwait(false);
         try
         {

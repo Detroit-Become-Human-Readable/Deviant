@@ -41,6 +41,10 @@ public sealed class AudioEventNameCacheTests
         await using var cached = await AudioExplorerSession.OpenStagedAsync(fixture.IndexPath, workspace.Cache,
             workspace.Aliases, NoTools, new InlineProgress(progress => phases.Enqueue(progress.Phase)), CancellationToken.None, startEnrichment: false);
         var cachedPage = await cached.QueryAsync(new(Search: "Play_Fixture_Sound"));
+        Assert.False(cached.IsEnrichmentComplete);
+        Assert.Empty(cached.Catalog.Media);
+        Assert.Equal("My clip", Assert.Single(cachedPage.Rows).Label);
+        await cached.LoadCatalogAsync();
         Assert.True(cached.IsEnrichmentComplete);
         Assert.False(cached.IsEnrichmentStarted);
         Assert.Equal(DetroitAudioSnapshotReader.EventMediaVersion, cached.Catalog.EventMediaVersion);

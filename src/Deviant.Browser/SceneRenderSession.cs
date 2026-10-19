@@ -70,6 +70,7 @@ public sealed class SceneRenderSession : IAsyncDisposable
             return await Task.Run(async () =>
             {
             using var largeLoadCapacity = allowLargeData ? budget.AllowLargeSceneLoad() : null;
+            using var metadataCache = new SceneMetadataLeaseCache(snapshot, budget, allowLargeData);
             var document = section.Result.Value ?? throw new ArchiveException("SceneUnavailable", "The scene section is unavailable.");
             if (section.Result.Revision != Revision)
                 throw new ArchiveException("SourceChanged", "The selected scene belongs to another archive revision.");
@@ -84,7 +85,7 @@ public sealed class SceneRenderSession : IAsyncDisposable
                 {
                     using var layout = await ReadLayoutAsync(new(section, instance.Identity,
                         new(Vector3.Zero, Vector3.Zero), SceneRenderScope.Branch) { AllowLargeData = allowLargeData }, progress, linked.Token,
-                        boundsOnly: true).ConfigureAwait(false);
+                        boundsOnly: true, metadataCache: metadataCache).ConfigureAwait(false);
                     issues.AddRange(layout.Issues);
                     if (layout.Occurrences.Count == 0) continue;
                     var bounds = BoundsOf(layout.Occurrences.Select(item => item.Bounds));
@@ -96,7 +97,7 @@ public sealed class SceneRenderSession : IAsyncDisposable
                         previewBounds, layout.Occurrences.Count)
                         { VisibleOccurrenceCount = visible.Length });
                 }
-                catch (ArchiveException error) when (!IsWorkloadLimit(error))
+                catch (ArchiveException error) when (error.Code != "SourceChanged" && !IsWorkloadLimit(error))
                 { issues.Add(new(instance.Identity, error.Code, error.Message)); }
             }
             progress?.Report(new("Regions", document.CatalogInstances.Count, document.CatalogInstances.Count, budget.UsedBytes));
@@ -138,24 +139,37 @@ public sealed class SceneRenderSession : IAsyncDisposable
         if (!fresh.HasIncompleteMaterials && preparedCache is not null && preparation is not null)
         {
             preparedKeys.Add("scene/" + key);
-            preparation.Enqueue("scene/" + key, async cancellation =>
-            {
-                using var publication = await preparedCache.AcquirePreparedAsync("scenes", key, ".scene",
-                    async (path, jobToken) =>
-                    {
-                        await PreparedSceneCodec.WriteAsync(path, key, fresh, jobToken).ConfigureAwait(false);
-                        sourceSession.Session.EnsureCurrent();
-                    }, async (path, jobToken) =>
-                    {
-                        if (!await PreparedSceneCodec.ValidateAsync(path, key, Revision, jobToken).ConfigureAwait(false)) return false;
-                        await sourceSession.Session.VerifyAsync(fresh.SourceExtents, jobToken,
-                            SourceExtentVerifier.MaximumBytes, SourceExtentVerifier.MaximumLargeExtentCount).ConfigureAwait(false);
-                        sourceSession.Session.EnsureCurrent(); return true;
-                    }, cancellation).ConfigureAwait(false);
-                sourceSession.Session.EnsureCurrent();
-            }, fresh.AcquireLease());
+            preparation.Enqueue("scene/" + key, cancellation => StorePreparedSceneAsync(key, fresh, cancellation), fresh.AcquireLease());
         }
         return fresh;
+    }
+
+    internal async Task StorePreparedSceneAsync(string key, RenderAssetSnapshot fresh, CancellationToken token = default)
+    {
+        if (fresh.Revision != Revision)
+            throw new ArchiveException("SourceChanged", "The scene belongs to another archive revision.");
+        var cache = preparedCache ?? throw new InvalidOperationException("Scene preparation storage is unavailable.");
+        try
+        {
+            using var publication = await cache.AcquirePreparedOutputAsync("scenes", key, ".scene",
+                async (output, jobToken) =>
+                {
+                    await PreparedSceneCodec.WriteAsync(output, key, fresh, jobToken).ConfigureAwait(false);
+                    sourceSession.Session.EnsureCurrent();
+                }, async (path, jobToken) =>
+                {
+                    if (!await PreparedSceneCodec.ValidateAsync(path, key, Revision, jobToken).ConfigureAwait(false)) return false;
+                    await sourceSession.Session.VerifyAsync(fresh.SourceExtents, jobToken,
+                        SourceExtentVerifier.MaximumBytes, SourceExtentVerifier.MaximumLargeExtentCount).ConfigureAwait(false);
+                    sourceSession.Session.EnsureCurrent(); return true;
+                }, token).ConfigureAwait(false);
+        }
+        catch (IOException error) when (error.Data["ErrorCode"] is "CacheStorageLimit" || (error.HResult & 0xffff) is 112 or 39)
+        {
+            token.ThrowIfCancellationRequested();
+            AssetLoadDiagnostics.Cache("PreparedSceneStorage", key, false);
+        }
+        sourceSession.Session.EnsureCurrent();
     }
 
     private async Task<RenderAssetSnapshot> LoadUnpreparedAsync(SceneRenderRequest request,
@@ -337,7 +351,8 @@ public sealed class SceneRenderSession : IAsyncDisposable
 
     private async Task<SceneLayoutData> ReadLayoutAsync(SceneRenderRequest request,
         IProgress<RenderLoadProgress>? progress, CancellationToken token, bool boundsOnly = false,
-        Func<LayoutPublication, CancellationToken, Task>? publishLayout = null)
+        Func<LayoutPublication, CancellationToken, Task>? publishLayout = null,
+        SceneMetadataLeaseCache? metadataCache = null)
     {
         using var timing = AssetLoadDiagnostics.Measure("SceneLayout", request.Section.Descriptor.Identity.Key);
         ValidateRequest(request);
@@ -346,7 +361,7 @@ public sealed class SceneRenderSession : IAsyncDisposable
             : request.AllowLargeData ? 512L * 1024 * 1024
             : request.Scope == SceneRenderScope.Scene ? 2 * MaximumGraphBytes : MaximumGraphBytes;
         using var graphMemory = new SceneGraphMemory(budget, graphLimit);
-        graphMemory.Grow(1024 * 1024);
+        TrackGraph(1024 * 1024);
         TrackGraph(section.Objects.Sum(frame => (long)frame.RawPayload.Length + frame.RawHeader.Length + 1024));
         var issues = new List<RenderIssue>();
         var sourceExtents = new List<SourceExtent>(request.Section.Result.Extents);
@@ -396,10 +411,15 @@ public sealed class SceneRenderSession : IAsyncDisposable
                 continue;
             }
             progress?.Report(new("Metadata", work.Count, work.Count + pending.Count + 1, budget.UsedBytes));
-            NativeContainerLease lease;
-            try { lease = await NativeContainerLease.OpenMetadataAsync(snapshot, item.Container, budget, token,
-                allowLargeData: request.AllowLargeData).ConfigureAwait(false); }
-            catch (ArchiveException error) when (IsWorkloadLimit(error)) { throw; }
+            SceneMetadataUse lease;
+            try
+            {
+                lease = metadataCache is not null
+                    ? await metadataCache.AcquireAsync(item.Container, token).ConfigureAwait(false)
+                    : OwnMetadata(await NativeContainerLease.OpenMetadataAsync(snapshot, item.Container, budget, token,
+                        allowLargeData: request.AllowLargeData).ConfigureAwait(false));
+            }
+            catch (ArchiveException error) when (IsWorkloadLimit(error) || metadataCache is not null && error.Code == "SourceChanged") { throw; }
             catch (Exception error) when (error is ArchiveException or IOException or InvalidDataException)
             { AddIssue(issues, new(item.Container, "ContainerUnavailable", error.Message)); continue; }
             try
@@ -421,7 +441,7 @@ public sealed class SceneRenderSession : IAsyncDisposable
                 catalogInstanceCount += metadata.NestedCatalogs.Count;
                 if (catalogInstanceCount > catalogInstanceLimit)
                     throw new ArchiveException("SceneInstanceLimit", "The scene exceeds the catalog instance limit.");
-                using var referenceScratch = graphMemory.ReserveScratch(checked(64L * 1024 + lease.Directory.Objects.Count * 1024L));
+                using var referenceScratch = ReserveGraphScratch(checked(64L * 1024 + lease.Directory.Objects.Count * 1024L));
                 var nativeResolver = new NativeReferenceResolver(lease.Directory);
                 foreach (var nested in metadata.NestedCatalogs)
                 {
@@ -439,6 +459,7 @@ public sealed class SceneRenderSession : IAsyncDisposable
                         nested.World, [.. item.InstancePath, nested.Instance.Identity], [.. item.ContainerPath, child], item.Depth + 1,
                         nested.Instance.InstanceName));
                 }
+                if (metadataCache is not null) lease.EnsureUnchanged();
             }
             finally { lease.Dispose(); }
         }
@@ -451,8 +472,19 @@ public sealed class SceneRenderSession : IAsyncDisposable
 
         void TrackGraph(long bytes)
         {
-            graphMemory.Grow(bytes);
+            try { graphMemory.Grow(bytes); }
+            catch (ArchiveException error) when (error.Code == "AssetMemoryLimit" && metadataCache?.EvictIdle() > 0)
+            { token.ThrowIfCancellationRequested(); graphMemory.Grow(bytes); }
         }
+
+        IDisposable ReserveGraphScratch(long bytes)
+        {
+            try { return graphMemory.ReserveScratch(bytes); }
+            catch (ArchiveException error) when (error.Code == "AssetMemoryLimit" && metadataCache?.EvictIdle() > 0)
+            { token.ThrowIfCancellationRequested(); return graphMemory.ReserveScratch(bytes); }
+        }
+
+        static SceneMetadataUse OwnMetadata(NativeContainerLease owner) => new(owner, owner);
 
         void AddIssue(List<RenderIssue> target, RenderIssue issue)
         {
@@ -468,7 +500,7 @@ public sealed class SceneRenderSession : IAsyncDisposable
             // reservations cover parsed nodes, transform copies, hierarchy work maps,
             // reference indexes and parser objects until this owner has been projected.
             var nodeCount = directory.Objects.Count(frame => frame.NativeType == NodeRecordReader.NativeType);
-            using var ownerScratch = graphMemory.ReserveScratch(checked(1024L * 1024 +
+            using var ownerScratch = ReserveGraphScratch(checked(1024L * 1024 +
                 directory.Objects.Count * 2048L + nodeCount * 8192L +
                 nodeCount * (long)physicalExtents.Count * 32L));
             using var meshMetadataScratch = new RenderResourceGroup();
@@ -489,7 +521,7 @@ public sealed class SceneRenderSession : IAsyncDisposable
             {
                 cancellation.ThrowIfCancellationRequested();
                 using var entityScratch = frame.NativeType is 2009 || frame.NativeType == SceneCatalogInstanceReader.NativeType
-                    ? graphMemory.ReserveScratch(checked(4096L + frame.RawPayload.Length * 32L)) : null;
+                    ? ReserveGraphScratch(checked(4096L + frame.RawPayload.Length * 32L)) : null;
                 if (frame.NativeType == SceneCatalogInstanceReader.NativeType && entityReader.TryRead(frame, out var entity, out _) && entity is not null &&
                     new SceneCatalogInstanceReader().TryRead(frame, entity, out var instance, out _) && instance is not null &&
                     nodeById.TryGetValue(ParseNodeId(entity.Node), out var instanceNode))
@@ -525,7 +557,7 @@ public sealed class SceneRenderSession : IAsyncDisposable
                     if (meshFrame is null) continue;
                     if (!meshMetadata.TryGetValue(meshFrame.Identity, out var metadata))
                     {
-                        var parserScratch = graphMemory.ReserveScratch(checked(4096L + meshFrame.RawPayload.Length * 32L));
+                        var parserScratch = ReserveGraphScratch(checked(4096L + meshFrame.RawPayload.Length * 32L));
                         try
                         {
                             if (!new NativeMeshDataReader().TryRead(meshFrame, out metadata, out _, cancellation) || metadata is null)

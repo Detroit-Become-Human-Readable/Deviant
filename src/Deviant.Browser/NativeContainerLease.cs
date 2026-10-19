@@ -71,6 +71,17 @@ public sealed class NativeContainerLease : IDisposable
     public IReadOnlyList<SourceExtent> PhysicalExtents => SourceExtents;
     public bool IsMetadataOnly { get; }
     public long PreparedMetadataBytes { get { lock (sync) return preparedMetadataBytes; } }
+    internal long RetainedReservationBytes
+    {
+        get
+        {
+            lock (sync)
+            {
+                ObjectDisposedException.ThrowIf(resources is null, this);
+                return resources.OfType<AssetMemoryBudget.Reservation>().Sum(item => item.Bytes);
+            }
+        }
+    }
     internal NativeTexturePayload MetadataSource => storedSource ?? throw new ObjectDisposedException(nameof(NativeContainerLease));
     internal int? MetadataDecodedPrefixLength => metadataDecodedPrefixLength;
     internal bool MetadataSourceIsDirect => metadataSourceIsDirect;

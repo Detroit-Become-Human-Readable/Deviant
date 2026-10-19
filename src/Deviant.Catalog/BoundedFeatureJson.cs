@@ -10,6 +10,8 @@ internal static class BoundedFeatureJson
 {
     private static readonly JsonSerializerOptions CacheOptions = CreateCacheOptions();
 
+    public static string SerializeAsset(AssetDescriptor asset) => JsonSerializer.Serialize(asset, CacheOptions);
+
     public static string Serialize<T>(T value, int limit)
     {
         var buffer = new BoundedBuffer(limit);

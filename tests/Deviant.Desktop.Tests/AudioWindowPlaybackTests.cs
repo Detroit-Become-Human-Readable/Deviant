@@ -496,7 +496,7 @@ public sealed class AudioWindowPlaybackTests
         var identity = new ResourceIdentity(session.Snapshot.IndexContentId, 0);
         var pendingRow = PendingRow(identity, session.Snapshot.PhysicalSourceStamp);
         var pendingError = Assert.Throws<ArchiveException>(() => session.Review([pendingRow]));
-        Assert.Equal("ClassificationPending", pendingError.Code);
+        Assert.Equal("AudioSourceDetailsRequired", pendingError.Code);
 
         await session.EnrichmentTask;
         var page = await session.QueryAsync(new AudioExplorerQuery(Limit: 10));
@@ -512,6 +512,47 @@ public sealed class AudioWindowPlaybackTests
         Assert.Equal(fixture.ExpectedWems[0], exportedBytes);
         Assert.Equal(Convert.ToHexString(SHA256.HashData(exportedBytes)).ToLowerInvariant(), entry.Sha256);
         Assert.Equal(row.Identity.Key, entry.Identity);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SelectedExportPreparationFailureStaysWithinTheAudioWindow(bool partial)
+    {
+        using var fixture = new GeneratedArchive(1);
+        RunSta(() =>
+        {
+            AudioWindow? window = null;
+            try
+            {
+                window = OpenAudioWindow(fixture, new FakeBackendFactory(), new(null, null, null, null, null, null, null));
+                var selected = Assert.Single(window.CurrentRows);
+                Named<ListView>(window, "MediaList").SelectedItem = selected;
+                var selectedRows = (Dictionary<string, AudioExplorerRow>)typeof(AudioWindow).GetField("selectedAudioRows",
+                    BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!;
+                Pump(WaitUntilAsync(() => selectedRows.TryGetValue(selected.Identity.Key, out var row) && row.SelectedSourceVerified));
+                Pump(Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle).Task);
+                using (var features = window.CurrentSession!.AcquireSharedFeatureStore())
+                    features.Store.ReplaceAssets(AudioExplorerSession.AssetFamily, []);
+                string method = partial ? "ExportPartialCoreAsync" : "ExportSelectedCoreAsync";
+                Func<Task> start = () => Assert.IsAssignableFrom<Task>(Invoke(window, method));
+                var operation = Assert.IsAssignableFrom<Task>(Invoke(window, "TrackJobAsync", start));
+
+                var captured = Record.ExceptionAsync(async () => await operation);
+                Pump(captured);
+
+                Assert.Null(captured.Result);
+                Assert.True(operation.IsCompletedSuccessfully);
+                Assert.Contains("no longer present", Status(window), StringComparison.OrdinalIgnoreCase);
+                Assert.Null(ActiveJob(window));
+                Assert.Null(typeof(AudioWindow).GetField("jobCancellation", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window));
+                Assert.False((bool)typeof(AudioWindow).GetField("foregroundBusy", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(window)!);
+                Assert.Empty(window.OwnedWindows);
+                Assert.False(Directory.Exists(Path.Combine(fixture.Root, "exports")));
+                Assert.Null(window.PlayingContext);
+            }
+            finally { if (window is not null) Pump(WindowTestLifetime.CloseAsync(window)); }
+        });
     }
 
     private static AudioWindow OpenAudioWindow(GeneratedArchive fixture, FakeBackendFactory factory, AudioToolPaths tools,

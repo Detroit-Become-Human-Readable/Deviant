@@ -13,6 +13,19 @@ public sealed class FeatureStoreUnchangedPublicationTests : IDisposable
     private string CacheRoot => Path.Combine(root, "cache");
 
     [Fact]
+    public void ExactIdentityAndSemanticLookupKeysSelectTheirOwnRows()
+    {
+        using var store=FeatureStore.Open(Snapshot(),CacheRoot);
+        var first=Asset();
+        var other=first with { Identity=new(first.Identity.IndexContentId,first.Identity.Ordinal+1),LookupKey=first.Identity.Key };
+        store.UpsertAssets([first,other]);
+        Assert.Equal(first.Identity,Assert.Single(store.Query(new(Family:first.Family){ExactIdentityKey=first.Identity.Key})).Identity);
+        Assert.Equal(other.Identity,Assert.Single(store.Query(new(Family:first.Family,ExactKey:first.Identity.Key))).Identity);
+        Assert.Equal(1,store.Count(new(Family:first.Family){ExactIdentityKey=first.Identity.Key}));
+        Assert.Equal(0,store.Count(new(Family:first.Family){ExactIdentityKey=first.Identity.Key+"0"}));
+    }
+
+    [Fact]
     public void IdenticalPublicationReturnsItsIdentityWithoutDatabaseChanges()
     {
         using var store = FeatureStore.Open(Snapshot(), CacheRoot);
@@ -25,6 +38,27 @@ public sealed class FeatureStoreUnchangedPublicationTests : IDisposable
         Assert.Equal(before, Changes(store));
         Assert.Equal("1", Assert.Single(store.QueryCharacterGroups(new(Family: "character-model"), out _))
             .Metadata["model.animation-count"]);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void SwitchingPublicationApisKeepsAnUnchangedAssetGeneration(bool boundedFirst)
+    {
+        using var store = FeatureStore.Open(Snapshot(), CacheRoot);
+        var asset = Asset();
+        var scope = new LinkedFeatureScope("generated-head", "v1", "model", "v1", asset.Family);
+        if (boundedFirst) store.PublishBoundedAssetsBatch([Write(asset)]);
+        else store.UpsertAssets([asset]);
+        var before = store.CaptureLinkedFeatureDependencies(scope);
+        var payload = Scalar(store, "SELECT payload FROM assets_v2 WHERE identity=$identity", asset.Identity.Key);
+
+        if (boundedFirst) store.UpsertAssets([asset]);
+        else store.PublishBoundedAssetsBatch([Write(asset)]);
+
+        Assert.Equal(payload, Scalar(store, "SELECT payload FROM assets_v2 WHERE identity=$identity", asset.Identity.Key));
+        Assert.Equal(before.FamilyEpoch, store.CaptureLinkedFeatureDependencies(scope).FamilyEpoch);
+        Assert.Equal(asset.Identity, Assert.Single(store.Query(new(Family: asset.Family))).Identity);
     }
 
     [Theory]

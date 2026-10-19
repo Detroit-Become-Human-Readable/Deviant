@@ -20,8 +20,23 @@ public static class PreparedSceneCodec
     private const long MaximumOwnedBytes = 2L * 1024 * 1024 * 1024;
     private static readonly JsonSerializerOptions json = new() { IncludeFields = true, MaxDepth = 128 };
 
-    public static async Task WriteAsync(string path, string key, RenderAssetSnapshot source, CancellationToken token = default)
+    public static Task WriteAsync(string path, string key, RenderAssetSnapshot source, CancellationToken token = default)
+        => WriteCoreAsync(() => new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None,
+            1024 * 1024, FileOptions.Asynchronous), true, key, source, token);
+
+    /// <summary>Writes a complete scene to an empty readable, seekable output owned by the caller.</summary>
+    public static Task WriteAsync(Stream output, string key, RenderAssetSnapshot source, CancellationToken token = default)
     {
+        ArgumentNullException.ThrowIfNull(output);
+        if (!output.CanRead || !output.CanWrite || !output.CanSeek || output.Position != 0 || output.Length != 0)
+            throw new ArgumentException("Use an empty readable, writable, seekable output.", nameof(output));
+        return WriteCoreAsync(() => output, false, key, source, token);
+    }
+
+    private static async Task WriteCoreAsync(Func<Stream> openOutput, bool ownsOutput, string key,
+        RenderAssetSnapshot source, CancellationToken token)
+    {
+        ArgumentNullException.ThrowIfNull(source); token.ThrowIfCancellationRequested();
         if (source.HasIncompleteMaterials) throw new InvalidDataException("The scene has incomplete materials.");
         using var held = source.AcquireLease();
         using var scratch = source.MemoryBudget.Reserve(MaximumMetadataBytes + 1024 * 1024, "prepared scene encoding");
@@ -41,7 +56,9 @@ public static class PreparedSceneCodec
             RequiredMaterialKeys = source.Meshes.Values.SelectMany(mesh => mesh.MaterialsByPrimitive?.Values ??
                 Enumerable.Empty<ResourceIdentity>()).Select(identity => identity.Key).Distinct(StringComparer.Ordinal).ToArray()
         };
-        await using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.Asynchronous))
+        var file = openOutput();
+        try
+        {
         using (var writer = new BinaryWriter(file, System.Text.Encoding.UTF8, true))
         {
             writer.Write(Magic); writer.Write(FormatVersion); WriteJson(writer, manifest);
@@ -87,11 +104,13 @@ public static class PreparedSceneCodec
             }
             writer.Flush(); await file.FlushAsync(token).ConfigureAwait(false);
         }
-        await using var input = File.OpenRead(path);
-        var digest = await SHA256.HashDataAsync(input, token).ConfigureAwait(false);
-        input.Close();
-        await using var append = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.None);
-        await append.WriteAsync(digest, token).ConfigureAwait(false);
+        file.Position = 0;
+        var digest = await SHA256.HashDataAsync(file, token).ConfigureAwait(false);
+        file.Seek(0, SeekOrigin.End);
+        await file.WriteAsync(digest, token).ConfigureAwait(false);
+        await file.FlushAsync(token).ConfigureAwait(false);
+        }
+        finally { if (ownsOutput) await file.DisposeAsync().ConfigureAwait(false); }
     }
 
     public static async Task<bool> ValidateAsync(string path, string key, SourceRevision revision, CancellationToken token = default,

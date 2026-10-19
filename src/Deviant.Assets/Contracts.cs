@@ -37,6 +37,7 @@ public sealed record AssetQuery(string? Search = null, string? GroupKey = null, 
     AssetAvailability? Availability = null, AssetCompleteness? Completeness = null, long Offset = 0, int Limit = 100, string? Family = null, string? ExactKey = null,
     AssetSort Sort = AssetSort.Default, bool Descending = false)
 {
+    public string? ExactIdentityKey { get; init; }
     public string? ModelKind { get; init; }
     public string? ModelNameProfile { get; init; }
     public string? CharacterGroup { get; init; }

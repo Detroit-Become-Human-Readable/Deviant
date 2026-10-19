@@ -123,6 +123,9 @@ public sealed class DialogueHeaderAssociationTests
         Assert.False(session.IsEnrichmentStarted);
         Assert.Empty(session.Catalog.Media);
         var page = await session.QueryAsync(new(Limit: 100));
+        Assert.Empty(session.Catalog.Media);
+        Assert.NotEmpty(page.Rows);
+        await session.LoadCatalogAsync();
         Assert.NotEmpty(session.Catalog.Media);
         Assert.NotEmpty(page.Rows);
         Assert.False(session.AreDialogueHeadersReady);

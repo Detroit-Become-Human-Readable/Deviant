@@ -199,14 +199,13 @@ public partial class AssetFamilyView
                 ?? document.Info.MipCount - 1;
             var key = CacheManager.Key(owner.Revision.IndexContentId + ":" + owner.Revision.PhysicalSourceStamp,
                 document.ContentSha256, NativeTextureDecoder.Version + ":bgra-thumbnail-rgb-v2", $"thumbnail:64:mip:{mip}:RGB");
-            await using var lease = await cache.AcquireAsync(key, async (path, cancellation) =>
+            await using var lease = await cache.AcquirePreviewOutputAsync(key, ".png", async (file, cancellation) =>
             {
                 var decoder = new DdsTextureDecoder(128L * 1024 * 1024);
                 var surface = await decoder.DecodeMipAsync(document, mip, cancellation);
                 var thumbnail = decoder.CreateThumbnail(surface, 64, ignoreAlpha: true);
-                await using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
                 PngTextureWriter.Write(file, thumbnail, thumbnail.IsSrgb, cancellation);
-            }, own.Token, ".png");
+            }, own.Token);
             BitmapSource bitmap;
             await using (var stream = new FileStream(lease.Path, FileMode.Open, FileAccess.Read, FileShare.Read))
             {

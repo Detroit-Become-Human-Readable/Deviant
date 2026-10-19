@@ -735,7 +735,8 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
 
     private static BankInfo ParseBankFromSlice(string key, string name, uint expectedId, DataSlice bankSlice,
         ResourceIdentity bankIdentity, ResourceIdentity mediaOwnerIdentity,
-        IReadOnlyDictionary<uint, (string Name, ResourceRecord Resource, bool Verified)> knownNames, AudioCatalog catalog, PackageReader archive)
+        IReadOnlyDictionary<uint, (string Name, ResourceRecord Resource, bool Verified)> knownNames, AudioCatalog catalog, PackageReader archive,
+        (uint Id, int RecordIndex)? selectedMember = null, CancellationToken cancellationToken = default)
     {
         var bank = new BankInfo { Key = key, Identity = bankIdentity, ContainerIdentity = mediaOwnerIdentity with { MemberPath = "bank" }, Name = name, Id = expectedId, Slice = bankSlice };
         var chunks = new Dictionary<string, (long Offset, uint Length)>();
@@ -743,6 +744,7 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
         var chunkCount = 0;
         while (position <= bankSlice.Length - 8)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (++chunkCount > 4096)
             {
                 bank.Diagnostics.Add(new Diagnostic("BankChunkCountLimit", "The bank contains too many chunks to parse safely.", key));
@@ -750,6 +752,8 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
             }
             var header = archive.ReadAt(bankSlice.FilePath, checked(bankSlice.Offset + position), 8, "HIRC");
             var tag = Encoding.ASCII.GetString(header, 0, 4);
+            if (selectedMember is not null && chunks.ContainsKey(tag) && tag is "BKHD" or "DIDX" or "DATA" or "HIRC")
+                bank.Diagnostics.Add(new("AmbiguousBankChunk", "Multiple chunks define the selected bank's media or classification data.", key));
             var size = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(4, 4));
             if (size > bankSlice.Length - position - 8)
             {
@@ -794,12 +798,15 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
                 var mediaOccurrences = new Dictionary<uint, int>();
                 for (var local = 0; local + 12 <= bytes.Length; local += 12)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var row = bytes.AsSpan(local, 12);
                     var mediaId = BinaryPrimitives.ReadUInt32LittleEndian(row[..4]);
                     var mediaOffset = BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(4, 4));
                     var mediaSize = BinaryPrimitives.ReadUInt32LittleEndian(row.Slice(8, 4));
+                    if (selectedMember is { } requested && mediaId != requested.Id) continue;
                     var occurrence = mediaOccurrences.GetValueOrDefault(mediaId);
                     mediaOccurrences[mediaId] = occurrence + 1;
+                    if (selectedMember is { } requestedRecord && local / 12 != requestedRecord.RecordIndex) continue;
                     didxRows.Add((mediaId, mediaOffset, mediaSize, occurrence, local / 12));
                 }
             }
@@ -814,6 +821,8 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
 
         foreach (var (id, offset, size, occurrence, recordIndex) in didxRows)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (selectedMember is { } selected && (selected.Id != id || selected.RecordIndex != recordIndex)) continue;
             if (dataOffset < 0 || offset > dataLength || size > dataLength - offset)
             {
                 var missingKey = $"{key}:media:{id:X8}:{occurrence}";
@@ -851,7 +860,7 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
             if (bank.Version is 118 or 120 && hirc.Length <= MaximumWrapperBytes)
             {
                 var hircBytes = archive.ReadAt(bankSlice.FilePath, checked(bankSlice.Offset + hirc.Offset), checked((int)hirc.Length), "HIRC");
-                ParseHirc(bank, hircBytes, catalog, checked(bankSlice.Offset + hirc.Offset));
+                ParseHirc(bank, hircBytes, catalog, checked(bankSlice.Offset + hirc.Offset), cancellationToken);
             }
             else if (bank.Version is 118 or 120)
                 bank.Diagnostics.Add(new Diagnostic("HIRCSizeLimit", "HIRC metadata exceeds the bounded parsing limit; raw bank export remains available.", key));
@@ -868,6 +877,7 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
                 var offset = 8; var names = new List<NameEvidence>();
                 for (uint index = 0; index < count && index < 100_000; index++)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (offset > bytes.Length - 5) { names.Clear(); break; }
                     var id = BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset));
                     var length = bytes[offset + 4]; offset += 5;
@@ -884,7 +894,8 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
         return bank;
     }
 
-    private static void ParseHirc(BankInfo bank, ReadOnlySpan<byte> bytes, AudioCatalog catalog, long hircOffset)
+    private static void ParseHirc(BankInfo bank, ReadOnlySpan<byte> bytes, AudioCatalog catalog, long hircOffset,
+        CancellationToken cancellationToken = default)
     {
         if (bytes.Length < 4)
         {
@@ -902,6 +913,7 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
         var position = 4;
         for (uint i = 0; i < count; i++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (position > bytes.Length - 9)
             {
                 bank.Diagnostics.Add(new Diagnostic("MalformedHIRC", "The HIRC object header is truncated.", bank.Key));
@@ -940,7 +952,7 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
         }
         if (position != bytes.Length)
             bank.Diagnostics.Add(new Diagnostic("HIRCUnparsedTail", $"HIRC contains {bytes.Length - position} trailing byte(s).", bank.Key));
-        LinkBankObjects(bank);
+        LinkBankObjects(bank, cancellationToken);
     }
 
     private static void ParseLocalization(ReadOnlySpan<byte> bytes, ResourceRecord resource, AudioCatalog catalog)
@@ -1068,10 +1080,11 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
         return true;
     }
 
-    private static void LinkBankObjects(BankInfo bank)
+    private static void LinkBankObjects(BankInfo bank, CancellationToken cancellationToken = default)
     {
         foreach (var parent in bank.Objects.Values)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var missingChildren = parent.Children.Where(childId => !bank.Objects.ContainsKey(childId)).ToArray();
             if (missingChildren.Length > 0)
             {

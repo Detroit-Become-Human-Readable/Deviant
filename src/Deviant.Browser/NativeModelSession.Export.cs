@@ -113,14 +113,31 @@ public sealed partial class NativeModelSession
                         if (preparationCache is not null)
                         {
                             var exportPlan = plan!;
-                            var prepared = await preparationCache.AcquirePlannedTextureAsync(exportPlan.Fingerprint, hdrConversion,
-                                async cancellation =>
+                            Task<(DdsTextureDocument Document, TextureSurface Surface, NativeTextureExportSourceEvidence Evidence)>? producedOriginal = null;
+                            Task<(DdsTextureDocument Document, TextureSurface Surface, NativeTextureExportSourceEvidence Evidence)> ProduceOnce(CancellationToken cancellation)
+                                => producedOriginal ??= ProduceOriginalAsync(cancellation);
+                            async Task<(DdsTextureDocument Document, TextureSurface Surface, NativeTextureExportSourceEvidence Evidence)> ProduceOriginalAsync(CancellationToken cancellation)
+                            {
+                                var decoded = await DecodeOriginalAsync(cancellation).ConfigureAwait(false);
+                                return (decoded.Document, decoded.Surface, textures.CaptureExportEvidence(exportPlan, loadedSource!, cancellation));
+                            }
+                            var prepared = await UseOptionalExportPreparationAsync<
+                                (DdsTextureDocument Document, TextureSurface Surface, NativeTextureExportSourceEvidence Evidence, IAsyncDisposable Lease)>(
+                                () => preparationCache.AcquirePlannedTextureAsync(exportPlan.Fingerprint, hdrConversion,
+                                    ProduceOnce, (evidence, cancellation) => textures.VerifyExportEvidenceAsync(exportPlan, evidence, cancellation),
+                                    CreateContainerSourceValidation(container), MemoryBudget, token),
+                                async () =>
                                 {
-                                    var decoded = await DecodeOriginalAsync(cancellation).ConfigureAwait(false);
-                                    var evidence = textures.CaptureExportEvidence(exportPlan, loadedSource!, cancellation);
-                                    return (decoded.Document, decoded.Surface, evidence);
-                                }, (evidence, cancellation) => textures.VerifyExportEvidenceAsync(exportPlan, evidence, cancellation),
-                                CreateContainerSourceValidation(container), MemoryBudget, token).ConfigureAwait(false);
+                                    container.EnsureUnchanged();
+                                    var uncachedOriginal = await ProduceOnce(token).ConfigureAwait(false);
+                                    var verification = await textures.VerifyExportEvidenceAsync(exportPlan, uncachedOriginal.Evidence, token).ConfigureAwait(false);
+                                    try
+                                    {
+                                        token.ThrowIfCancellationRequested(); container.EnsureUnchanged();
+                                        return (uncachedOriginal.Document, uncachedOriginal.Surface, uncachedOriginal.Evidence, verification);
+                                    }
+                                    catch { verification.Dispose(); throw; }
+                                }, token).ConfigureAwait(false);
                             retained.Add(new ExportPreparationLease(prepared.Lease));
                             document = prepared.Document; surface = prepared.Surface;
                             validation = textures.ExportValidation(exportPlan, prepared.Evidence);
@@ -268,9 +285,20 @@ public sealed partial class NativeModelSession
                             var key = NativeModelExportPreparationCache.MaterialKey(material, primitive, sourceKeys,
                                 bakeTextures, width, height, options.MaximumTexturePixels, token);
                             int diagnosticStart = bakeDiagnostics.Count;
-                            var prepared = await preparationCache.AcquireMapsAsync(key, PreparePrimitiveMapsAsync,
-                                CreateBakeSourceValidation(container, mapValidations), MemoryBudget, token,
-                                () => bakeDiagnostics.Skip(diagnosticStart).ToArray()).ConfigureAwait(false);
+                            Task<IReadOnlyList<FbxStagedMaterialMapInput>>? producedMaps = null;
+                            Task<IReadOnlyList<FbxStagedMaterialMapInput>> ProduceMapsOnce() => producedMaps ??= PreparePrimitiveMapsAsync();
+                            var validateMaps = CreateBakeSourceValidation(container, mapValidations);
+                            var prepared = await UseOptionalExportPreparationAsync<
+                                (IReadOnlyList<FbxStagedMaterialMapInput> Maps, IAsyncDisposable Lease, bool CacheHit, IReadOnlyList<string> Diagnostics)>(
+                                () => preparationCache.AcquireMapsAsync(key, ProduceMapsOnce, validateMaps, MemoryBudget, token,
+                                    () => bakeDiagnostics.Skip(diagnosticStart).ToArray()),
+                                async () =>
+                                {
+                                    await validateMaps(token).ConfigureAwait(false);
+                                    var originalMaps = await ProduceMapsOnce().ConfigureAwait(false);
+                                    token.ThrowIfCancellationRequested(); await validateMaps(token).ConfigureAwait(false);
+                                    return (originalMaps, EmptyExportPreparationLease.Instance, false, Array.Empty<string>());
+                                }, token).ConfigureAwait(false);
                             retained.Add(new ExportPreparationLease(prepared.Lease));
                             if (prepared.CacheHit)
                             {
@@ -474,7 +502,28 @@ public sealed partial class NativeModelSession
     private static Func<string, string, CancellationToken, Task<TextureExportResult>> CreatePreparedMediaPublisher(
         NativeModelExportPreparationCache cache, string key, DdsTextureDocument document, TextureSurface surface,
         string sourceRoot, Func<CancellationToken, Task> validate, AssetMemoryBudget budget) => (stageRoot, name, cancellation) =>
-            cache.PublishTextureMediaAsync(key, document, surface, sourceRoot, stageRoot, name, validate, budget, cancellation);
+            UseOptionalExportPreparationAsync(
+                () => cache.PublishTextureMediaAsync(key, document, surface, sourceRoot, stageRoot, name, validate, budget, cancellation),
+                () => new TextureExportService().ExportAsync(document, surface, surface.IsHdr ? AssetExportFormat.Dds : AssetExportFormat.Png,
+                    sourceRoot, stageRoot, name, cancellationToken: cancellation, expectedRevision: document.Revision, preCommitValidation: validate),
+                cancellation);
+
+    internal static async Task<T> UseOptionalExportPreparationAsync<T>(Func<Task<T>> prepared, Func<Task<T>> fallback,
+        CancellationToken token = default)
+    {
+        try { return await prepared().ConfigureAwait(false); }
+        catch (IOException error) when (error.Data["ErrorCode"] is "CacheStorageLimit" || (error.HResult & 0xffff) is 112 or 39)
+        {
+            token.ThrowIfCancellationRequested();
+            return await fallback().ConfigureAwait(false);
+        }
+    }
+
+    private sealed class EmptyExportPreparationLease : IAsyncDisposable
+    {
+        internal static readonly EmptyExportPreparationLease Instance = new();
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
 
     private Func<CancellationToken, Task> CreateTextureSourceValidation(NativeTextureValidationSnapshot snapshot) => async cancellation =>
     {

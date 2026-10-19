@@ -67,6 +67,17 @@ public sealed partial class CacheManager
             extension.ToLowerInvariant(), validator, Path.Combine("prepared-v1", category), producer);
     }
 
+    /// <summary>Acquires a preview whose output is admitted before disk growth.</summary>
+    public Task<CacheLease> AcquirePreviewOutputAsync(string key, string extension,
+        Func<Stream, CancellationToken, Task> producer, CancellationToken token = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(key);
+        ArgumentNullException.ThrowIfNull(producer);
+        if (extension is not (".wav" or ".png"))
+            throw new ArgumentException("Use a WAV or PNG cache entry.", nameof(extension));
+        return AcquireCoreAsync(key, null, token, extension, null, outputProducer: producer);
+    }
+
     /// <summary>Produces an admitted bake in the existing material-bake cache namespace.</summary>
     public Task<CacheLease> AcquireMaterialBakeOutputAsync(string key, Func<Stream, CancellationToken, Task> producer,
         Func<string, CancellationToken, Task<bool>> validate, CancellationToken token = default)

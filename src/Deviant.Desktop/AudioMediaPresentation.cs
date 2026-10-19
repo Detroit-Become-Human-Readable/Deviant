@@ -7,7 +7,8 @@ internal static class AudioMediaPresentation
 {
     public static string Details(AudioExplorerRow row)
     {
-        var media = row.Media;
+        if (row.SourceMedia is not { } media)
+            return string.Join(" · ", new[] { row.Bank, row.Descriptor.Language, row.Descriptor.Codec }.Where(value => !string.IsNullOrWhiteSpace(value)));
         var heading = $"{row.Bank} · {media.Language} · {media.Codec}";
         if (media.Midi is not { } midi)
             return $"{heading} · {media.Duration?.ToString("F2", CultureInfo.InvariantCulture) ?? "—"} s · {media.Channels} ch\n{row.CompletenessBadge}";

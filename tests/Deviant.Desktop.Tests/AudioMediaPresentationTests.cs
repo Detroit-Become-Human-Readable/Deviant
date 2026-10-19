@@ -8,6 +8,16 @@ namespace Deviant.Desktop.Tests;
 
 public sealed class AudioMediaPresentationTests
 {
+    [Fact]
+    public void DescriptorOnlyDetailsDoNotRequireAMediaPayload()
+    {
+        var identity=new ResourceIdentity("generated-index",0,"wem");
+        var row=new AudioExplorerRow(new(identity,new("generated-index","revision"),"audio.media","Clip",null,
+            AssetAvailability.Available,AssetCompleteness.Unverified,AssetCapabilities.None,[],[],"English","PCM"),null!,null);
+        Assert.Equal("Standalone · English · PCM",AudioMediaPresentation.Details(row));
+        Assert.False(row.CanPreview);
+        Assert.False(row.CanExportOriginal);
+    }
     [Theory]
     [InlineData(480, "480 PPQN")]
     [InlineData(0xe850, "SMPTE 24 fps · 80 ticks/frame")]

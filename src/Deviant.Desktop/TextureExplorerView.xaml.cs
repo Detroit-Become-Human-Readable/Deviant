@@ -722,15 +722,14 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
             var mip = document.MipLevels.FirstOrDefault(level => Math.Max(level.Width, level.Height) <= 128)?.Index ?? document.Info.MipCount - 1;
             var key = CacheManager.Key(owner.Revision.IndexContentId + ":" + owner.Revision.PhysicalSourceStamp,
                 NativeTextureSession.SourceVersion(source) + ":" + document.ContentSha256, NativeTextureDecoder.Version + ":discovery-thumbnail-rgb-v2", $"thumbnail:128:mip:{mip}:RGB");
-            await using var lease = await thumbnailCache.AcquireAsync(key, async (path, cancellation) =>
+            await using var lease = await thumbnailCache.AcquirePreviewOutputAsync(key, ".png", async (file, cancellation) =>
             {
                 var decoder = new DdsTextureDecoder(128L * 1024 * 1024);
                 var surface = await decoder.DecodeMipAsync(document, mip, cancellation);
                 if (surface.IsHdr) surface = HdrDisplayTransform.ToSdr(surface, cancellationToken: cancellation);
                 var thumbnail = decoder.CreateThumbnail(surface, 128, ignoreAlpha: true);
-                await using var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
                 PngTextureWriter.Write(file, thumbnail, thumbnail.IsSrgb, cancellation);
-            }, own.Token, ".png");
+            }, own.Token);
             BitmapSource bitmap;
             await using (var stream = new FileStream(lease.Path, FileMode.Open, FileAccess.Read, FileShare.Read))
             { bitmap = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad).Frames[0]; bitmap.Freeze(); }

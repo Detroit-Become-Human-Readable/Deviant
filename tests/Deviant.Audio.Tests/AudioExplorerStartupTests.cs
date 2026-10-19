@@ -120,7 +120,7 @@ public sealed class AudioExplorerStartupTests
     }
 
     [Fact]
-    public async Task ConcurrentFirstAudioQueriesRestoreWarmMetadataOnceAndPreserveAliases()
+    public async Task ConcurrentMetadataQueriesKeepLegacySnapshotDeferredAndExplicitRestoreRunsOnce()
     {
         using var fixture = FormatsFixtureBuilder.CreateAudioCatalog();
         using var workspace = new StartupWorkspace();
@@ -141,10 +141,14 @@ public sealed class AudioExplorerStartupTests
         session.Updated += (_, update) => { if (update.Phase == "Loaded cached audio metadata") Interlocked.Increment(ref updates); };
         var pages = await Task.WhenAll(Enumerable.Range(0, 12).Select(_ => session.QueryAsync(new(Limit: 100))))
             .WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.Equal(1, observations.Count); Assert.Equal(1, updates);
-        Assert.All(pages, page => Assert.Equal(session.Catalog.Media.Count, page.Total));
+        Assert.Equal(0, observations.Count); Assert.Equal(0, updates);
+        Assert.Empty(session.Catalog.Media);
         var selectedRow = Assert.Single(await session.ReadSelectionAsync([selected]));
         Assert.Equal("Generated alias", selectedRow.Label);
+        Assert.False(session.IsEnrichmentComplete);
+        await Task.WhenAll(Enumerable.Range(0,12).Select(_=>session.LoadCatalogAsync()));
+        Assert.Equal(1, observations.Count); Assert.Equal(1, updates);
+        Assert.All(pages, page => Assert.Equal(session.Catalog.Media.Count, page.Total));
         Assert.True(session.IsEnrichmentComplete); Assert.True(session.AreDialogueHeadersReady);
         Assert.False(session.IsEnrichmentStarted);
     }
@@ -446,6 +450,7 @@ public sealed class AudioExplorerStartupTests
 
         await using var warm = await AudioExplorerSession.OpenStagedAsync(fixture.IndexPath,
             workspace.Cache, workspace.Aliases, NoTools, null, CancellationToken.None, startEnrichment: false);
+        await warm.LoadCatalogAsync();
         var page = await warm.QueryAsync(new());
         var cached = Assert.Single(page.Rows);
         Assert.True(warm.IsEnrichmentComplete);

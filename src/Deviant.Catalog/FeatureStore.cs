@@ -217,7 +217,7 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
                 command.Parameters["$bank"].Value = (object?)asset.GroupKey ?? DBNull.Value; command.Parameters["$language"].Value = (object?)asset.Language ?? DBNull.Value;
                 command.Parameters["$codec"].Value = (object?)asset.Codec ?? DBNull.Value; command.Parameters["$duration"].Value = (object?)asset.DurationSeconds ?? DBNull.Value;
                 command.Parameters["$channels"].Value = (object?)asset.Channels ?? DBNull.Value; command.Parameters["$availability"].Value = (int)asset.Availability;
-                command.Parameters["$completeness"].Value = (int)asset.Completeness; command.Parameters["$payload"].Value = JsonSerializer.Serialize(asset); command.ExecuteNonQuery();
+                command.Parameters["$completeness"].Value = (int)asset.Completeness; command.Parameters["$payload"].Value = BoundedFeatureJson.SerializeAsset(asset); command.ExecuteNonQuery();
                 if (characterProjectionWritesEnabled && asset.Family == "character-model")
                 {
                     using var row = connection.CreateCommand(); row.Transaction = transaction;
@@ -382,7 +382,7 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
         var indexHint=useTrigram?" NOT INDEXED":query.GroupKey is not null&&query.ExactKey is null?" INDEXED BY assets_v2_bank":"";
         if(!useTrigram&&query.GroupKey is null&&query.Sort==Deviant.Assets.AssetSort.Name&&query.Language is not null&&query.Family is not null)
             indexHint=" INDEXED BY assets_v2_language";
-        if(select=="row_id"&&query.Sort is Deviant.Assets.AssetSort.Name or Deviant.Assets.AssetSort.Default&&query.Family is not null&&query.GroupKey is null&&string.IsNullOrWhiteSpace(query.Search)&&query.ExactKey is null&&query.Language is null&&query.Codec is null&&query.Channels is null&&query.Availability is null&&query.Completeness is null&&query.MinimumDuration is null&&query.MaximumDuration is null)
+        if(select=="row_id"&&query.Sort is Deviant.Assets.AssetSort.Name or Deviant.Assets.AssetSort.Default&&query.Family is not null&&query.GroupKey is null&&string.IsNullOrWhiteSpace(query.Search)&&query.ExactKey is null&&query.ExactIdentityKey is null&&query.Language is null&&query.Codec is null&&query.Channels is null&&query.Availability is null&&query.Completeness is null&&query.MinimumDuration is null&&query.MaximumDuration is null)
             indexHint=query.Sort==Deviant.Assets.AssetSort.Name?(allowNameIndex?" INDEXED BY assets_v2_name_v1":""):" INDEXED BY assets_v2_family_sort";
         var command = (readConnection ?? connection).CreateCommand(); command.Transaction = transaction;
         command.CommandText = $"SELECT {select} FROM assets_v2{indexHint} WHERE revision=$revision";
@@ -400,6 +400,7 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
         }
         Filter("bank", "=", query.GroupKey); Filter("language", "=", query.Language); Filter("codec", "=", query.Codec);
         Filter("lookup_key", "=", query.ExactKey);
+        Filter("identity", "=", query.ExactIdentityKey);
         Filter("family", "=", query.Family);
         if (query.CachedPayloadFilter is { } cachedPayload)
         {

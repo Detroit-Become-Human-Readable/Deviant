@@ -30,6 +30,7 @@ public partial class AudioWindow
 
     private ResourceIdentity? DialogueAudioOwner(AudioExplorerRow row)
     {
+        if (!row.IsHydrated) return null;
         var current = session;
         var identity = row.Identity;
         if (current is null || identity.IndexContentId != current.Snapshot.IndexContentId ||

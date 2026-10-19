@@ -49,7 +49,7 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
         using var scratch = budget.Reserve(256 * 1024, "prepared texture media streaming");
         try
         {
-            await using var lease = await cache.AcquirePreparedAsync("export-encoded", key, ".encoded", async (path, cancellation) =>
+            await using var lease = await cache.AcquirePreparedOutputAsync("export-encoded", key, ".encoded", async (output, cancellation) =>
             {
                 string root = Path.Combine(Path.GetTempPath(), "Deviant-export-" + Guid.NewGuid().ToString("N"));
                 try
@@ -61,7 +61,6 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
                         expectedRevision: document.Revision, preCommitValidation: validateSource).ConfigureAwait(false);
                     byte[] json = JsonSerializer.SerializeToUtf8Bytes(new MediaHeader(key, Profile, result));
                     if (json.Length > MaximumHeaderBytes) throw new InvalidDataException("PreparedMediaHeaderLimit");
-                    await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
                     byte[] prefix = new byte[12]; "DVEPMED1"u8.CopyTo(prefix); BinaryPrimitives.WriteInt32LittleEndian(prefix.AsSpan(8), json.Length);
                     await output.WriteAsync(prefix, cancellation).ConfigureAwait(false); await output.WriteAsync(json, cancellation).ConfigureAwait(false);
                     await using var input = new FileStream(Path.Combine(root, result.RelativePath), FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous);
@@ -251,10 +250,10 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
         var leases = new LeaseSet();
         try
         {
-            var bundle = await cache.AcquirePreparedAsync("export-maps", key, ".maps", async (path, cancellation) =>
+            var bundle = await cache.AcquirePreparedOutputAsync("export-maps", key, ".maps", async (output, cancellation) =>
             {
                 cancellation.ThrowIfCancellationRequested(); created = await producer().ConfigureAwait(false);
-                await WriteMapsAsync(path, key, created, diagnostics?.Invoke() ?? [], cancellation).ConfigureAwait(false);
+                await WriteMapsAsync(output, key, created, diagnostics?.Invoke() ?? [], cancellation).ConfigureAwait(false);
             }, (path, cancellation) => ValidateMapsAsync(path, key, cancellation), token).ConfigureAwait(false);
             leases.Add(bundle);
             await validateSource(token).ConfigureAwait(false);
@@ -282,11 +281,10 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
                 }
                 long pngOffset = input.Position;
                 string mediaKey = CacheManager.PreparedKey("export-media", Profile, key, $"{map.Role}|{map.PngSha256}");
-                var media = await cache.AcquirePreparedAsync("export-media", mediaKey, ".png", async (path, cancellation) =>
+                var media = await cache.AcquirePreparedOutputAsync("export-media", mediaKey, ".png", async (output, cancellation) =>
                 {
                     await using var source = new FileStream(bundle.Path, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous);
                     source.Position = pngOffset;
-                    await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
                     await CopyRangeAsync(source, output, map.Length, cancellation).ConfigureAwait(false);
                 }, (path, cancellation) => ValidateMediaAsync(path, map.Length, map.PngSha256, cancellation), token).ConfigureAwait(false);
                 leases.Add(media);
@@ -306,7 +304,7 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
         catch { await leases.DisposeAsync().ConfigureAwait(false); throw; }
     }
 
-    private static async Task WriteMapsAsync(string path, string key, IReadOnlyList<FbxStagedMaterialMapInput> maps, IReadOnlyList<string> diagnostics, CancellationToken token)
+    private static async Task WriteMapsAsync(Stream output, string key, IReadOnlyList<FbxStagedMaterialMapInput> maps, IReadOnlyList<string> diagnostics, CancellationToken token)
     {
         if (maps.Count > 2) throw new InvalidDataException("PreparedMapCountInvalid");
         var header = new MapsHeader(key, MaterialProfile, maps.Select(map => new MapHeader(map.Role, map.TextureCoordinateSet,
@@ -314,7 +312,6 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
             map.PngSha256, map.GraphSha256, map.PrimitiveKeys, map.Sources, map.PolygonCornerCoordinates?.Count ?? 0)).ToArray(), diagnostics);
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(header);
         if (json.Length > MaximumHeaderBytes) throw new InvalidDataException("PreparedMapsHeaderLimit");
-        await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
         byte[] prefix = new byte[12]; "DVEPMAP1"u8.CopyTo(prefix); BinaryPrimitives.WriteInt32LittleEndian(prefix.AsSpan(8), json.Length);
         await output.WriteAsync(prefix, token).ConfigureAwait(false); await output.WriteAsync(json, token).ConfigureAwait(false);
         byte[] cornerBuffer = new byte[64 * 1024];
@@ -521,10 +518,10 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
         CacheLease? lease = null; FileStream? pinnedInput = null;
         try
         {
-            lease = await cache.AcquirePreparedAsync("export-texture", key, ".data", async (path, cancellation) =>
+            lease = await cache.AcquirePreparedOutputAsync("export-texture", key, ".data", async (output, cancellation) =>
             {
                 created = await producer(cancellation).ConfigureAwait(false);
-                await WriteAsync(path, key, created.Value.Document, created.Value.Surface, cancellation, producedEvidence?.Invoke()).ConfigureAwait(false);
+                await WriteAsync(output, key, created.Value.Document, created.Value.Surface, cancellation, producedEvidence?.Invoke()).ConfigureAwait(false);
             }, async (path, cancellation) =>
             {
                 pinnedInput?.Dispose(); pinnedInput = null; bool accepted = false;
@@ -572,7 +569,7 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
         catch { pinnedInput?.Dispose(); if (lease is not null) await lease.DisposeAsync().ConfigureAwait(false); throw; }
     }
 
-    private static async Task WriteAsync(string path, string key, DdsTextureDocument document, TextureSurface surface, CancellationToken token, NativeTextureExportSourceEvidence? evidence = null)
+    private static async Task WriteAsync(Stream output, string key, DdsTextureDocument document, TextureSurface surface, CancellationToken token, NativeTextureExportSourceEvidence? evidence = null)
     {
         var s = new SurfaceHeader(surface.Width, surface.Height, surface.IsHdr, surface.SourceIsHdr, surface.IsSrgb,
             surface.MipIndex, surface.SourceFormat, surface.SourceFormatName, surface.SourcePayloadSha256, surface.Subresource,
@@ -581,7 +578,6 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
             surface.IsHdr ? 0 : surface.Rgba8.Length, s) { SourceEvidence = evidence };
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(header);
         if (json.Length > MaximumHeaderBytes) throw new InvalidDataException("ExportPreparationHeaderLimit");
-        await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         byte[] prefix = new byte[12]; "DVEPTEX1"u8.CopyTo(prefix); BinaryPrimitives.WriteInt32LittleEndian(prefix.AsSpan(8), json.Length);
         await Part(prefix); await Part(json); await Part(document.OriginalBytes);

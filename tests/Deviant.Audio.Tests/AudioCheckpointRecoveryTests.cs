@@ -5,6 +5,7 @@ using Deviant.Browser;
 using Deviant.Catalog;
 using Deviant.Core;
 using Deviant.Formats.Audio;
+using Deviant.Export.Audio;
 using Microsoft.Data.Sqlite;
 using Xunit;
 
@@ -13,6 +14,38 @@ namespace Deviant.Audio.Tests;
 public sealed class AudioCheckpointRecoveryTests
 {
     private static readonly AudioToolPaths NoTools=new(null,null,null,null,null,null,null);
+
+    [Fact]
+    public async Task SelectedOriginalExportDoesNotRequireFinishingAnInterruptedCatalog()
+    {
+        using var fixture=FormatsFixtureBuilder.CreateUnreferencedEmbeddedBank();
+        using var workspace=new Workspace();
+        await SaveInterruptedCheckpointAsync(fixture,workspace);
+        await using var session=await AudioExplorerSession.OpenStagedAsync(fixture.IndexPath,workspace.Cache,
+            workspace.Aliases,NoTools,null,CancellationToken.None,startEnrichment:false);
+        var page=await session.QueryAsync(new(Limit:10));
+        var listed=Assert.Single(page.Rows);
+        Assert.Throws<ArchiveException>(()=>session.Review([listed]));
+
+        var rows=await session.ReadSelectionAsync([listed.Identity.Key]);
+        var selected=Assert.Single(rows);
+        Assert.True(selected.SelectedSourceVerified);
+        var review=session.Review(rows);
+        var output=workspace.ExportRoot;
+        var report=await session.ExportAsync(review,new(output,AudioExportFormat.Original));
+
+        Assert.Equal(AudioExportStatus.Completed,Assert.Single(report.Manifest.Entries).Status);
+        Assert.False(session.IsEnrichmentStarted);
+        Assert.False(session.IsEnrichmentComplete);
+        Assert.False(session.IsCatalogLoaded);
+        Assert.Empty(session.Catalog.Media);
+        var entry=Assert.Single(report.Manifest.Entries);
+        var binding=AudioResourceBinding.Resolve(session.Snapshot,selected.Media,original:true);
+        var expected=new byte[checked((int)binding.Extent.Length)];
+        using(var source=File.OpenRead(binding.Volume.FilePath))
+        { source.Position=binding.Extent.Offset;await source.ReadExactlyAsync(expected); }
+        Assert.Equal(expected,await File.ReadAllBytesAsync(Path.Combine(output,entry.RelativeOutput)));
+    }
 
     [Fact]
     public async Task InterruptedNativeIndexingKeepsPublishedNamesBrowsableAfterReopenWithoutFinalSnapshot()
@@ -103,8 +136,13 @@ public sealed class AudioCheckpointRecoveryTests
 
         await using var reopened=await AudioExplorerSession.OpenStagedAsync(fixture.IndexPath,workspace.Cache,
             workspace.Aliases,NoTools,null,CancellationToken.None,startEnrichment:false);
-        var error=await Assert.ThrowsAsync<ArchiveException>(()=>reopened.QueryAsync(new(Limit:10)));
-        Assert.Equal("AudioRecoveryRequired",error.Code);
+        var page=await reopened.QueryAsync(new(Limit:10));
+        var pending=Assert.Single(page.Rows);
+        Assert.Equal(descriptor.Identity,pending.Identity);
+        Assert.Equal(descriptor.Label,pending.Label);
+        Assert.False(pending.IsHydrated);
+        Assert.False(pending.CanPreview);
+        Assert.False(pending.CanExportOriginal);
         Assert.False(reopened.IsEnrichmentStarted);
         Assert.False(reopened.IsEnrichmentComplete);
         Assert.Equal(1,reopened.MediaCount);
@@ -129,7 +167,7 @@ public sealed class AudioCheckpointRecoveryTests
             identity=Assert.Single(store.Query(new(Family:AudioExplorerSession.AssetFamily,Limit:10))).Identity;
         using var barrier=new VerificationBarrier(session.Snapshot.PhysicalSourceStamp);
         using var cancellation=new CancellationTokenSource();
-        var querying=Task.Run(()=>session.QueryAsync(new(Limit:10),cancellation.Token));
+        var querying=Task.Run(()=>session.PrepareSelectedMediaAsync(identity,cancellation.Token));
         Task? disposing=null;
         try
         {
@@ -222,6 +260,7 @@ public sealed class AudioCheckpointRecoveryTests
         private readonly string root=Path.Combine(Path.GetTempPath(),"deviant-audio-checkpoint-"+Guid.NewGuid().ToString("N"));
         public CacheManager Cache { get; }
         public AliasStore Aliases { get; }
+        public string ExportRoot=>Path.Combine(root,"exports");
         public Workspace()
         {
             Cache=new(Path.Combine(root,"settings"),new CacheSettings(Path.Combine(root,"cache")));

@@ -3,10 +3,14 @@ using Deviant.Catalog;
 using Deviant.Core;
 using Deviant.Formats.Audio;
 using Deviant.Formats.Audio.Model;
+using System.Diagnostics.CodeAnalysis;
 
 namespace Deviant.Browser;
 
-internal sealed record AudioRecoveryCheckpoint(SourceRevision Revision,MediaEntry Media,string SourceLabel);
+internal sealed record AudioRecoveryCheckpoint(SourceRevision Revision,MediaEntry Media,string SourceLabel)
+{
+    public SelectedAudioClassificationScope? SelectedScope { get; init; }
+}
 
 public sealed partial class AudioExplorerSession
 {
@@ -16,7 +20,8 @@ public sealed partial class AudioExplorerSession
     private long recoveryMediaCount=-1;
 
     private async Task PublishRecoveryCheckpointsAsync(IReadOnlyList<MediaEntry> media,
-        IReadOnlyDictionary<string,string> labels,CancellationToken token)
+        IReadOnlyDictionary<string,string> labels,CancellationToken token,
+        IReadOnlyDictionary<string,SelectedAudioClassificationScope>? selectedScopes=null)
     {
         var revision=new SourceRevision(Snapshot.IndexContentId,Snapshot.PhysicalSourceStamp);
         var batch=new List<BoundedFeatureAssetWrite>(FeatureStore.BoundedAssetPublicationLimit);
@@ -36,7 +41,8 @@ public sealed partial class AudioExplorerSession
             var label=labels.GetValueOrDefault(identity.Key,UserLabel(entry));
             var descriptor=Describe(entry,label);
             var feature=BoundedFeatureWrite.Create(RecoveryFeaturePrefix+identity.Key,RecoveryVersion,
-                new AudioRecoveryCheckpoint(revision,entry,label),MaximumRecoveryPayloadBytes);
+                new AudioRecoveryCheckpoint(revision,entry,label)
+                { SelectedScope=selectedScopes is not null&&selectedScopes.TryGetValue(identity.Key,out var selectedScope)?selectedScope:null },MaximumRecoveryPayloadBytes);
             // Use the same bounded serializer as publication for the combined transaction limit.
             var assetBytes=BoundedFeatureWrite.Create("audio.recovery-size",RecoveryVersion,descriptor,
                 MaximumRecoveryPayloadBytes).Utf8ByteCount;
@@ -69,45 +75,62 @@ public sealed partial class AudioExplorerSession
         using var linked=CancellationTokenSource.CreateLinkedTokenSource(token,storeOwner.SourceCancellation);
         token=linked.Token;
         token.ThrowIfCancellationRequested();
-        var page=await Task.Run(()=>storeOwner.Store.ReadBoundedAssetFeaturePage<AudioRecoveryCheckpoint>(ToAssetQuery(query),
+        var assetQuery=ToAssetQuery(query);
+        var page=await Task.Run(()=>storeOwner.Store.ReadBoundedAssetFeaturePage<AudioRecoveryCheckpoint>(assetQuery,
             RecoveryFeaturePrefix,RecoveryVersion,MaximumRecoveryPayloadBytes,token),token).ConfigureAwait(false);
-        // This is the query's matching total; the session count remains the whole retained family.
-        await RestoreRecoveryCountAsync(token).ConfigureAwait(false);
-        var revision=new SourceRevision(Snapshot.IndexContentId,Snapshot.PhysicalSourceStamp);
+        // Only an unfiltered count describes the retained family. Filtered totals stay with this page.
+        if((assetQuery with { Offset=0,Limit=100,Sort=AssetSort.Default,Descending=false })==new AssetQuery(Family:AssetFamily))
+            Interlocked.Exchange(ref recoveryMediaCount,page.Total);
         var rows=new List<AudioExplorerRow>(page.Rows.Count);
-        using var verification=new AudioMetadataVerifier(Snapshot).CreateLease();
         foreach(var stored in page.Rows)
         {
             token.ThrowIfCancellationRequested();
-            var checkpoint=stored.Feature;
-            if(checkpoint is null)
-            {
-                var error=new ArchiveException("AudioRecoveryRequired","This saved clip needs its source details loaded.");
-                error.Data["RecoveryStatus"]=stored.ErrorCode??"BoundedFeatureMissing";
-                throw error;
-            }
-            var media=checkpoint.Media;
-            if(checkpoint.Revision!=revision||media is null||media.Identity is null||media.Identity!=stored.Asset.Identity||
-               stored.Asset.Revision!=revision||stored.Asset.Family!=AssetFamily||checkpoint.SourceLabel is null||stored.Asset.Metadata is null||
-               media.Slice is null||media.BankKey is null||media.Language is null||media.Codec is null||media.ResolutionDetails is null||
-               media.Names is null||media.Aliases is null||media.EventKeys is null||media.SourceEvidence is null||
-               media.MetadataReadDigests is null||media.MetadataReadDigests.Any(digest=>digest is null||digest.Slice is null)||
-               !stored.Asset.Metadata.TryGetValue("audio.source-label",out var label)||label!=checkpoint.SourceLabel)
-                throw new ArchiveException("AudioRecoveryInvalid","The saved audio details do not match their source entry.");
-            using(AssetLoadDiagnostics.Measure("AudioRecoveryVerification",Snapshot.PhysicalSourceStamp))
-                await verification.VerifyMediaAsync(media,token).ConfigureAwait(false);
-            token.ThrowIfCancellationRequested();
-            if(MediaPolicy.HasBytes(media))_ = AudioResourceBinding.Resolve(Snapshot,media,original:true);
             lock(catalogGate)
             {
-                labelsByIdentity[media.Identity.Key]=checkpoint.SourceLabel;
-                var descriptor=Describe(media,checkpoint.SourceLabel);
-                var row=new AudioExplorerRow(descriptor,media,aliases.Get(media.Identity),
-                    string.IsNullOrWhiteSpace(media.BankName)?null:media.BankName);
+                var row=RecoveryMetadataRow(stored);
+                labelsByIdentity[row.Identity.Key]=SourceLabel(stored.Asset);
                 RememberBrowseRow(row,stored.SerializedBytes);rows.Add(row);
             }
         }
         token.ThrowIfCancellationRequested();
         return new(page.Total,rows.AsReadOnly());
+    }
+
+    private AudioExplorerRow RecoveryMetadataRow(BoundedAssetFeatureRow<AudioRecoveryCheckpoint> stored)
+    {
+        string? error=stored.ErrorCode;
+        if(TryReadRecoveryMedia(stored,out var media,out var label))
+        {
+            try
+            {
+                return new(Describe(media,label),media,aliases.Get(stored.Asset.Identity),
+                    string.IsNullOrWhiteSpace(media.BankName)?null:media.BankName);
+            }
+            catch(Exception invalid) when(invalid is ArchiveException or InvalidDataException or ArgumentException or OverflowException)
+            { error="AudioRecoveryInvalid"; }
+        }
+        else error??=stored.Feature is null?"BoundedFeatureMissing":"AudioRecoveryInvalid";
+        var descriptor=stored.Asset with { Capabilities=AssetCapabilities.None };
+        return new(descriptor,null,aliases.Get(descriptor.Identity),
+            bankLabelsByKey.GetValueOrDefault(descriptor.GroupKey??StandaloneGroupKey)) { HydrationErrorCode=error };
+    }
+
+    private static string SourceLabel(AssetDescriptor descriptor) =>
+        descriptor.Metadata?.GetValueOrDefault("audio.source-label")??descriptor.Label;
+
+    private bool TryReadRecoveryMedia(BoundedAssetFeatureRow<AudioRecoveryCheckpoint> stored,
+        [NotNullWhen(true)] out MediaEntry? media,out string label)
+    {
+        var revision=new SourceRevision(Snapshot.IndexContentId,Snapshot.PhysicalSourceStamp);
+        var checkpoint=stored.Feature;media=checkpoint?.Media;label=SourceLabel(stored.Asset);
+        return stored.ErrorCode is null&&checkpoint is not null&&checkpoint.Revision==revision&&media is not null&&
+            media.Identity is not null&&media.Identity==stored.Asset.Identity&&stored.Asset.Revision==revision&&
+            stored.Asset.Family==AssetFamily&&checkpoint.SourceLabel is not null&&stored.Asset.Metadata is not null&&
+            media.Slice is not null&&media.Slice.FilePath is not null&&media.BankKey is not null&&media.Language is not null&&
+            media.Codec is not null&&media.ResolutionDetails is not null&&media.Names is not null&&
+            media.Names.All(item=>item is not null)&&media.Aliases is not null&&media.EventKeys is not null&&
+            media.SourceEvidence is not null&&media.SourceEvidence.All(item=>item is not null)&&media.MetadataReadDigests is not null&&
+            media.MetadataReadDigests.All(digest=>digest is not null&&digest.Slice is not null&&digest.Slice.FilePath is not null&&digest.Sha256 is not null)&&
+            stored.Asset.Metadata.TryGetValue("audio.source-label",out var sourceLabel)&&sourceLabel==checkpoint.SourceLabel;
     }
 }

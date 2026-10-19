@@ -403,6 +403,7 @@ public partial class AudioWindow : Window, IAssetNavigator
             if (currentView == "audio" && !foregroundBusy) StatusText.Text = audioResultStatus;
             RefreshActivity();
             UpdateSelectedDetails();
+            RefreshSavedAudioFilters(current);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); if (generation == queryGeneration && currentView == "audio" && !foregroundBusy) StatusText.Text = ex.Message; }
@@ -463,6 +464,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     private void MediaList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (suppressSelectionTracking) return;
+        CancelSelectedAudioDetails();
         foreach (AudioExplorerRow row in e.RemovedItems)
         {
             selectedIdentities.Remove(row.Identity.Key);
@@ -495,7 +497,8 @@ public partial class AudioWindow : Window, IAssetNavigator
     {
         get
         {
-            if (MediaList.SelectedItem is AudioExplorerRow visible) return visible;
+            if (MediaList.SelectedItem is AudioExplorerRow visible)
+                return selectedAudioRows.GetValueOrDefault(visible.Identity.Key) ?? visible;
             if (!IsFocusedInCurrentSource || focusedIdentity is not { } identity || session is not { } current) return null;
             return selectedAudioRows.GetValueOrDefault(identity.Key);
         }
@@ -514,16 +517,17 @@ public partial class AudioWindow : Window, IAssetNavigator
         updatingAlias=true;
         try { aliasEditorIdentity=row?.Identity; AliasBox.Text=row is null?"":aliasDrafts.Read(row.Identity,row.UserAlias); }
         finally { updatingAlias=false; }
-        AdvancedDetails.Text = row is null ? "" : $"Media {row.IdText}\nResource {row.Identity.Ordinal}\nMember {row.Identity.MemberPath}\nBank {row.Media.BankKey}\nOffset {row.Media.Slice.Offset}\nLength {row.Media.Slice.Length}\nIndex {row.Identity.IndexContentId}\n" +
+        AdvancedDetails.Text = row?.SourceMedia is null ? "" : $"Media {row.IdText}\nResource {row.Identity.Ordinal}\nMember {row.Identity.MemberPath}\nBank {row.Media.BankKey}\nOffset {row.Media.Slice.Offset}\nLength {row.Media.Slice.Length}\nIndex {row.Identity.IndexContentId}\n" +
             string.Join("\n", row.Media.Names.Select(name => $"{name.Kind} · {name.Text} · {name.Source}")) +
             (row.Media.EventKeys.Count == 0 ? "" : "\nEvents\n" + string.Join("\n",row.Media.EventKeys));
         PlayButton.IsEnabled = row?.CanPreview == true;
         PartialButton.IsEnabled = row?.CanPreviewPartial == true;
-        PartialButton.Visibility = row?.Media.Completeness == MediaCompleteness.Fragment ? Visibility.Visible : Visibility.Collapsed;
-        ExportPartialButton.Visibility = row?.Media.Completeness == MediaCompleteness.Fragment && row.CanExportOriginal
+        PartialButton.Visibility = row?.SourceMedia?.Completeness == MediaCompleteness.Fragment ? Visibility.Visible : Visibility.Collapsed;
+        ExportPartialButton.Visibility = row?.SourceMedia?.Completeness == MediaCompleteness.Fragment && row.CanExportOriginal
             ? Visibility.Visible : Visibility.Collapsed;
         _=RefreshRelatedAsync();
-        ExportBankButton.IsEnabled = row is not null && session?.Banks.Any(bank => bank.Key == row.Media.BankKey && bank.CanExportOriginal) == true;
+        ExportBankButton.IsEnabled = row?.SourceMedia is { } media && session?.Banks.Any(bank => bank.Key == media.BankKey && bank.CanExportOriginal) == true;
+        EnsureSelectedAudioDetails(row);
     }
 
     private async void SaveAlias_Click(object sender, RoutedEventArgs e)
@@ -591,6 +595,7 @@ public partial class AudioWindow : Window, IAssetNavigator
             token.ThrowIfCancellationRequested();
             if (request != previewRequestVersion || !ReferenceEquals(current, session)) return;
             SetBusy(true, partial ? "Preparing partial preview…" : "Preparing preview…");
+            row = await current.PrepareSelectedMediaAsync(row.Identity, token);
             pendingPreview = await Task.Run(async () => await current.PreviewAsync(row.Identity, partial, cancellationToken: token).ConfigureAwait(false), token);
             if (token.IsCancellationRequested || request != previewRequestVersion || !ReferenceEquals(current, session)) return;
             await Task.Run(async () => await player.LoadAsync(pendingPreview.Path, volume, cancellationToken: token), token);
@@ -697,12 +702,7 @@ public partial class AudioWindow : Window, IAssetNavigator
 
     private async void ExportSelected_Click(object sender, RoutedEventArgs e) => await TrackJobAsync(ExportSelectedCoreAsync);
 
-    private async Task ExportSelectedCoreAsync()
-    {
-        var current = session; if (current is null) return;
-        var rows = await current.ReadSelectionAsync(selectedIdentities);
-        await ExportAsync(current.Review(rows));
-    }
+    private Task ExportSelectedCoreAsync() => PrepareSelectedAudioExportAsync(allowPartial: false);
     private async void ExportMatches_Click(object sender, RoutedEventArgs e) => await TrackJobAsync(ExportMatchesCoreAsync);
     private async Task ExportMatchesCoreAsync()
     {
@@ -715,14 +715,13 @@ public partial class AudioWindow : Window, IAssetNavigator
         finally { if (jobCancellation?.Token == token) { jobCancellation.Dispose(); jobCancellation = null; } }
     }
     private async void ExportPartial_Click(object sender, RoutedEventArgs e) => await TrackJobAsync(ExportPartialCoreAsync);
-    private async Task ExportPartialCoreAsync()
-    { if (session is not null && CurrentRow is { } row) { await session.LoadCatalogAsync(); await ExportAsync(session.Review([row]), allowPartial: true); } }
+    private Task ExportPartialCoreAsync() => PrepareSelectedAudioExportAsync(allowPartial: true);
 
     private async void ExportBank_Click(object sender, RoutedEventArgs e) => await TrackJobAsync(ExportBankCoreAsync);
     private async Task ExportBankCoreAsync()
     {
         var current = session; var row = CurrentRow;
-        if (current is null || row is null || row.Media.BankKey.Length == 0) return;
+        if (current is null || row?.SourceMedia is not { } media || media.BankKey.Length == 0) return;
         var dialog = new OpenFolderDialog { Title = "Choose bank export folder", Multiselect = false };
         if (dialog.ShowDialog(this) != true) return;
         jobCancellation?.Cancel(); jobCancellation?.Dispose(); jobCancellation = new CancellationTokenSource();
@@ -747,12 +746,17 @@ public partial class AudioWindow : Window, IAssetNavigator
 
     private async Task ExportAsync(AudioExportReview review, bool allowPartial = false, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var current = session; if (current is null || review.Rows.Count == 0) { StatusText.Text = "No audio resources selected."; return; }
+        if (!ReferenceEquals(current.Snapshot, review.Snapshot))
+            throw new ArchiveException("StaleReview", "The workspace changed. Select the clips again.");
         var dialog = new OpenFolderDialog { Title = "Choose audio export folder", Multiselect = false };
         if (dialog.ShowDialog(this) != true) return;
+        cancellationToken.ThrowIfCancellationRequested();
         var choose = new AudioExportOptionsDialog(review, allowPartial);
         choose.Owner = this;
         if (choose.ShowDialog() != true) return;
+        cancellationToken.ThrowIfCancellationRequested();
         var ownsJobCancellation = !cancellationToken.CanBeCanceled;
         if (ownsJobCancellation)
         {
@@ -840,6 +844,8 @@ public partial class AudioWindow : Window, IAssetNavigator
     { if (inputPath is not null) await OpenAsync(inputPath, token); }
     private void CancelAudioQueries()
     {
+        CancelSelectedAudioDetails();
+        recoveryFilterCancellation?.Cancel();
         filterTimer.Stop();
         audioQueryRefreshPending = false;
         ++audioQueryEpoch;

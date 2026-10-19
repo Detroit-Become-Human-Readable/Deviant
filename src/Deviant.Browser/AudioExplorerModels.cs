@@ -28,25 +28,45 @@ public sealed record AudioExplorerQuery(
     AssetSort Sort = AssetSort.Default,
     bool Descending = false);
 
-public sealed record AudioExplorerRow(AssetDescriptor Descriptor, MediaEntry Media, string? UserAlias, string? BankLabel = null)
+public enum AudioMediaHydrationState { SourceDetailsRequired, Ready }
+
+public sealed record AudioExplorerRow
 {
+    public AudioExplorerRow(AssetDescriptor Descriptor, MediaEntry? Media, string? UserAlias, string? BankLabel = null)
+    { this.Descriptor = Descriptor; SourceMedia = Media; this.UserAlias = UserAlias; this.BankLabel = BankLabel; }
+
+    public AssetDescriptor Descriptor { get; init; }
+    public MediaEntry? SourceMedia { get; internal init; }
+    public MediaEntry Media => SourceMedia ?? throw new ArchiveException("AudioSourceDetailsRequired", "Load the selected clip's source details first.");
+    public string? UserAlias { get; init; }
+    public string? BankLabel { get; init; }
+    public bool IsHydrated => SourceMedia is not null;
+    public bool SelectedSourceVerified { get; internal init; }
+    internal Deviant.Formats.Audio.SelectedAudioClassificationScope? SelectedClassificationScope { get; init; }
+    public string? CachePersistenceErrorCode { get; internal init; }
+    public AudioMediaHydrationState HydrationState => IsHydrated ? AudioMediaHydrationState.Ready : AudioMediaHydrationState.SourceDetailsRequired;
+    public string? HydrationErrorCode { get; internal init; }
     public ResourceIdentity Identity => Descriptor.Identity;
     public string Label => UserAlias ?? Descriptor.Label;
     public string PlayableLabel => Label;
     public string NaturalSortKey => Descriptor.SortKey ?? NaturalOrder.Key(PlayableLabel);
-    public string IdText => Media.IdText;
-    public string Bank => BankLabel ?? (string.IsNullOrWhiteSpace(Media.BankName) ? "Standalone" : Media.BankName);
-    public string CompletenessBadge => Media.Completeness switch
+    public string IdText => SourceMedia?.IdText ?? "";
+    public string Bank => BankLabel ?? (SourceMedia is { } media && !string.IsNullOrWhiteSpace(media.BankName) ? media.BankName : "Standalone");
+    public string CompletenessBadge => SourceMedia?.Completeness switch
     {
         MediaCompleteness.Complete => "",
         MediaCompleteness.Fragment => "Partial",
-        _ => ""
+        _ => Descriptor.Completeness == AssetCompleteness.Partial ? "Partial" : ""
     };
-    public bool CanPreview => Descriptor.Capabilities.HasFlag(AssetCapabilities.Preview);
-    public bool CanPreviewPartial => Descriptor.Capabilities.HasFlag(AssetCapabilities.PartialPreview);
-    public bool CanExportOriginal => Descriptor.Capabilities.HasFlag(AssetCapabilities.Original);
-    public bool CanConvert => Descriptor.Capabilities.HasFlag(AssetCapabilities.Wav) || Descriptor.Capabilities.HasFlag(AssetCapabilities.Ogg);
-    public string? UnavailableReason => MediaPolicy.GetUnavailableReason(Media) is { Length: > 0 } reason ? reason : null;
+    public bool CanPreview => IsHydrated && Descriptor.Capabilities.HasFlag(AssetCapabilities.Preview);
+    public bool CanPreviewPartial => IsHydrated && Descriptor.Capabilities.HasFlag(AssetCapabilities.PartialPreview);
+    public bool CanExportOriginal => IsHydrated && Descriptor.Capabilities.HasFlag(AssetCapabilities.Original);
+    public bool CanConvert => IsHydrated && (Descriptor.Capabilities.HasFlag(AssetCapabilities.Wav) || Descriptor.Capabilities.HasFlag(AssetCapabilities.Ogg));
+    public string? UnavailableReason => SourceMedia is null ? "Source details are not loaded." :
+        MediaPolicy.GetUnavailableReason(SourceMedia) is { Length: > 0 } reason ? reason : null;
+
+    public void Deconstruct(out AssetDescriptor Descriptor, out MediaEntry Media, out string? UserAlias, out string? BankLabel)
+    { Descriptor = this.Descriptor; Media = this.Media; UserAlias = this.UserAlias; BankLabel = this.BankLabel; }
 }
 
 public sealed record AudioExplorerPage(long Total, IReadOnlyList<AudioExplorerRow> Rows)
