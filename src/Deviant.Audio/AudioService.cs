@@ -7,7 +7,7 @@ using Deviant.Formats.Audio.Model;
 
 namespace Deviant.Audio;
 
-public sealed class AudioService(AudioToolPaths paths, ProcessRunner? processRunner = null, AudioProcessingLimits? processingLimits = null)
+public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? processRunner = null, AudioProcessingLimits? processingLimits = null)
 {
     private readonly AudioProcessingLimits _limits = processingLimits ?? new AudioProcessingLimits();
     private readonly ProcessRunner _processes = processRunner ?? new ProcessRunner(
@@ -693,7 +693,21 @@ public sealed class AudioService(AudioToolPaths paths, ProcessRunner? processRun
     public static AudioWavMetadata ReadWavMetadata(string path)
     {
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        using var reader = new BinaryReader(stream);
+        return ReadWavMetadata(stream);
+    }
+
+    public static AudioWavMetadata ReadWavMetadata(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        if (!stream.CanRead || !stream.CanSeek) throw new ArgumentException("WAV validation requires a readable, seekable stream.", nameof(stream));
+        var position=stream.Position;
+        try { stream.Position=0;return ReadWavMetadataCore(stream); }
+        finally { stream.Position=position; }
+    }
+
+    private static AudioWavMetadata ReadWavMetadataCore(Stream stream)
+    {
+        using var reader = new BinaryReader(stream,System.Text.Encoding.UTF8,leaveOpen:true);
         if (stream.Length > (long)uint.MaxValue + 8)
             throw new AudioToolException("WAV exceeds the maximum supported RIFF container size.");
         if (stream.Length < 44 || new string(reader.ReadChars(4)) != "RIFF") throw new AudioToolException("Output is not a supported RIFF/WAVE file.");

@@ -15,7 +15,7 @@ public sealed record ProcessRequest(
 
 public sealed record ProcessResult(int ExitCode, string StandardOutput, string StandardError, TimeSpan Elapsed);
 
-public sealed class ProcessRunner(long defaultMaximumWorkingSetBytes = 2L * 1024 * 1024 * 1024)
+public sealed partial class ProcessRunner(long defaultMaximumWorkingSetBytes = 2L * 1024 * 1024 * 1024)
 {
     private const int OutputLimit = 2 * 1024 * 1024;
 

@@ -545,28 +545,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
     public async Task<IReadOnlyList<AudioExplorerRow>> ReadMatchingAsync(AudioExplorerQuery query,
         IProgress<AudioExplorerProgress>? progress = null, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(query);
-        ThrowIfDisposed();
-        await EnsureAudioInitializedAsync(cancellationToken).ConfigureAwait(false);
-        var unpaged = ToAssetQuery(query with { Offset = 0, Limit = 10_000 });
-        await featureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            var total = await Task.Run(() => featureStore.Count(unpaged, cancellationToken), cancellationToken).ConfigureAwait(false);
-            if (total > int.MaxValue) throw new InvalidOperationException("The matching audio selection is too large to materialize.");
-            var rows = new List<AudioExplorerRow>((int)total);
-            progress?.Report(new("Selecting matching audio", 0, total));
-            for (long offset = 0; offset < total; offset += unpaged.Limit)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var page = await Task.Run(() => featureStore.QueryIdentityKeys(unpaged with { Offset = offset }, cancellationToken), cancellationToken).ConfigureAwait(false);
-                rows.AddRange(HydrateRows(page, cancellationToken));
-                progress?.Report(new("Selecting matching audio", Math.Min(total, offset + page.Count), total));
-            }
-            cancellationToken.ThrowIfCancellationRequested();
-            return rows.AsReadOnly();
-        }
-        finally { featureGate.Release(); }
+        return await ReadMatchingOnDemandAsync(query,progress,cancellationToken).ConfigureAwait(false);
     }
 
     public async Task SetAliasAsync(ResourceIdentity identity, string? alias, CancellationToken cancellationToken = default)
@@ -618,10 +597,10 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
             var options = $"wav={format};partial={partialPreview};channels=source";
             var fingerprint = await GetToolFingerprintAsync(AudioToolUse.Wav, token).ConfigureAwait(false);
             var cacheKey = CacheManager.Key(sourceRevision, payloadHash, fingerprint, options);
-            var lease = await cache.AcquireAsync(cacheKey, async (destination, cacheToken) =>
+            var lease = await cache.AcquirePreviewOutputAsync(cacheKey, ".wav", async (destination, cacheToken) =>
             {
-                var purpose = partialPreview ? DecodePurpose.PartialPreview : DecodePurpose.Preview;
-                await audioService.DecodeToWavAsync(Catalog, media, destination, format, progress, cacheToken, purpose).ConfigureAwait(false);
+                await DecodePreviewOutputAsync(media,source.Volume,source.VolumeHandle,payloadHash,destination,
+                    format,partialPreview,progress,cacheToken).ConfigureAwait(false);
             }, token).ConfigureAwait(false);
             try
             {
