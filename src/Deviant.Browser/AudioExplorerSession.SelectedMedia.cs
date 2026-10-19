@@ -40,31 +40,43 @@ public sealed partial class AudioExplorerSession
         using var owner=AcquireSharedFeatureStore();
         using var linked=CancellationTokenSource.CreateLinkedTokenSource(cancellationToken,owner.SourceCancellation);
         var token=linked.Token;
-        return await Task.Run(async()=>
+        using var operation=WorkflowDiagnostics.Begin("Audio.SelectedPreparation",keys.Length==1?keys[0]:null);
+        operation?.Progress("Waiting for selected media",0,keys.Length,"clips");
+        try
         {
-            await selectedMediaGate.WaitAsync(token).ConfigureAwait(false);
-            try
+            var prepared=await Task.Run(async()=>
             {
-                var rows=new List<AudioExplorerRow>(keys.Length);
-                long bytes=0;
-                foreach(var key in keys)
+                await selectedMediaGate.WaitAsync(token).ConfigureAwait(false);
+                try
                 {
+                    var rows=new List<AudioExplorerRow>(keys.Length);
+                    long bytes=0;
+                    foreach(var key in keys)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        if(keys.Length>1)operation?.Progress("Preparing selected clips",rows.Count,keys.Length,"clips");
+                        var (row,retained)=await PrepareSelectedRowAsync(owner.Store,key,token,
+                            keys.Length==1?operation:null).ConfigureAwait(false);
+                        if(retained>FeatureStore.MaximumLinkedFeaturePageBytes-bytes)
+                            throw new ArchiveException("AudioSelectionLimit","The selected metadata exceeds one preparation page.");
+                        bytes=checked(bytes+retained);rows.Add(row);
+                    }
                     token.ThrowIfCancellationRequested();
-                    var (row,retained)=await PrepareSelectedRowAsync(owner.Store,key,token).ConfigureAwait(false);
-                    if(retained>FeatureStore.MaximumLinkedFeaturePageBytes-bytes)
-                        throw new ArchiveException("AudioSelectionLimit","The selected metadata exceeds one preparation page.");
-                    bytes=checked(bytes+retained);rows.Add(row);
+                    return (IReadOnlyList<AudioExplorerRow>)rows.AsReadOnly();
                 }
-                token.ThrowIfCancellationRequested();
-                return (IReadOnlyList<AudioExplorerRow>)rows.AsReadOnly();
-            }
-            finally { selectedMediaGate.Release(); }
-        },token).ConfigureAwait(false);
+                finally { selectedMediaGate.Release(); }
+            },token).ConfigureAwait(false);
+            operation?.Progress("Selected source ready",prepared.Count,keys.Length,"clips");
+            operation?.Complete();return prepared;
+        }
+        catch(OperationCanceledException){operation?.Cancel();throw;}
+        catch(Exception error){operation?.Fail(error,error is ArchiveException archive?archive.Code:null);throw;}
     }
 
     private async Task<(AudioExplorerRow Row,long SerializedBytes)> PrepareSelectedRowAsync(FeatureStore store,
-        string key,CancellationToken token)
+        string key,CancellationToken token,WorkflowDiagnosticOperation? operation=null)
     {
+        operation?.Progress("Reading selected source");
         var page=store.ReadBoundedAssetFeaturePage<AudioRecoveryCheckpoint>(new(Family:AssetFamily,Limit:1){ExactIdentityKey=key},
             RecoveryFeaturePrefix,RecoveryVersion,MaximumRecoveryPayloadBytes,token);
         var stored=page.Rows.SingleOrDefault()
@@ -96,6 +108,7 @@ public sealed partial class AudioExplorerSession
         if(media is null||!HasSelectedClassification(media,scope)||!media.MetadataReadCoverageComplete||media.MetadataReadDigests.Count==0)
         {
             token.ThrowIfCancellationRequested();
+            operation?.Progress("Reading selected native source");
             var logical=AudioResourceBinding.ResolveOwner(Snapshot,stored.Asset.Identity);
             ResourceIdentity? bank=null;
             if(logical.Resource.Type==29)
@@ -108,6 +121,7 @@ public sealed partial class AudioExplorerSession
         }
         token.ThrowIfCancellationRequested();
         using var verification=new AudioMetadataVerifier(Snapshot).CreateLease();
+        operation?.Progress("Verifying selected source");
         using(AssetLoadDiagnostics.Measure("AudioRecoveryVerification",Snapshot.PhysicalSourceStamp))
             await verification.VerifyMediaAsync(media,token).ConfigureAwait(false);
         token.ThrowIfCancellationRequested();
@@ -124,7 +138,8 @@ public sealed partial class AudioExplorerSession
         var serialized=BoundedFeatureWrite.Create(RecoveryFeaturePrefix+key,RecoveryVersion,checkpoint,MaximumRecoveryPayloadBytes).Utf8ByteCount;
         if(persist)
         {
-            await featureGate.WaitAsync(token).ConfigureAwait(false);
+            operation?.Progress("Checking optional checkpoint writer");
+            var writerAvailable=await featureGate.WaitAsync(0,token).ConfigureAwait(false);
             try
             {
                 token.ThrowIfCancellationRequested();
@@ -150,8 +165,9 @@ public sealed partial class AudioExplorerSession
                     }
                     media=refreshed;scope=latest.Feature!.SelectedScope;label=currentLabel;
                 }
-                else
+                else if(writerAvailable)
                 {
+                    operation?.Progress("Saving selected checkpoint");
                     IReadOnlyDictionary<string,SelectedAudioClassificationScope>? scopes=scope is { } local
                         ?new Dictionary<string,SelectedAudioClassificationScope>{{key,local}}:null;
                     try
@@ -170,8 +186,13 @@ public sealed partial class AudioExplorerSession
                         WorkflowDiagnostics.Failure("Audio.SelectedCheckpoint",error,key,partial:true,phase:"Saving selected clip");
                     }
                 }
+                else
+                {
+                    cachePersistenceError="CacheWriteDeferred";
+                    operation?.Progress("Checkpoint deferred");
+                }
             }
-            finally { featureGate.Release(); }
+            finally { if(writerAvailable)featureGate.Release(); }
         }
         token.ThrowIfCancellationRequested();
         serialized=BoundedFeatureWrite.Create(RecoveryFeaturePrefix+key,RecoveryVersion,

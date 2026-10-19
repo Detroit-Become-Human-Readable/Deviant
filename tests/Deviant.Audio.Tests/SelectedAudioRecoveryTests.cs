@@ -62,7 +62,8 @@ public sealed class SelectedAudioRecoveryTests
 
         Assert.True(row.IsHydrated); Assert.Same(row.Media, row.SourceMedia);
         Assert.False(row.SelectedSourceVerified);
-        Assert.DoesNotContain(measurements.Items, measurement => measurement.Stage == "AudioRecoveryVerification");
+        Assert.DoesNotContain(measurements.Items, measurement => measurement.Stage == "AudioRecoveryVerification" &&
+            measurement.Key == session.Snapshot.PhysicalSourceStamp);
         Assert.False(session.IsEnrichmentStarted);
     }
 

@@ -17,6 +17,7 @@ public sealed partial class AudioExplorerSession
         if (string.IsNullOrWhiteSpace(extension)) extension=".bin";
         var revision=SourceIdentity.DerivedCacheKey(Snapshot.IndexContentId,Snapshot.PhysicalSourceStamp);
         var key=CacheManager.PreparedKey("audio-input","audio-source-slice-v1",revision,payloadHash+"/"+extension);
+        progress?.Report(new("Preparing decoder input"));
         using var input=await cache.AcquirePreparedOutputAsync("audio-input",key,extension,async(destination,cancellation)=>
         {
             SourceIdentity.EnsureUnchanged(new FileRevisionProvider(),sourceHandle,volume.FilePath,volume.Stamp);

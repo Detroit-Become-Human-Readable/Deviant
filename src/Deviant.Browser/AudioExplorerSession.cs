@@ -567,7 +567,37 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         WavFormat format = WavFormat.Pcm16, IProgress<AudioProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        using var diagnostic = WorkflowDiagnostics.Begin("Audio.Preview", identity.Key);
+        try
+        {
+            var result = await PreparePreviewAsync(identity, partialPreview, format,
+                new PreviewProgress(progress, diagnostic), cancellationToken).ConfigureAwait(false);
+            diagnostic?.Complete();
+            return result;
+        }
+        catch (OperationCanceledException) { diagnostic?.Cancel(); throw; }
+        catch (Exception error)
+        {
+            diagnostic?.Fail(error, error is ArchiveException archive ? archive.Code : error.Data["ErrorCode"]?.ToString());
+            throw;
+        }
+    }
+
+    private sealed class PreviewProgress(IProgress<AudioProgress>? target, WorkflowDiagnosticOperation? diagnostic) : IProgress<AudioProgress>
+    {
+        public void Report(AudioProgress value)
+        {
+            diagnostic?.Progress(value.Phase, value.Total > 0 ? value.Completed : null,
+                value.Total > 0 ? value.Total : null);
+            target?.Report(value);
+        }
+    }
+
+    private async Task<PreviewSession> PreparePreviewAsync(ResourceIdentity identity, bool partialPreview,
+        WavFormat format, IProgress<AudioProgress> progress, CancellationToken cancellationToken)
+    {
         ThrowIfDisposed();
+        progress.Report(new("Preparing selected clip"));
         var selected = await PrepareSelectedMediaAsync(identity, cancellationToken).ConfigureAwait(false);
         var media = selected.Media;
         var capabilities = selected.Descriptor.Capabilities;
@@ -582,6 +612,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
             !partialPreview && !capabilities.HasFlag(AssetCapabilities.Preview))
             throw new AudioToolException("The audio source could not be validated for preview.");
         using var metadataVerifier = new AudioMetadataVerifier(Snapshot).CreateLease();
+        progress.Report(new("Verifying audio metadata"));
         await metadataVerifier.VerifyMediaAsync(media,cancellationToken).ConfigureAwait(false);
 
         var source = PinMediaSource(media);
@@ -595,8 +626,10 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
             SourceIdentity.EnsureUnchanged(new FileRevisionProvider(), source.VolumeHandle, source.Volume.FilePath, source.Volume.Stamp);
             var sourceRevision = SourceIdentity.DerivedCacheKey(Snapshot.IndexContentId, Snapshot.PhysicalSourceStamp);
             var options = $"wav={format};partial={partialPreview};channels=source";
+            progress.Report(new("Reading decoder identity"));
             var fingerprint = await GetToolFingerprintAsync(AudioToolUse.Wav, token).ConfigureAwait(false);
             var cacheKey = CacheManager.Key(sourceRevision, payloadHash, fingerprint, options);
+            progress.Report(new("Preparing preview output"));
             var lease = await cache.AcquirePreviewOutputAsync(cacheKey, ".wav", async (destination, cacheToken) =>
             {
                 await DecodePreviewOutputAsync(media,source.Volume,source.VolumeHandle,payloadHash,destination,
@@ -604,12 +637,14 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
             }, token).ConfigureAwait(false);
             try
             {
+                progress.Report(new("Verifying prepared preview"));
                 SourceIdentity.EnsureUnchanged(new FileRevisionProvider(), source.IndexHandle, Snapshot.IndexPath, Snapshot.IndexStamp);
                 SourceIdentity.EnsureUnchanged(new FileRevisionProvider(), source.VolumeHandle, source.Volume.FilePath, source.Volume.Stamp);
                 var afterHash = await HashSliceAsync(source.VolumeHandle, media.Slice.Offset, media.Slice.Length, progress, token).ConfigureAwait(false);
                 if (!string.Equals(payloadHash, afterHash, StringComparison.Ordinal))
                     throw new ArchiveException("SourceChanged", "The selected audio payload changed while its preview was prepared.");
                 await metadataVerifier.VerifyMediaAsync(media,token).ConfigureAwait(false);
+                progress.Report(new("Preview ready"));
                 return new PreviewSession(identity, new SourceRevision(Snapshot.IndexContentId, Snapshot.PhysicalSourceStamp),
                     lease.Path, partialPreview ? AssetCompleteness.Partial : media.Completeness switch
                     {

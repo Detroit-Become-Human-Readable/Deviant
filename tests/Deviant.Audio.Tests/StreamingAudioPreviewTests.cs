@@ -47,7 +47,11 @@ public sealed class StreamingAudioPreviewTests
         await File.WriteAllBytesAsync(materialized,bytes);
         var service=new AudioService(AudioToolPaths.Discover(Environment.GetEnvironmentVariable("DEVIANT_AUDIO_TOOLS")));
         var baseline=Path.Combine(fixture.DirectoryPath,"reference.wav");
-        await service.DecodeToWavAsync(catalog,media,baseline,format,purpose:DecodePurpose.Preview);
+        var tools=AudioToolPaths.Discover(Environment.GetEnvironmentVariable("DEVIANT_AUDIO_TOOLS"));
+        var formatCode=format switch { WavFormat.Pcm16=>"1",WavFormat.Pcm24=>"2",WavFormat.Float32=>"4",_=>throw new ArgumentOutOfRangeException(nameof(format)) };
+        var reference=await new ProcessRunner().RunAsync(new(tools.VgmstreamCli!,["-i","-W",formatCode,"-o",baseline,materialized],
+            Timeout:TimeSpan.FromSeconds(10),MonitoredOutputFiles:[baseline],MaximumOutputFileBytes:1024*1024));
+        Assert.Equal(0,reference.ExitCode);
         using var output=new MemoryStream();
 
         var metadata=await service.DecodeMaterializedToWavAsync(media,materialized,output,format);

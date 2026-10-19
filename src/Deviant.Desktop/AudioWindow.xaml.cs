@@ -588,6 +588,7 @@ public partial class AudioWindow : Window, IAssetNavigator
         previewCancellation = ownCancellation;
         var token = ownCancellation.Token;
         PreviewSession? pendingPreview = null;
+        bool acceptPreviewProgress = true;
         var volume = (float)VolumeSlider.Value;
         try
         {
@@ -596,7 +597,18 @@ public partial class AudioWindow : Window, IAssetNavigator
             if (request != previewRequestVersion || !ReferenceEquals(current, session)) return;
             SetBusy(true, partial ? "Preparing partial preview…" : "Preparing preview…");
             row = await current.PrepareSelectedMediaAsync(row.Identity, token);
-            pendingPreview = await Task.Run(async () => await current.PreviewAsync(row.Identity, partial, cancellationToken: token).ConfigureAwait(false), token);
+            using var previewProgress = new CoalescedProgress<AudioProgress>(value => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (acceptPreviewProgress && !token.IsCancellationRequested && request == previewRequestVersion && ReferenceEquals(current, session)
+                    && !closingInProgress && !indexOpeningActive)
+                {
+                    foregroundStage = value.Phase; foregroundCompleted = value.Completed; foregroundTotal = value.Total;
+                    RefreshActivity();
+                }
+            })));
+            pendingPreview = await Task.Run(async () => await current.PreviewAsync(row.Identity, partial,
+                progress: previewProgress, cancellationToken: token).ConfigureAwait(false), token);
+            acceptPreviewProgress = false;
             if (token.IsCancellationRequested || request != previewRequestVersion || !ReferenceEquals(current, session)) return;
             await Task.Run(async () => await player.LoadAsync(pendingPreview.Path, volume, cancellationToken: token), token);
             if (token.IsCancellationRequested || request != previewRequestVersion || !ReferenceEquals(current, session)) { await Task.Run(player.Stop); return; }
@@ -610,6 +622,7 @@ public partial class AudioWindow : Window, IAssetNavigator
         catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); if (request == previewRequestVersion && ReferenceEquals(current, session) && !indexOpeningActive && !closingInProgress) SetBusy(false, ex.Message); }
         finally
         {
+            acceptPreviewProgress = false;
             if (pendingPreview is not null) await pendingPreview.DisposeAsync();
             if (ReferenceEquals(jobCancellation, ownCancellation)) jobCancellation = null;
             if (ReferenceEquals(previewCancellation, ownCancellation)) previewCancellation = null;

@@ -12,6 +12,7 @@ public sealed record NativeTexturePreviewPlan(int MipIndex, int Width, int Heigh
     IReadOnlyList<ResourceIdentity> RequiredPayloadIdentities, long PackageDecodedBytes, long SelectedEncodedBytes)
 {
     public bool UsesNativeBlocks { get; init; }
+    public long OutputEncodedBytes { get; init; }
 }
 
 public sealed partial class NativeTextureDecoder
@@ -30,6 +31,10 @@ public sealed partial class NativeTextureDecoder
 
     private long EstimatePreviewPlanBytes(NativeTexturePreviewPlan plan)
     {
+        long outputBytes = plan.OutputEncodedBytes == 0 ? plan.SelectedEncodedBytes : plan.OutputEncodedBytes;
+        if (outputBytes > maximumDecodedBytes)
+            throw Error("NativeTextureDecodeBudget", "The selected texture representation exceeds the decode budget.");
+        long expansionBytes = plan.OutputEncodedBytes > plan.SelectedEncodedBytes ? checked(2 * outputBytes) : 0;
         if (plan.IsConverted)
         {
             long decodedBytes = plan.UsesNativeBlocks ? plan.SelectedEncodedBytes : checked((long)plan.Width * plan.Height * 4);
@@ -42,11 +47,11 @@ public sealed partial class NativeTextureDecoder
                 plan.SelectedEncodedBytes > maximumDecodedBytes ||
                 plan.SelectedEncodedBytes > TextureBufferPatternInspector.MaximumDecodedBytes)
                 throw Error("NativeTextureDecodeBudget", "The selected mip exceeds the decode budget.");
-            return checked(plan.SelectedEncodedBytes * 3 + SegsContainerReader.DefaultDecodedSegmentBytes + 1024 * 1024);
+            return checked(plan.SelectedEncodedBytes * 3 + expansionBytes + SegsContainerReader.DefaultDecodedSegmentBytes + 1024 * 1024);
         }
         if (plan.PackageDecodedBytes > maximumDecodedBytes || plan.PackageDecodedBytes > TextureBufferPatternInspector.MaximumDecodedBytes)
             throw Error("NativeTextureDecodeBudget", "Mip data exceeds the decode budget.");
-        return checked(plan.PackageDecodedBytes * 3 + plan.SelectedEncodedBytes * 2 + 1024 * 1024);
+        return checked(plan.PackageDecodedBytes * 3 + plan.SelectedEncodedBytes * 2 + expansionBytes + 1024 * 1024);
     }
 
     public NativeTextureDecodedDocument ReadPreview(NativeTextureSource source, int maximumPreviewDimension,
@@ -99,7 +104,7 @@ public sealed partial class NativeTextureDecoder
         if (compressed && metadata.FirstByte != 7) Put(144, 3);
         int cursor = 148;
         foreach (var bytes in faceBytes) { token.ThrowIfCancellationRequested(); bytes.CopyTo(dds, cursor); cursor += bytes.Length; }
-        var document = new DdsTextureReader().Read(dds, metadata.Identity, source.Revision);
+        var document = ReadNativeDocument(dds, source, token);
         token.ThrowIfCancellationRequested();
         return new(document, Array.AsReadOnly(evidence), metadata.MipSizeCount,
             Enumerable.Range(0, metadata.MipSizeCount).Where(index => index != plan.MipIndex).ToArray());
@@ -148,7 +153,7 @@ public sealed partial class NativeTextureDecoder
             long outputBound = nativeBlocks ? bytes : checked((long)selected.Descriptor.Width * selected.Descriptor.Height * 4);
             return new(new(selected.Index, selected.Descriptor.Width, selected.Descriptor.Height, false, true,
                 Array.AsReadOnly(new[] { selected.Reference.Resolution.Candidates[0] }), outputBound, outputBound)
-                { UsesNativeBlocks = nativeBlocks }, selected.Reference,
+                { UsesNativeBlocks = nativeBlocks, OutputEncodedBytes = outputBound }, selected.Reference,
                 selected.Reference.Reference.ResourceType == 2229 ? TextureBufferPatternKind.Raw : TextureBufferPatternKind.RawLod, [0], checked((int)bytes));
         }
         bool cube = metadata.SizeGroupSelector == 2; int faceCount = cube ? 6 : 1;
@@ -203,7 +208,8 @@ public sealed partial class NativeTextureDecoder
         PreviewSelection Make(int mip, TextureFileTextV24ResourceReference reference, TextureBufferPatternKind kind,
             long packageBytes, IReadOnlyList<long> offsets, int bytes) => new(new(mip, Math.Max(1, metadata.Mip0Width >> mip),
                 Math.Max(1, metadata.Mip0Height >> mip), cube, false,
-                Array.AsReadOnly(new[] { reference.Resolution.Candidates[0] }), packageBytes, checked((long)bytes * faceCount)),
+                Array.AsReadOnly(new[] { reference.Resolution.Candidates[0] }), packageBytes, checked((long)bytes * faceCount))
+                { OutputEncodedBytes = checked((long)bytes * faceCount * (IsScalarSrgb(source) ? 4 : 1)) },
                 reference, kind, offsets, bytes);
     }
 }

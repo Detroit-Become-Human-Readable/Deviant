@@ -50,6 +50,11 @@ public sealed partial class NativeTextureDecoder
         else decodedBytes = metadata.MipByteLengthGroups.Sum(group => group.Sum(length => (long)length));
         if (decodedBytes > maximumDecodedBytes)
             throw Error("NativeTextureDecodeBudget", "Mip data exceeds the decode budget.");
+        if (!metadata.PostSelectorBoolean && IsScalarSrgb(source))
+        {
+            var outputBytes = ScalarSrgbOutputBytes(decodedBytes);
+            return checked(3 * decodedBytes + 2 * outputBytes + 1024 * 1024);
+        }
         return checked(3 * decodedBytes + 1024 * 1024);
     }
 
@@ -137,7 +142,7 @@ public sealed partial class NativeTextureDecoder
         var cursor = 148;
         foreach (var mip in supported) { token.ThrowIfCancellationRequested(); mip.Bytes.CopyTo(dds, cursor); cursor += mip.Bytes.Length; }
         token.ThrowIfCancellationRequested();
-        var document = new DdsTextureReader().Read(dds, metadata.Identity, source.Revision);
+        var document = ReadNativeDocument(dds, source, token);
         token.ThrowIfCancellationRequested();
         return new(document, supported.Select(mip => mip.Evidence).ToArray(), metadata.MipSizeCount,
             Enumerable.Range(supportedCount, metadata.MipSizeCount - supportedCount).ToArray());
@@ -218,7 +223,7 @@ public sealed partial class NativeTextureDecoder
         Put(132, 3); Put(136, 4); Put(140, 1); if (compressed && metadata.FirstByte != 7) Put(144, 3);
         var cursor = 148;
         foreach (var mip in supported) { token.ThrowIfCancellationRequested(); mip.Bytes.CopyTo(dds, cursor); cursor += mip.Bytes.Length; }
-        var document = new DdsTextureReader().Read(dds, metadata.Identity, source.Revision);
+        var document = ReadNativeDocument(dds, source, token);
         return new(document, supported.Select(mip => mip.Evidence).ToArray(), metadata.MipSizeCount,
             Enumerable.Range(supportedCount, metadata.MipSizeCount - supportedCount).ToArray());
 
@@ -249,8 +254,7 @@ public sealed partial class NativeTextureDecoder
             throw Error("NativeTextureMetadataMismatch", "Texture metadata does not match its source.");
         if (!MatchesSerializedMetadata(metadata, source.MetadataBytes.Span))
             throw Error("NativeTextureMetadataMismatch", "Texture metadata fields do not match their serialized values.");
-        if (metadata.FirstByte is not (0 or 5 or 7 or 11 or 18 or 19 or 25) || metadata.RawFixedPrefix84[0] != metadata.FirstByte ||
-            metadata.FirstByte == 11 && IsSrgb(source))
+        if (metadata.FirstByte is not (0 or 5 or 7 or 11 or 18 or 19 or 25) || metadata.RawFixedPrefix84[0] != metadata.FirstByte)
             throw Error("UnsupportedNativeTextureFormat", "This texture format is unavailable.");
         if (metadata.SizeGroupSelector is not (1 or 2) || metadata.SerializedSelector != 1 || metadata.ThirdU16 != 1 ||
             metadata.SkipLodSizeTables || metadata.MipByteLengthGroups.Count != (metadata.SizeGroupSelector == 2 ? 6 : 1) ||
@@ -341,7 +345,7 @@ public sealed partial class NativeTextureDecoder
             Write(128, DxgiFormat(metadata.FirstByte, IsSrgb(source))); Write(132, 3); Write(140, 1);
             if (compressed && metadata.FirstByte != 7) Write(144, 3);
             blocks.Span.CopyTo(blockDds.AsSpan(148));
-            var blockDocument = new DdsTextureReader().Read(blockDds, metadata.Identity, source.Revision);
+            var blockDocument = ReadNativeDocument(blockDds, source, token);
             var blockEvidence = new NativeTextureMipSource(selected.Index, width, height, payload.Identity,
                 payload.Sha256, Hash(blocks.Span), payloadExtent!, new(payload.Identity, 0, blocks.Length));
             return new(blockDocument, [blockEvidence], metadata.MipSizeCount,
@@ -378,7 +382,7 @@ public sealed partial class NativeTextureDecoder
                 dds[pixel] = 255;
             }
         }
-        var document = new DdsTextureReader().Read(dds, metadata.Identity, source.Revision);
+        var document = ReadNativeDocument(dds, source, token);
         var evidence = new NativeTextureMipSource(selected.Index, width, height, payload.Identity, payload.Sha256,
             compactRed ? Hash(decoded.Rgba8.Span) : Hash(dds.AsSpan(148)), payloadExtent!, new(payload.Identity, 0, decoded.Rgba8.Length));
         return new(document, [evidence], metadata.MipSizeCount,

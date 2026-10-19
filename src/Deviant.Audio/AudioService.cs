@@ -99,23 +99,19 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
         await using var workspace = new OperationWorkspace(catalog.Fingerprint);
         progress?.Report(new AudioProgress("Materializing source", Detail: media.DisplayName));
         var source = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
-        var rawWav = Path.Combine(workspace.DirectoryPath, "decoded-vgmstream.wav");
-        progress?.Report(new AudioProgress("Decoding", Detail: "vgmstream"));
-        var formatCode = format switch { WavFormat.Pcm16 => "1", WavFormat.Pcm24 => "2", WavFormat.Float32 => "4", _ => throw new ArgumentOutOfRangeException(nameof(format)) };
-        var decoded = await _processes.RunAsync(new ProcessRequest(paths.VgmstreamCli!, ["-i", "-W", formatCode, "-o", rawWav, source], workspace.DirectoryPath,
-            Timeout: TimeSpan.FromHours(2), MonitoredOutputFiles: [rawWav], MaximumOutputFileBytes: _limits.MaximumWavFileBytes), cancellationToken).ConfigureAwait(false);
-        EnsureSuccess(decoded, "vgmstream decode failed");
-        EnsureFile(rawWav, "vgmstream did not create a WAV file.");
-        EnsureFileWithinLimit(rawWav, _limits.MaximumWavFileBytes, "Decoded WAV exceeds the RIFF output-size limit.");
-        var metadata = ReadWavMetadata(rawWav);
-        progress?.Report(new AudioProgress("Validating WAV"));
-        EnsureWav(metadata);
-        EnsureWavFormat(metadata, format);
         cancellationToken.ThrowIfCancellationRequested();
         var destination = Path.GetFullPath(destinationWav);
         Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
         var staging = destination + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        try { File.Copy(rawWav, staging, overwrite: false); File.Move(staging, destination, overwrite: true); }
+        AudioWavMetadata metadata;
+        try
+        {
+            await using (var output = new FileStream(staging, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None,
+                128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                metadata = await DecodeMaterializedToWavAsync(media, source, output, format, progress, cancellationToken, purpose).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            File.Move(staging, destination, overwrite: true);
+        }
         finally { if (File.Exists(staging)) File.Delete(staging); }
         return new AudioDecodeResult(destination, format, metadata.Channels, metadata.SampleRate, metadata.SampleFrames,
             TimeSpan.FromSeconds((double)metadata.SampleFrames / metadata.SampleRate), "vgmstream");
