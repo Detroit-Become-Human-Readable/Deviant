@@ -78,7 +78,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         this.aliases = aliases;
         this.cache = cache;
         audioTools = tools;
-        audioService = new AudioService(tools);
+        audioService = new AudioService(tools, sourceStorage: new CacheAudioSourceStorage(cache));
         mediaByIdentity = new Dictionary<string, MediaEntry>(StringComparer.Ordinal);
         AudioResult = result;
         var labels = BuildUserLabels(result.Catalog);

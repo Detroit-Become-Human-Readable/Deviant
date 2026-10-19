@@ -256,7 +256,8 @@ public sealed class AudioExportService
                 {
                     var archive = ex as ArchiveException;
                     entries[i] = entries[i] with { Status = AudioExportStatus.Failed,
-                        ErrorCode = archive?.Code ?? ex.GetType().Name, Diagnostic = SanitizeDiagnostic(ex.Message, snapshot, root) };
+                        ErrorCode = archive?.Code ?? (Equals(ex.Data["ErrorCode"], "CacheStorageLimit") ? "CacheStorageLimit" : ex.GetType().Name),
+                        Diagnostic = SanitizeDiagnostic(ex.Message, snapshot, root) };
                 }
                 finally
                 {

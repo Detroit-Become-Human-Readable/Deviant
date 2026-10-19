@@ -7,7 +7,8 @@ using Deviant.Formats.Audio.Model;
 
 namespace Deviant.Audio;
 
-public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? processRunner = null, AudioProcessingLimits? processingLimits = null)
+public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? processRunner = null, AudioProcessingLimits? processingLimits = null,
+    IAudioSourceStorage? sourceStorage = null)
 {
     private readonly AudioProcessingLimits _limits = processingLimits ?? new AudioProcessingLimits();
     private readonly ProcessRunner _processes = processRunner ?? new ProcessRunner(
@@ -19,7 +20,8 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
         ArgumentNullException.ThrowIfNull(media);
         RequireTool(paths.VgmstreamCli, "vgmstream-cli");
         await using var workspace = new OperationWorkspace(catalog.Fingerprint);
-        var source = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
+        await using var sourceLease = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
+        var source = sourceLease.Path;
         if (media.Completeness == MediaCompleteness.Fragment)
             return await ProbeByDecodingAsync(source, workspace.DirectoryPath, cancellationToken).ConfigureAwait(false);
         var result = await _processes.RunAsync(new ProcessRequest(paths.VgmstreamCli!, ["-m", source], workspace.DirectoryPath,
@@ -98,7 +100,8 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
         RequireTool(paths.VgmstreamCli, "vgmstream-cli");
         await using var workspace = new OperationWorkspace(catalog.Fingerprint);
         progress?.Report(new AudioProgress("Materializing source", Detail: media.DisplayName));
-        var source = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
+        await using var sourceLease = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
+        var source = sourceLease.Path;
         cancellationToken.ThrowIfCancellationRequested();
         var destination = Path.GetFullPath(destinationWav);
         Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
@@ -131,7 +134,8 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
         EnsureExpectedWavSize(media, WavFormat.Pcm16, allowFragment: false);
         await using var workspace = new OperationWorkspace(catalog.Fingerprint);
         progress?.Report(new AudioProgress("Materializing source", Detail: media.DisplayName));
-        var source = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
+        await using var sourceLease = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
+        var source = sourceLease.Path;
         var candidate = Path.Combine(workspace.DirectoryPath, "ww2ogg-output.ogg");
         var diagnostics = new List<string>();
         var remuxPossible = paths.Ww2Ogg is not null && paths.Revorb is not null;
@@ -244,7 +248,8 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
             if (!plan.AllowPartialMedia) MediaPolicy.RequireConversion(media);
             else if (!MediaPolicy.CanPreview(media)) throw new AudioToolException(MediaPolicy.GetUnavailableReason(media));
             EnsureExpectedWavSize(media, WavFormat.Pcm16, allowFragment: plan.AllowPartialMedia);
-            var source = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
+            await using var sourceLease = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
+            var source = sourceLease.Path;
             var wav = Path.Combine(workspace.DirectoryPath, $"layer-{index:D3}.wav");
             progress?.Report(new AudioProgress("Decoding event media", index, plan.Items.Count, media.DisplayName));
             var decoded = await _processes.RunAsync(new ProcessRequest(paths.VgmstreamCli!, ["-i", "-W", "1", "-o", wav, source], workspace.DirectoryPath,
@@ -422,7 +427,7 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
         return path;
     }
 
-    private async Task<string> MaterializeAsync(AudioCatalog catalog, MediaEntry media, OperationWorkspace workspace, CancellationToken cancellationToken)
+    private async Task<AudioSourceLease> MaterializeAsync(AudioCatalog catalog, MediaEntry media, OperationWorkspace workspace, CancellationToken cancellationToken)
     {
         if (media.State is MediaState.MissingExternal or MediaState.Ambiguous or MediaState.Malformed or MediaState.Unsupported)
             throw new AudioToolException($"Media '{media.DisplayName}' cannot be processed ({media.State}).");
@@ -437,7 +442,7 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
             throw new AudioToolException($"Media '{media.DisplayName}' is not bound to a volume in the selected archive snapshot.");
         var extension = media.IsRiff || Path.GetExtension(sourcePath).Equals(".wem", StringComparison.OrdinalIgnoreCase) ? ".wem" : Path.GetExtension(sourcePath);
         if (string.IsNullOrWhiteSpace(extension)) extension = ".bin";
-        var target = Path.Combine(workspace.DirectoryPath, $"input-{Guid.NewGuid():N}{extension}");
+        extension = extension.ToLowerInvariant();
         var revisions = new FileRevisionProvider();
         using var indexHandle = SourceIdentity.OpenPinned(catalog.SourcePath);
         SourceIdentity.EnsureUnchanged(revisions, indexHandle, catalog.SourcePath, catalog.IndexStamp);
@@ -445,23 +450,80 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
         SourceIdentity.EnsureUnchanged(revisions, handle, sourcePath, volume.Stamp);
         if (!IndexLayout.InBounds(media.Slice.Offset, media.Slice.Length, RandomAccess.GetLength(handle)))
             throw new AudioToolException($"Media '{media.DisplayName}' points outside available source data.");
-        await using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
-        var buffer = new byte[128 * 1024];
-        long copied = 0;
-        while (copied < media.Slice.Length)
+        string? expectedHash = null;
+        if (sourceStorage is not null)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var wanted = (int)Math.Min(buffer.Length, media.Slice.Length - copied);
-            var count = await RandomAccess.ReadAsync(handle, buffer.AsMemory(0, wanted), checked(media.Slice.Offset + copied), cancellationToken).ConfigureAwait(false);
-            if (count == 0) throw new ArchiveException("SourceChanged", "The media ended during a bounded copy.");
-            await output.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
-            copied += count;
+            expectedHash = await HashSourceAsync(cancellationToken).ConfigureAwait(false);
+            EnsureSourceUnchanged();
+            var key = new AudioSourceKey(SourceIdentity.DerivedCacheKey(catalog.IndexContentId, catalog.PhysicalSourceStamp),
+                expectedHash, extension, media.Slice.Length);
+            var lease = await sourceStorage.AcquireAsync(key, CopySourceAsync, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var content = lease.Content;
+                if (content.Length != media.Slice.Length)
+                    throw new ArchiveException("SourceChanged", "The decoder input length differs from its selected source extent.");
+                content.Position = 0;
+                var actual = Convert.ToHexString(await System.Security.Cryptography.SHA256.HashDataAsync(content, cancellationToken).ConfigureAwait(false)).ToLowerInvariant();
+                content.Position = 0;
+                if (actual != expectedHash || await HashSourceAsync(cancellationToken).ConfigureAwait(false) != expectedHash)
+                    throw new ArchiveException("SourceChanged", "The decoder input differs from its selected source bytes.");
+                EnsureSourceUnchanged(); cancellationToken.ThrowIfCancellationRequested();
+                return lease;
+            }
+            catch (Exception error)
+            {
+                try { await lease.DisposeAsync().ConfigureAwait(false); }
+                catch (Exception cleanup) { error.Data["AudioSourceCleanupError"] = cleanup.GetType().Name + ": " + cleanup.Message[..Math.Min(512, cleanup.Message.Length)]; }
+                throw;
+            }
         }
-        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-        SourceIdentity.EnsureUnchanged(revisions, handle, sourcePath, volume.Stamp);
-        SourceIdentity.EnsureUnchanged(revisions, indexHandle, catalog.SourcePath, catalog.IndexStamp);
-        return target;
+        var target = Path.Combine(workspace.DirectoryPath, $"input-{Guid.NewGuid():N}{extension}");
+        await using (var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024,
+            FileOptions.Asynchronous | FileOptions.SequentialScan))
+            await CopySourceAsync(output, cancellationToken).ConfigureAwait(false);
+        return new AudioSourceLease(target);
+
+        void EnsureSourceUnchanged()
+        {
+            SourceIdentity.EnsureUnchanged(revisions, handle, sourcePath, volume.Stamp);
+            SourceIdentity.EnsureUnchanged(revisions, indexHandle, catalog.SourcePath, catalog.IndexStamp);
+        }
+
+        async Task<string> HashSourceAsync(CancellationToken token)
+        {
+            using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+            var buffer = new byte[128 * 1024]; long consumed = 0;
+            while (consumed < media.Slice.Length)
+            {
+                token.ThrowIfCancellationRequested();
+                int count = await RandomAccess.ReadAsync(handle, buffer.AsMemory(0, (int)Math.Min(buffer.Length, media.Slice.Length - consumed)),
+                    checked(media.Slice.Offset + consumed), token).ConfigureAwait(false);
+                if (count == 0) throw new ArchiveException("SourceChanged", "The media ended during input verification.");
+                hash.AppendData(buffer.AsSpan(0, count)); consumed += count;
+            }
+            return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+        }
+
+        async Task CopySourceAsync(Stream output, CancellationToken token)
+        {
+            EnsureSourceUnchanged();
+            using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+            var buffer = new byte[128 * 1024]; long copied = 0;
+            while (copied < media.Slice.Length)
+            {
+                token.ThrowIfCancellationRequested();
+                int count = await RandomAccess.ReadAsync(handle, buffer.AsMemory(0, (int)Math.Min(buffer.Length, media.Slice.Length - copied)),
+                    checked(media.Slice.Offset + copied), token).ConfigureAwait(false);
+                if (count == 0) throw new ArchiveException("SourceChanged", "The media ended during a bounded copy.");
+                hash.AppendData(buffer.AsSpan(0, count));
+                await output.WriteAsync(buffer.AsMemory(0, count), token).ConfigureAwait(false); copied += count;
+            }
+            if (expectedHash is not null && Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant() != expectedHash)
+                throw new ArchiveException("SourceChanged", "The media changed while preparing its decoder input.");
+            await output.FlushAsync(token).ConfigureAwait(false); EnsureSourceUnchanged();
+        }
     }
 
     private async Task<AudioProbeResult> ProbeWithFfprobeAsync(string input, CancellationToken cancellationToken)
