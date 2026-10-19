@@ -22,26 +22,7 @@ public sealed class TextureExportService
         bool overwrite = false, CancellationToken cancellationToken = default, SourceRevision? expectedRevision = null,
         Func<CancellationToken, Task>? preCommitValidation = null)
     {
-        ArgumentNullException.ThrowIfNull(document);
-        if (format is not (AssetExportFormat.Original or AssetExportFormat.Dds or AssetExportFormat.Png))
-            throw new ArchiveException("UnsupportedFormat", "Texture export supports Original, DDS, and PNG formats.");
-        if (document.Identity is not null)
-        {
-            if (expectedRevision is null)
-                throw new ArchiveException("SourceRevisionRequired", "Archive-backed texture export requires the selected source revision.");
-            if (!StringComparer.Ordinal.Equals(expectedRevision.IndexContentId, document.Identity.IndexContentId) ||
-                (document.Revision is not null && expectedRevision != document.Revision))
-                throw new ArchiveException("SourceChanged", "The texture document belongs to a different source revision.");
-            if (preCommitValidation is null)
-                throw new ArchiveException("SourceValidationRequired", "Archive-backed texture export requires a pre-commit source validation callback.");
-        }
-        else if (document.Revision is not null || expectedRevision is not null)
-            throw new ArchiveException("SourceRevisionUnavailable", "The texture document does not carry the requested source revision.");
-        if (format == AssetExportFormat.Png)
-        {
-            if (decoded is null) throw new ArchiveException("PixelsUnavailable", "A decoded texture surface is required for PNG export.");
-            ValidateSurface(document, decoded);
-        }
+        ValidateEncoding(document, decoded, format, expectedRevision, preCommitValidation);
 
         var output = Path.GetFullPath(outputRoot);
         OutputSafety.ValidateOutputRoot(output, sourceRoot);
@@ -61,22 +42,12 @@ public sealed class TextureExportService
         var temporaryCreated = false;
         try
         {
-            using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            TextureExportResult result;
             await using (var file = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                              128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
                 temporaryCreated = true;
-                using var hashing = new HashingWriteStream(file, digest);
-                switch (format)
-                {
-                    case AssetExportFormat.Original:
-                    case AssetExportFormat.Dds:
-                        await WriteBytesAsync(hashing, document.OriginalBytes, cancellationToken).ConfigureAwait(false);
-                        break;
-                    case AssetExportFormat.Png:
-                        PngTextureWriter.Write(hashing, decoded!, decoded!.IsSrgb, cancellationToken);
-                        break;
-                }
+                result = await EncodeCoreAsync(document, decoded, format, file, relativePath, cancellationToken).ConfigureAwait(false);
                 await file.FlushAsync(cancellationToken).ConfigureAwait(false);
                 file.Flush(flushToDisk: true);
             }
@@ -89,19 +60,7 @@ public sealed class TextureExportService
                 throw new ArchiveException("DestinationExists", "The selected output file already exists.");
             File.Move(temporaryPath, destination, overwrite);
             temporaryCreated = false;
-            var hash = Convert.ToHexString(digest.GetHashAndReset()).ToLowerInvariant();
-            var hdrOutput = (format is AssetExportFormat.Dds or AssetExportFormat.Original) && document.Info.IsHdr;
-            var pixelFormat = document.Info.FormatName;
-            var losses = format == AssetExportFormat.Png ? DescribePngLosses(document, decoded!) : "None; original encoded bytes copied exactly.";
-            var precision = format == AssetExportFormat.Png ? "RGBA8" : "Source encoded";
-            return new TextureExportResult(relativePath, new FileInfo(destination).Length, hash, format, document.ContentSha256,
-                document.Identity, document.Revision,
-                format == AssetExportFormat.Png ? decoded!.MipIndex : null, pixelFormat, document.Info.IsHdr, hdrOutput,
-                document.Info.IsSrgb, format == AssetExportFormat.Png ? decoded!.IsSrgb : document.Info.IsSrgb,
-                precision, losses, format == AssetExportFormat.Png ? decoded!.DisplayTransform : null)
-            {
-                SelectedSubresource = format == AssetExportFormat.Png ? decoded!.Subresource : null
-            };
+            return result;
         }
         finally
         {
@@ -110,6 +69,79 @@ public sealed class TextureExportService
                 try { File.Delete(temporaryPath); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
             }
+        }
+    }
+
+    /// <summary>Encodes into a caller-owned stream; the caller publishes the output after this method succeeds.</summary>
+    public async Task<TextureExportResult> EncodeAsync(DdsTextureDocument document, TextureSurface? decoded,
+        AssetExportFormat format, Stream output, string relativePath, CancellationToken cancellationToken = default,
+        SourceRevision? expectedRevision = null, Func<CancellationToken, Task>? preCommitValidation = null)
+    {
+        ValidateEncoding(document, decoded, format, expectedRevision, preCommitValidation);
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(relativePath);
+        if (!output.CanWrite) throw new ArgumentException("The output stream must be writable.", nameof(output));
+        var result = await EncodeCoreAsync(document, decoded, format, output, relativePath, cancellationToken).ConfigureAwait(false);
+        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (preCommitValidation is not null)
+            await preCommitValidation(cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        return result;
+    }
+
+    private static async Task<TextureExportResult> EncodeCoreAsync(DdsTextureDocument document, TextureSurface? decoded,
+        AssetExportFormat format, Stream output, string relativePath, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var hashing = new HashingWriteStream(output, digest);
+        switch (format)
+        {
+            case AssetExportFormat.Original:
+            case AssetExportFormat.Dds:
+                await WriteBytesAsync(hashing, document.OriginalBytes, token).ConfigureAwait(false);
+                break;
+            case AssetExportFormat.Png:
+                PngTextureWriter.Write(hashing, decoded!, decoded!.IsSrgb, token);
+                break;
+        }
+        token.ThrowIfCancellationRequested();
+        var hash = Convert.ToHexString(digest.GetHashAndReset()).ToLowerInvariant();
+        var hdrOutput = (format is AssetExportFormat.Dds or AssetExportFormat.Original) && document.Info.IsHdr;
+        var losses = format == AssetExportFormat.Png ? DescribePngLosses(document, decoded!) : "None; original encoded bytes copied exactly.";
+        return new TextureExportResult(relativePath, hashing.BytesWritten, hash, format, document.ContentSha256,
+            document.Identity, document.Revision,
+            format == AssetExportFormat.Png ? decoded!.MipIndex : null, document.Info.FormatName, document.Info.IsHdr, hdrOutput,
+            document.Info.IsSrgb, format == AssetExportFormat.Png ? decoded!.IsSrgb : document.Info.IsSrgb,
+            format == AssetExportFormat.Png ? "RGBA8" : "Source encoded", losses,
+            format == AssetExportFormat.Png ? decoded!.DisplayTransform : null)
+        {
+            SelectedSubresource = format == AssetExportFormat.Png ? decoded!.Subresource : null
+        };
+    }
+
+    private static void ValidateEncoding(DdsTextureDocument document, TextureSurface? decoded, AssetExportFormat format,
+        SourceRevision? expectedRevision, Func<CancellationToken, Task>? preCommitValidation)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        if (format is not (AssetExportFormat.Original or AssetExportFormat.Dds or AssetExportFormat.Png))
+            throw new ArchiveException("UnsupportedFormat", "Texture export supports Original, DDS, and PNG formats.");
+        if (document.Identity is not null)
+        {
+            if (expectedRevision is null)
+                throw new ArchiveException("SourceRevisionRequired", "Archive-backed texture export requires the selected source revision.");
+            if (!StringComparer.Ordinal.Equals(expectedRevision.IndexContentId, document.Identity.IndexContentId) ||
+                (document.Revision is not null && expectedRevision != document.Revision))
+                throw new ArchiveException("SourceChanged", "The texture document belongs to a different source revision.");
+            if (preCommitValidation is null)
+                throw new ArchiveException("SourceValidationRequired", "Archive-backed texture export requires a pre-commit source validation callback.");
+        }
+        else if (document.Revision is not null || expectedRevision is not null)
+            throw new ArchiveException("SourceRevisionUnavailable", "The texture document does not carry the requested source revision.");
+        if (format == AssetExportFormat.Png)
+        {
+            if (decoded is null) throw new ArchiveException("PixelsUnavailable", "A decoded texture surface is required for PNG export.");
+            ValidateSurface(document, decoded);
         }
     }
 
@@ -154,6 +186,7 @@ public sealed class TextureExportService
 
     private sealed class HashingWriteStream(Stream destination, IncrementalHash hash) : Stream
     {
+        public long BytesWritten { get; private set; }
         public override bool CanRead => false;
         public override bool CanSeek => false;
         public override bool CanWrite => destination.CanWrite;
@@ -166,19 +199,25 @@ public sealed class TextureExportService
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count)
         {
+            var next = checked(BytesWritten + count);
             hash.AppendData(buffer.AsSpan(offset, count));
             destination.Write(buffer, offset, count);
+            BytesWritten = next;
         }
         public override void Write(ReadOnlySpan<byte> buffer)
         {
+            var next = checked(BytesWritten + buffer.Length);
             hash.AppendData(buffer);
             destination.Write(buffer);
+            BytesWritten = next;
         }
         public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var next = checked(BytesWritten + buffer.Length);
             hash.AppendData(buffer.Span);
             await destination.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+            BytesWritten = next;
         }
         protected override void Dispose(bool disposing) { }
         public override ValueTask DisposeAsync() => ValueTask.CompletedTask;

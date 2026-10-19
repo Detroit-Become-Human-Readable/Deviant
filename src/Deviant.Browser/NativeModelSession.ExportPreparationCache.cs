@@ -51,26 +51,39 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
         {
             await using var lease = await cache.AcquirePreparedOutputAsync("export-encoded", key, ".encoded", async (output, cancellation) =>
             {
-                string root = Path.Combine(Path.GetTempPath(), "Deviant-export-" + Guid.NewGuid().ToString("N"));
-                try
+                TextureExportResult? encoded = null;
+                var extension = surface.IsHdr ? ".dds" : ".png";
+                await using var media = await cache.AcquireScratchOutputAsync(extension, async (destination, scratchToken) =>
                 {
                     using var encoderMemory = budget.Reserve(surface.IsHdr ? 128 * 1024 : checked(surface.Width * 8L + 256 * 1024), "prepared texture encoder scratch");
-                    var result = await new TextureExportService().ExportAsync(document, surface,
-                        surface.IsHdr ? AssetExportFormat.Dds : AssetExportFormat.Png, sourceRoot, root,
-                        surface.IsHdr ? "media.dds" : "media.png", cancellationToken: cancellation,
+                    encoded = await new TextureExportService().EncodeAsync(document, surface,
+                        surface.IsHdr ? AssetExportFormat.Dds : AssetExportFormat.Png, destination,
+                        "media" + extension, cancellationToken: scratchToken,
                         expectedRevision: document.Revision, preCommitValidation: validateSource).ConfigureAwait(false);
+                }, async (path, scratchToken) =>
+                {
+                    if (encoded is null || encoded.Length is < 1 or > MaximumArtifactBytes - MaximumHeaderBytes - 44)
+                        return false;
+                    await using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                        128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    return file.Length == encoded.Length && Convert.ToHexString(
+                        await SHA256.HashDataAsync(file, scratchToken).ConfigureAwait(false)).Equals(encoded.Sha256, StringComparison.OrdinalIgnoreCase);
+                }, cancellation).ConfigureAwait(false);
+                var result = encoded ?? throw new InvalidDataException("PreparedMediaEncodingMissing");
+                await using (var input = new FileStream(media.Path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                    128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    if (input.Length != result.Length) throw new InvalidDataException("PreparedMediaLengthChanged");
                     byte[] json = JsonSerializer.SerializeToUtf8Bytes(new MediaHeader(key, Profile, result));
                     if (json.Length > MaximumHeaderBytes) throw new InvalidDataException("PreparedMediaHeaderLimit");
                     byte[] prefix = new byte[12]; "DVEPMED1"u8.CopyTo(prefix); BinaryPrimitives.WriteInt32LittleEndian(prefix.AsSpan(8), json.Length);
                     await output.WriteAsync(prefix, cancellation).ConfigureAwait(false); await output.WriteAsync(json, cancellation).ConfigureAwait(false);
-                    await using var input = new FileStream(Path.Combine(root, result.RelativePath), FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous);
                     await CopyRangeAsync(input, output, result.Length, cancellation).ConfigureAwait(false);
                     if (output.Length > MaximumArtifactBytes - 32) throw new InvalidDataException("PreparedMediaLimit");
                     await output.FlushAsync(cancellation).ConfigureAwait(false); output.Position = 0;
                     byte[] digest = await SHA256.HashDataAsync(output, cancellation).ConfigureAwait(false);
                     await output.WriteAsync(digest, cancellation).ConfigureAwait(false); await output.FlushAsync(cancellation).ConfigureAwait(false);
                 }
-                finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
             }, async (path, cancellation) =>
             {
                 pin?.Dispose(); pin = null; bool accepted = false;

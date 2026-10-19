@@ -128,7 +128,7 @@
                             <TextBlock Text="Codec" Margin="0,8,0,2"/><ComboBox x:Name="CodecBox" SelectionChanged="FilterChanged" />
                             <TextBlock Text="Channels" Margin="0,8,0,2"/><ComboBox x:Name="ChannelsBox" SelectionChanged="FilterChanged" />
                             <TextBlock Text="Availability" Margin="0,8,0,2"/><ComboBox x:Name="AvailabilityBox" SelectionChanged="FilterChanged" />
-                            <Expander Header="Advanced filters" Margin="0,8,0,0"><StackPanel><TextBlock Text="Media type" Margin="0,4,0,2"/><ComboBox x:Name="CompletenessBox" SelectionChanged="FilterChanged" /></StackPanel></Expander>
+                            <Expander Header="Advanced filters" Margin="0,8,0,0"><StackPanel><TextBlock Text="Completeness" Margin="0,4,0,2"/><ComboBox x:Name="CompletenessBox" SelectionChanged="FilterChanged" /></StackPanel></Expander>
                             <TextBlock Text="Duration (seconds)" Margin="0,8,0,2"/>
                             <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions><TextBox x:Name="MinimumDurationBox" MinWidth="40" TextChanged="FilterChanged"/><TextBlock Grid.Column="1" Text="to" VerticalAlignment="Center" Margin="6,0"/><TextBox x:Name="MaximumDurationBox" Grid.Column="2" MinWidth="40" TextChanged="FilterChanged"/></Grid>
                             <TextBlock Text="Sort" Margin="0,8,0,2"/><ComboBox x:Name="AudioSortBox" DisplayMemberPath="Label" SelectionChanged="FilterChanged"/>
