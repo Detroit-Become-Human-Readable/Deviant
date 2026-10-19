@@ -1,5 +1,4 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <ItemGroup><InternalsVisibleTo Include="Deviant.Scene.Tests" /></ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Deviant.Graphs/Deviant.Graphs.csproj" />
     <ProjectReference Include="../Deviant.Archives/Deviant.Archives.csproj" />

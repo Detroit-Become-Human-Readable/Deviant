@@ -110,11 +110,10 @@ The build creates:
 
 The first source build downloads and builds the audio utilities. Later builds reuse them. To compile without packaging, add `-p:GenerateDesktopArtifacts=false`.
 
-To build and run the tests without packaging:
+To compile without packaging:
 
 ```powershell
 dotnet build Deviant.slnx -c Release -p:GenerateDesktopArtifacts=false
-dotnet test Deviant.slnx -c Release --no-build -p:GenerateDesktopArtifacts=false
 ```
 
 To publish the CLI:

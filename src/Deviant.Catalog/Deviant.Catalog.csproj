@@ -1,6 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><AllowUnsafeBlocks>true</AllowUnsafeBlocks></PropertyGroup>
-  <ItemGroup><InternalsVisibleTo Include="Deviant.Tests" /><InternalsVisibleTo Include="CachePolicyWorker" /></ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Deviant.Core/Deviant.Core.csproj" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.10" />

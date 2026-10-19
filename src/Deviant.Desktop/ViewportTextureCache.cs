@@ -1,11 +1,8 @@
 using System.IO;
-using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using Deviant.Assets;
 using Deviant.Browser;
 using Deviant.Formats.Textures;
-
-[assembly: InternalsVisibleTo("Deviant.Desktop.Tests")]
 
 namespace Deviant.Desktop;
 

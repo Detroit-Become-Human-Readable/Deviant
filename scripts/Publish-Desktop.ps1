@@ -198,7 +198,7 @@ try {
     $excludedSegments = @('.git', '.local', '.codex', '.agents', '.aws', '.vs', 'bin', 'obj', 'artifacts', 'TestResults', 'assets', 'node_modules')
     $excludedExtensions = @('.user', '.suo', '.db', '.db-wal', '.db-shm', '.dll', '.exe', '.pdb', '.cache', '.log', '.tmp', '.trx', '.nupkg', '.zip')
     $publicRootFiles = @('.gitignore', 'Directory.Build.props', 'Deviant.slnx', 'LICENSE', 'README.md', 'THIRD-PARTY-NOTICES.md')
-    $publicDirectories = @('scripts', 'src', 'tests', 'tools', 'notices')
+    $publicDirectories = @('scripts', 'src', 'tools', 'notices')
     $productAssets = @('src/Deviant.Desktop/Assets/app-icon.png', 'src/Deviant.Desktop/Assets/app-icon.ico', 'src/Deviant.Desktop/Assets/processing.gif')
     $sourceFiles = [Collections.Generic.List[IO.FileInfo]]::new()
     foreach ($name in $publicRootFiles) {

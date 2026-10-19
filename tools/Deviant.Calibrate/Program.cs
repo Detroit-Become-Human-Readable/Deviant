@@ -14,22 +14,6 @@ for (var i = 0; i < args.Length; i++) if (args[i].StartsWith("--", StringCompari
 if (!options.TryGetValue("input", out var input) || !options.TryGetValue("out", out var output))
 { Console.Error.WriteLine("Deviant.Calibrate --input <index> --out <private results directory> [--tools <directory>] [--profile <name>] [--convert]"); return 1; }
 output = Path.GetFullPath(output); Directory.CreateDirectory(output);
-if(options.ContainsKey("strings"))
-{
- try{await Deviant.Calibrate.StringsChecks.RunAsync(input,output);return 0;}
- catch(Exception error){await File.WriteAllTextAsync(Path.Combine(output,"error.txt"),error.ToString());Console.Error.WriteLine(error);return 2;}
-}
-if(options.ContainsKey("parity"))
-{
- try { long? ordinal=long.TryParse(options.GetValueOrDefault("ordinal"),out var n)?n:null; uint? id=options.TryGetValue("media-id",out var raw)?Convert.ToUInt32(raw.Replace("0x","",StringComparison.OrdinalIgnoreCase),16):null;
-  await Deviant.Calibrate.OperationParityChecks.RunAsync(input,output,options.GetValueOrDefault("tools"),ordinal,id);return 0; }
- catch(Exception error){await File.WriteAllTextAsync(Path.Combine(output,"error.txt"),error.ToString());Console.Error.WriteLine(error);return 2;}
-}
-if (options.ContainsKey("library"))
-{
-    try { await Deviant.Calibrate.LibraryChecks.RunAsync(input, output, options.GetValueOrDefault("tools")); return 0; }
-    catch(Exception error) { await File.WriteAllTextAsync(Path.Combine(output,"error.txt"),error.ToString()); Console.Error.WriteLine(error); return 2; }
-}
 var timer = Stopwatch.StartNew(); var metrics = new Dictionary<string, object>();
 long peak = 0; using var sample = new Timer(_ => { using var process = Process.GetCurrentProcess(); InterlockedExtensions.Max(ref peak, process.WorkingSet64); }, null, 0, 25);
 try

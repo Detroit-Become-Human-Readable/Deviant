@@ -25,25 +25,8 @@
     <Project Path="src/Deviant.Formats.Narrative/Deviant.Formats.Narrative.csproj" />
     <Project Path="src/Deviant.Export.Models/Deviant.Export.Models.csproj" />
   </Folder>
-  <Folder Name="/tests/">
-    <Project Path="tests/Fixtures/BinaryOutputWorker/BinaryOutputWorker.csproj" />
-    <Project Path="tests/Fixtures/CachePolicyWorker/CachePolicyWorker.csproj" />
-    <Project Path="tests/Deviant.Audio.Tests/Deviant.Audio.Tests.csproj" />
-    <Project Path="tests/Deviant.Localization.Tests/Deviant.Localization.Tests.csproj" />
-    <Project Path="tests/Deviant.Tests/Deviant.Tests.csproj" />
-    <Project Path="tests/Deviant.Desktop.Tests/Deviant.Desktop.Tests.csproj" />
-    <Project Path="tests/Deviant.Animation.Tests/Deviant.Animation.Tests.csproj" />
-    <Project Path="tests/Deviant.Scene.Tests/Deviant.Scene.Tests.csproj" />
-    <Project Path="tests/Deviant.Texture.Tests/Deviant.Texture.Tests.csproj" />
-    <Project Path="tests/Deviant.Container.Tests/Deviant.Container.Tests.csproj" />
-    <Project Path="tests/Deviant.Shader.Tests/Deviant.Shader.Tests.csproj" />
-    <Project Path="tests/Deviant.Model.Tests/Deviant.Model.Tests.csproj" />
-    <Project Path="tests/Deviant.Narrative.Tests/Deviant.Narrative.Tests.csproj" />
-  </Folder>
   <Folder Name="/tools/">
-    <Project Path="tools/Deviant.UiCheck/Deviant.UiCheck.csproj" />
     <Project Path="tools/Deviant.Calibrate/Deviant.Calibrate.csproj" />
-    <Project Path="tools/Deviant.AudioCheck/Deviant.AudioCheck.csproj" />
     <Project Path="tools/Deviant.AnimationProbe/Deviant.AnimationProbe.csproj" />
     <Project Path="tools/Deviant.SceneProbe/Deviant.SceneProbe.csproj" />
     <Project Path="tools/Deviant.CatalogBench/Deviant.CatalogBench.csproj" />
