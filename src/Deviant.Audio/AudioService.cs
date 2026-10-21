@@ -249,160 +249,159 @@ public sealed partial class AudioService(AudioToolPaths paths, ProcessRunner? pr
         RequireTool(paths.Ffmpeg, "ffmpeg (required to combine event layers and timing)");
         RequireTool(paths.VgmstreamCli, "vgmstream-cli");
         await using var workspace = new OperationWorkspace(catalog.Fingerprint);
-        var inputWavs = new List<string>();
-        var inputMetadata = new List<AudioWavMetadata>();
-        for (var index = 0; index < plan.Items.Count; index++)
+        await using var artifacts = new AudioArtifactScope();
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var item = plan.Items[index];
-            var media = catalog.Media.SingleOrDefault(m => string.Equals(m.Key, item.MediaKey, StringComparison.Ordinal));
-            if (media is null) throw new AudioToolException($"Plan media '{item.MediaKey}' no longer resolves in this catalog.");
-            if (!plan.AllowPartialMedia) MediaPolicy.RequireConversion(media);
-            else if (!MediaPolicy.CanPreview(media)) throw new AudioToolException(MediaPolicy.GetUnavailableReason(media));
-            EnsureExpectedWavSize(media, WavFormat.Pcm16, allowFragment: plan.AllowPartialMedia);
-            await using var sourceLease = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
-            var source = sourceLease.Path;
-            var wav = Path.Combine(workspace.DirectoryPath, $"layer-{index:D3}.wav");
-            progress?.Report(new AudioProgress("Decoding event media", index, plan.Items.Count, media.DisplayName));
-            var decoded = await _processes.RunAsync(new ProcessRequest(paths.VgmstreamCli!, ["-i", "-W", "1", "-o", wav, source], workspace.DirectoryPath,
-                Timeout: TimeSpan.FromHours(2), MonitoredOutputFiles: [wav], MaximumOutputFileBytes: _limits.MaximumWavFileBytes), cancellationToken).ConfigureAwait(false);
-            EnsureSuccess(decoded, $"Could not decode '{media.DisplayName}' for event render");
-            EnsureFile(wav, $"No WAV data was created for '{media.DisplayName}'.");
-            EnsureFileWithinLimit(wav, _limits.MaximumWavFileBytes, $"Decoded WAV for '{media.DisplayName}' exceeds the RIFF output-size limit.");
-            var decodedMetadata = ReadWavMetadata(wav);
-            EnsureWav(decodedMetadata);
-            if (Math.Abs(item.PitchCents) > 0.01)
-                RetagPitchedWave(wav, decodedMetadata, GetPitchedSampleRate(decodedMetadata.SampleRate, item.PitchCents));
-            inputMetadata.Add(decodedMetadata);
-            inputWavs.Add(wav);
-        }
-
-        var renderDurations = new double[plan.Items.Count];
-        for (var index = 0; index < plan.Items.Count; index++)
-        {
-            var item = plan.Items[index];
-            if (item.DurationSeconds > 0) renderDurations[index] = item.DurationSeconds;
-            else
+            var inputWavs = new List<string>();
+            var inputMetadata = new List<AudioWavMetadata>();
+            for (var index = 0; index < plan.Items.Count; index++)
             {
-                var decodedSeconds = (double)inputMetadata[index].SampleFrames / inputMetadata[index].SampleRate;
-                var onePass = Math.Max(0, decodedSeconds - Math.Max(0, item.TrimBeginSeconds) + Math.Min(0, item.TrimEndSeconds));
-                if (onePass <= 0) throw new AudioToolException($"Decoded media '{item.MediaName}' has no samples after the event clip trims.");
-                renderDurations[index] = onePass * Math.Max(1, item.LoopCount) / Math.Pow(2, item.PitchCents / 1200d);
+                cancellationToken.ThrowIfCancellationRequested();
+                var item = plan.Items[index];
+                var media = catalog.Media.SingleOrDefault(m => string.Equals(m.Key, item.MediaKey, StringComparison.Ordinal));
+                if (media is null) throw new AudioToolException($"Plan media '{item.MediaKey}' no longer resolves in this catalog.");
+                if (!plan.AllowPartialMedia) MediaPolicy.RequireConversion(media);
+                else if (!MediaPolicy.CanPreview(media)) throw new AudioToolException(MediaPolicy.GetUnavailableReason(media));
+                EnsureExpectedWavSize(media, WavFormat.Pcm16, allowFragment: plan.AllowPartialMedia);
+                await using var sourceLease = await MaterializeAsync(catalog, media, workspace, cancellationToken).ConfigureAwait(false);
+                var source = sourceLease.Path;
+                progress?.Report(new AudioProgress("Decoding event media", index, plan.Items.Count, media.DisplayName));
+                AudioWavMetadata? decodedMetadata = null;
+                var layer = artifacts.Add(await CreateScratchAsync(".wav", workspace.DirectoryPath, async (output, token) =>
+                {
+                    var purpose = !plan.AllowPartialMedia ? DecodePurpose.Conversion :
+                        media.Completeness == MediaCompleteness.Fragment ? DecodePurpose.PartialPreview : DecodePurpose.Preview;
+                    var metadata = await DecodeMaterializedToWavAsync(media, source, output, WavFormat.Pcm16,
+                        cancellationToken: token, purpose: purpose).ConfigureAwait(false);
+                    decodedMetadata = metadata;
+                    if (Math.Abs(item.PitchCents) > 0.01)
+                        RetagEventWaveCapture(output, metadata, GetPitchedSampleRate(metadata.SampleRate, item.PitchCents));
+                }, cancellationToken).ConfigureAwait(false));
+                if (decodedMetadata is null) throw new AudioToolException("The event decoder returned no WAV metadata.");
+                inputMetadata.Add(decodedMetadata);
+                inputWavs.Add(layer.Path);
             }
-        }
 
-        var renderInputs = inputWavs.ToArray();
-        var loopSources = new bool[plan.Items.Count];
-        for (var index = 0; index < plan.Items.Count; index++)
-        {
-            var item = plan.Items[index];
-            if (item.LoopCount <= 1) continue;
-            cancellationToken.ThrowIfCancellationRequested();
-            var sourceMetadata = inputMetadata[index];
-            var decodedDuration = (double)sourceMetadata.SampleFrames / sourceMetadata.SampleRate;
-            var singlePassDuration = item.SourceDurationSeconds > 0 ? item.SourceDurationSeconds :
-                Math.Max(0, decodedDuration - Math.Max(0, item.TrimBeginSeconds) + Math.Min(0, item.TrimEndSeconds));
-            if (singlePassDuration <= 0) throw new AudioToolException($"Decoded media '{item.MediaName}' has no samples after the event clip trims.");
-            var startSample = checked((long)Math.Round(Math.Max(0, item.TrimBeginSeconds) * sourceMetadata.SampleRate, MidpointRounding.AwayFromZero));
-            var passSamples = Math.Max(1, checked((long)Math.Round(singlePassDuration * sourceMetadata.SampleRate, MidpointRounding.AwayFromZero)));
-            var onePass = Path.Combine(workspace.DirectoryPath, $"loop-source-{index:D3}.wav");
-            var trim = $"atrim=start_sample={startSample}:end_sample={checked(startSample + passSamples)},asetpts=PTS-STARTPTS";
-            if (Math.Abs(item.PitchCents) > 0.01) trim += $",aresample={sourceMetadata.SampleRate}";
-            progress?.Report(new AudioProgress("Preparing event loops", index, plan.Items.Count, item.MediaName));
-            var prepared = await _processes.RunAsync(new ProcessRequest(paths.Ffmpeg!,
-                ["-v", "error", "-y", "-i", inputWavs[index], "-map", "0:a:0", "-af", trim,
-                 "-c:a", "pcm_s16le", "-f", "wav", onePass], workspace.DirectoryPath,
-                Timeout: TimeSpan.FromHours(2), MonitoredOutputFiles: [onePass], MaximumOutputFileBytes: _limits.MaximumWavFileBytes), cancellationToken).ConfigureAwait(false);
-            EnsureSuccess(prepared, $"Could not prepare loop source for '{item.MediaName}'");
-            EnsureFileWithinLimit(onePass, _limits.MaximumWavFileBytes, $"Loop source for '{item.MediaName}' exceeds the RIFF output-size limit.");
-            var preparedMetadata = ReadWavMetadata(onePass);
-            EnsureWav(preparedMetadata);
-            if (preparedMetadata.SampleRate != sourceMetadata.SampleRate || preparedMetadata.Channels != sourceMetadata.Channels)
-                throw new AudioToolException($"Loop source for '{item.MediaName}' changed its output format.");
-            renderInputs[index] = onePass;
-            loopSources[index] = true;
-        }
-
-        var output = Path.Combine(workspace.DirectoryPath, "event.wav");
-        var args = new List<string> { "-v", "error", "-y" };
-        for (var index = 0; index < renderInputs.Length; index++)
-        {
-            if (loopSources[index]) args.AddRange(["-stream_loop", (plan.Items[index].LoopCount - 1).ToString(CultureInfo.InvariantCulture)]);
-            args.AddRange(["-i", renderInputs[index]]);
-        }
-        var filters = new List<string>();
-        var labels = new List<string>();
-        for (var index = 0; index < plan.Items.Count; index++)
-        {
-            var item = plan.Items[index];
-            var meta = inputMetadata[index];
-            var delayMs = checked((long)Math.Round(item.StartSeconds * 1000, MidpointRounding.AwayFromZero));
-            var pitch = Math.Pow(2, item.PitchCents / 1200d);
-            var chain = new List<string>();
-            var pitchShifted = Math.Abs(item.PitchCents) > 0.01;
-            if (loopSources[index]) chain.Add("asetpts=PTS-STARTPTS");
-            else if (pitchShifted)
+            var renderDurations = new double[plan.Items.Count];
+            for (var index = 0; index < plan.Items.Count; index++)
             {
-                var startTrim = item.TrimBeginSeconds > 0 ? item.TrimBeginSeconds : 0;
+                var item = plan.Items[index];
+                if (item.DurationSeconds > 0) renderDurations[index] = item.DurationSeconds;
+                else
+                {
+                    var decodedSeconds = (double)inputMetadata[index].SampleFrames / inputMetadata[index].SampleRate;
+                    var onePass = Math.Max(0, decodedSeconds - Math.Max(0, item.TrimBeginSeconds) + Math.Min(0, item.TrimEndSeconds));
+                    if (onePass <= 0) throw new AudioToolException($"Decoded media '{item.MediaName}' has no samples after the event clip trims.");
+                    renderDurations[index] = onePass * Math.Max(1, item.LoopCount) / Math.Pow(2, item.PitchCents / 1200d);
+                }
+            }
+
+            var renderInputs = inputWavs.ToArray();
+            var loopSources = new bool[plan.Items.Count];
+            for (var index = 0; index < plan.Items.Count; index++)
+            {
+                var item = plan.Items[index];
+                if (item.LoopCount <= 1) continue;
+                cancellationToken.ThrowIfCancellationRequested();
+                var sourceMetadata = inputMetadata[index];
+                var decodedDuration = (double)sourceMetadata.SampleFrames / sourceMetadata.SampleRate;
                 var singlePassDuration = item.SourceDurationSeconds > 0 ? item.SourceDurationSeconds :
-                    Math.Max(0, (double)meta.SampleFrames / meta.SampleRate - startTrim + Math.Min(0, item.TrimEndSeconds));
-                var startSample = checked((long)Math.Round(startTrim * meta.SampleRate, MidpointRounding.AwayFromZero));
-                var passSamples = Math.Max(1, checked((long)Math.Round(singlePassDuration * meta.SampleRate, MidpointRounding.AwayFromZero)));
-                chain.Add($"atrim=start_sample={startSample}:end_sample={checked(startSample + passSamples)}");
+                    Math.Max(0, decodedDuration - Math.Max(0, item.TrimBeginSeconds) + Math.Min(0, item.TrimEndSeconds));
+                if (singlePassDuration <= 0) throw new AudioToolException($"Decoded media '{item.MediaName}' has no samples after the event clip trims.");
+                var startSample = checked((long)Math.Round(Math.Max(0, item.TrimBeginSeconds) * sourceMetadata.SampleRate, MidpointRounding.AwayFromZero));
+                var passSamples = Math.Max(1, checked((long)Math.Round(singlePassDuration * sourceMetadata.SampleRate, MidpointRounding.AwayFromZero)));
+                var trim = $"atrim=start_sample={startSample}:end_sample={checked(startSample + passSamples)},asetpts=PTS-STARTPTS";
+                if (Math.Abs(item.PitchCents) > 0.01) trim += $",aresample={sourceMetadata.SampleRate}";
+                progress?.Report(new AudioProgress("Preparing event loops", index, plan.Items.Count, item.MediaName));
+                var onePass = artifacts.Add(await CreateScratchAsync(".wav", workspace.DirectoryPath, async (output, token) =>
+                    await CaptureEventWaveAsync(["-v", "error", "-y", "-nostdin", "-i", inputWavs[index],
+                        "-map", "0:a:0", "-af", trim, "-c:a", "pcm_s16le"], output, WavFormat.Pcm16,
+                        workspace.DirectoryPath, TimeSpan.FromHours(2), $"Could not prepare loop source for '{item.MediaName}'", token)
+                        .ConfigureAwait(false), cancellationToken).ConfigureAwait(false));
+                var preparedMetadata = ReadWavMetadata(onePass.Path);
+                if (preparedMetadata.SampleRate != sourceMetadata.SampleRate || preparedMetadata.Channels != sourceMetadata.Channels)
+                    throw new AudioToolException($"Loop source for '{item.MediaName}' changed its output format.");
+                renderInputs[index] = onePass.Path;
+                loopSources[index] = true;
             }
-            else
+
+            var args = new List<string> { "-v", "error", "-y", "-nostdin" };
+            for (var index = 0; index < renderInputs.Length; index++)
             {
-                var startTrim = item.TrimBeginSeconds > 0 ? item.TrimBeginSeconds : 0;
-                var singlePassDuration = item.SourceDurationSeconds > 0 ? item.SourceDurationSeconds :
-                    Math.Max(0, (double)meta.SampleFrames / meta.SampleRate - startTrim + Math.Min(0, item.TrimEndSeconds));
-                chain.Add($"atrim=start={Fmt(startTrim)}:duration={Fmt(singlePassDuration)}");
-                chain.Add("asetpts=PTS-STARTPTS");
+                if (loopSources[index]) args.AddRange(["-stream_loop", (plan.Items[index].LoopCount - 1).ToString(CultureInfo.InvariantCulture)]);
+                args.AddRange(["-i", renderInputs[index]]);
             }
-            if (pitchShifted) chain.Add($"aresample={meta.SampleRate}");
-            chain.Add($"atrim=duration={Fmt(renderDurations[index])}");
-            if (Math.Abs(item.GainDb) > 0.001) chain.Add($"volume={Fmt(item.GainDb)}dB");
-            if (delayMs > 0)
+            var filters = new List<string>();
+            var labels = new List<string>();
+            for (var index = 0; index < plan.Items.Count; index++)
             {
-                var delays = string.Join('|', Enumerable.Repeat(delayMs.ToString(CultureInfo.InvariantCulture), Math.Max(1, meta.Channels)));
-                chain.Add($"adelay={delays}");
+                var item = plan.Items[index];
+                var meta = inputMetadata[index];
+                var delayMs = checked((long)Math.Round(item.StartSeconds * 1000, MidpointRounding.AwayFromZero));
+                var pitch = Math.Pow(2, item.PitchCents / 1200d);
+                var chain = new List<string>();
+                var pitchShifted = Math.Abs(item.PitchCents) > 0.01;
+                if (loopSources[index]) chain.Add("asetpts=PTS-STARTPTS");
+                else if (pitchShifted)
+                {
+                    var startTrim = item.TrimBeginSeconds > 0 ? item.TrimBeginSeconds : 0;
+                    var singlePassDuration = item.SourceDurationSeconds > 0 ? item.SourceDurationSeconds :
+                        Math.Max(0, (double)meta.SampleFrames / meta.SampleRate - startTrim + Math.Min(0, item.TrimEndSeconds));
+                    var startSample = checked((long)Math.Round(startTrim * meta.SampleRate, MidpointRounding.AwayFromZero));
+                    var passSamples = Math.Max(1, checked((long)Math.Round(singlePassDuration * meta.SampleRate, MidpointRounding.AwayFromZero)));
+                    chain.Add($"atrim=start_sample={startSample}:end_sample={checked(startSample + passSamples)}");
+                }
+                else
+                {
+                    var startTrim = item.TrimBeginSeconds > 0 ? item.TrimBeginSeconds : 0;
+                    var singlePassDuration = item.SourceDurationSeconds > 0 ? item.SourceDurationSeconds :
+                        Math.Max(0, (double)meta.SampleFrames / meta.SampleRate - startTrim + Math.Min(0, item.TrimEndSeconds));
+                    chain.Add($"atrim=start={Fmt(startTrim)}:duration={Fmt(singlePassDuration)}");
+                    chain.Add("asetpts=PTS-STARTPTS");
+                }
+                if (pitchShifted) chain.Add($"aresample={meta.SampleRate}");
+                chain.Add($"atrim=duration={Fmt(renderDurations[index])}");
+                if (Math.Abs(item.GainDb) > 0.001) chain.Add($"volume={Fmt(item.GainDb)}dB");
+                if (delayMs > 0)
+                {
+                    var delays = string.Join('|', Enumerable.Repeat(delayMs.ToString(CultureInfo.InvariantCulture), Math.Max(1, meta.Channels)));
+                    chain.Add($"adelay={delays}");
+                }
+                var label = $"a{index}";
+                filters.Add($"[{index}:a:0]{string.Join(',', chain)}[{label}]");
+                labels.Add($"[{label}]");
             }
-            var label = $"a{index}";
-            filters.Add($"[{index}:a:0]{string.Join(',', chain)}[{label}]");
-            labels.Add($"[{label}]");
+            var maxDuration = plan.Items.Select((item, index) => item.StartSeconds + renderDurations[index]).Max();
+            if (plan.MaximumDurationSeconds is { } maximum) maxDuration = Math.Min(maxDuration, maximum);
+            var outputBytesPerSample = format switch { WavFormat.Pcm16 => 2, WavFormat.Pcm24 => 3, WavFormat.Float32 => 4, _ => 4 };
+            var estimatedOutputBytes = maxDuration * inputMetadata.Max(metadata => metadata.SampleRate) *
+                Math.Max(1, inputMetadata.Max(metadata => metadata.Channels)) * outputBytesPerSample + 1024;
+            if (!double.IsFinite(maxDuration) || maxDuration <= 0 || !double.IsFinite(estimatedOutputBytes) || estimatedOutputBytes > _limits.MaximumWavFileBytes)
+                throw new AudioToolException("The event render exceeds the configured WAV allocation limit.");
+            if (plan.Items.Count == 1) filters.Add($"[a0]apad=whole_dur={Fmt(maxDuration)},atrim=duration={Fmt(maxDuration)}[mix]");
+            else filters.Add($"{string.Join(string.Empty, labels)}amix=inputs={labels.Count}:duration=longest:normalize=0,apad=whole_dur={Fmt(maxDuration)},atrim=duration={Fmt(maxDuration)}[mix]");
+            var fade = Math.Min(plan.FadeOutSeconds, Math.Max(0, maxDuration));
+            if (fade > 0) filters.Add($"[mix]volume='min(1,max(0,({Fmt(maxDuration)}-t)/{Fmt(fade)}))':eval=frame[final]");
+            var target = format switch
+            {
+                WavFormat.Pcm16 => "pcm_s16le",
+                WavFormat.Pcm24 => "pcm_s24le",
+                WavFormat.Float32 => "pcm_f32le",
+                _ => throw new ArgumentOutOfRangeException(nameof(format))
+            };
+            args.AddRange(["-filter_complex", string.Join(';', filters), "-map", fade > 0 ? "[final]" : "[mix]", "-c:a", target]);
+            progress?.Report(new AudioProgress("Mixing event layers", Total: plan.Items.Count));
+            var rendered = artifacts.Add(await CreateScratchAsync(".wav", workspace.DirectoryPath, async (output, token) =>
+                await CaptureEventWaveAsync(args, output, format, workspace.DirectoryPath, TimeSpan.FromHours(3),
+                    "Event mix failed", token).ConfigureAwait(false), cancellationToken).ConfigureAwait(false));
+            var metadata = ReadWavMetadata(rendered.Path);
+            var destination = Path.GetFullPath(destinationWav);
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            File.Copy(rendered.Path, destination, overwrite: true);
+            return new AudioRenderResult(destination, metadata.Channels, metadata.SampleRate, metadata.SampleFrames,
+                TimeSpan.FromSeconds((double)metadata.SampleFrames / metadata.SampleRate), plan.Limitations);
         }
-        var maxDuration = plan.Items.Select((item, index) => item.StartSeconds + renderDurations[index]).Max();
-        if (plan.MaximumDurationSeconds is { } maximum) maxDuration = Math.Min(maxDuration, maximum);
-        var outputBytesPerSample = format switch { WavFormat.Pcm16 => 2, WavFormat.Pcm24 => 3, WavFormat.Float32 => 4, _ => 4 };
-        var estimatedOutputBytes = maxDuration * inputMetadata.Max(metadata => metadata.SampleRate) *
-            Math.Max(1, inputMetadata.Max(metadata => metadata.Channels)) * outputBytesPerSample + 1024;
-        if (!double.IsFinite(maxDuration) || maxDuration <= 0 || !double.IsFinite(estimatedOutputBytes) || estimatedOutputBytes > _limits.MaximumWavFileBytes)
-            throw new AudioToolException("The event render exceeds the configured WAV allocation limit.");
-        if (plan.Items.Count == 1) filters.Add($"[a0]apad=whole_dur={Fmt(maxDuration)},atrim=duration={Fmt(maxDuration)}[mix]");
-        else filters.Add($"{string.Join(string.Empty, labels)}amix=inputs={labels.Count}:duration=longest:normalize=0,apad=whole_dur={Fmt(maxDuration)},atrim=duration={Fmt(maxDuration)}[mix]");
-        var fade = Math.Min(plan.FadeOutSeconds, Math.Max(0, maxDuration));
-        if (fade > 0) filters.Add($"[mix]volume='min(1,max(0,({Fmt(maxDuration)}-t)/{Fmt(fade)}))':eval=frame[final]");
-        var target = format switch
-        {
-            WavFormat.Pcm16 => "pcm_s16le",
-            WavFormat.Pcm24 => "pcm_s24le",
-            WavFormat.Float32 => "pcm_f32le",
-            _ => throw new ArgumentOutOfRangeException(nameof(format))
-        };
-        args.AddRange(["-filter_complex", string.Join(';', filters), "-map", fade > 0 ? "[final]" : "[mix]", "-c:a", target, "-f", "wav", output]);
-        progress?.Report(new AudioProgress("Mixing event layers", Total: plan.Items.Count));
-        var render = await _processes.RunAsync(new ProcessRequest(paths.Ffmpeg!, args, workspace.DirectoryPath,
-            Timeout: TimeSpan.FromHours(3), MonitoredOutputFiles: [output], MaximumOutputFileBytes: _limits.MaximumWavFileBytes), cancellationToken).ConfigureAwait(false);
-        EnsureSuccess(render, "Event mix failed");
-        EnsureFile(output, "FFmpeg did not create an event WAV.");
-        EnsureFileWithinLimit(output, _limits.MaximumWavFileBytes, "Event render WAV exceeds the RIFF output-size limit.");
-        var metadata = ReadWavMetadata(output);
-        EnsureWav(metadata);
-        EnsureWavFormat(metadata, format);
-        var destination = Path.GetFullPath(destinationWav);
-        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-        File.Copy(output, destination, overwrite: true);
-        return new AudioRenderResult(destination, metadata.Channels, metadata.SampleRate, metadata.SampleFrames,
-            TimeSpan.FromSeconds((double)metadata.SampleFrames / metadata.SampleRate), plan.Limitations);
+        catch (Exception error) { artifacts.Failure = error; throw; }
     }
 
     public async Task<string> NormalizePreviewToStereoAsync(string wavPath, string destinationWav,

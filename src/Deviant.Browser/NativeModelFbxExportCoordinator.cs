@@ -30,7 +30,10 @@ public sealed class NativeModelFbxMaterialInputs : IDisposable
     {
         var released = Interlocked.Exchange(ref retainedResources, null);
         if (released is null) return;
-        for (var index = released.Count - 1; index >= 0; index--) released[index].Dispose();
+        Exception? failure = null;
+        for (var index = released.Count - 1; index >= 0; index--)
+            try { released[index].Dispose(); } catch (Exception error) { failure ??= error; }
+        if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
 }
 

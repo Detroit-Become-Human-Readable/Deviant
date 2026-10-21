@@ -44,7 +44,7 @@ public sealed partial class NativeModelSession
         try
         {
             retained.Add(container.AcquireLease());
-            var staging = new FbxMaterialMapStaging(); retained.Add(staging);
+            var staging = new FbxMaterialMapStaging(surfaceDiskCache); retained.Add(staging);
             retained.Add(MemoryBudget.Reserve(checked(4096L + refs.Length * 512L + selected.Length * 2048L), "FBX material sources"));
             var textureCache = new Dictionary<ResourceIdentity, FbxTexturePreparation>();
             var unsupportedTextures = new Dictionary<ResourceIdentity, string>();
@@ -257,6 +257,7 @@ public sealed partial class NativeModelSession
                     materialTextures.Add(preparedTexture);
                 }
                 var maps = new List<FbxStagedMaterialMapInput>();
+                var residentMaps = new List<FbxBakedMaterialMapInput>();
                 if (!placementDependentGraph && !unsupportedGraphTextures && material.SurfaceGraph is { BaseColor: not null } graph)
                 {
                     bakeDiagnostics.Add("Colour maps sample the source base mip with its FILETEXT filter, addressing and border settings.");
@@ -285,12 +286,24 @@ public sealed partial class NativeModelSession
                             var key = NativeModelExportPreparationCache.MaterialKey(material, primitive, sourceKeys,
                                 bakeTextures, width, height, options.MaximumTexturePixels, token);
                             int diagnosticStart = bakeDiagnostics.Count;
+                            int residentStart = residentMaps.Count;
                             Task<IReadOnlyList<FbxStagedMaterialMapInput>>? producedMaps = null;
                             Task<IReadOnlyList<FbxStagedMaterialMapInput>> ProduceMapsOnce() => producedMaps ??= PreparePrimitiveMapsAsync();
+                            async Task<IReadOnlyList<FbxStagedMaterialMapInput>> ProduceCacheMapsAsync()
+                            {
+                                var produced = await ProduceMapsOnce().ConfigureAwait(false);
+                                if (residentMaps.Count != residentStart)
+                                {
+                                    var error = new IOException("Material maps are retained in memory for this export.");
+                                    error.Data["ErrorCode"] = "CacheStorageLimit";
+                                    throw error;
+                                }
+                                return produced;
+                            }
                             var validateMaps = CreateBakeSourceValidation(container, mapValidations);
                             var prepared = await UseOptionalExportPreparationAsync<
                                 (IReadOnlyList<FbxStagedMaterialMapInput> Maps, IAsyncDisposable Lease, bool CacheHit, IReadOnlyList<string> Diagnostics)>(
-                                () => preparationCache.AcquireMapsAsync(key, ProduceMapsOnce, validateMaps, MemoryBudget, token,
+                                () => preparationCache.AcquireMapsAsync(key, ProduceCacheMapsAsync, validateMaps, MemoryBudget, token,
                                     () => bakeDiagnostics.Skip(diagnosticStart).ToArray()),
                                 async () =>
                                 {
@@ -399,7 +412,7 @@ public sealed partial class NativeModelSession
                                     texture.Resolution.Candidates[0], Revision, texture.Document.ContentSha256, texture.Surface.Subresource)
                                     { Sampling = textureCache[texture.Resolution.Candidates[0]].Sampling }).ToArray(),
                                 CreateBakeSourceValidation(container, mapValidations)) { PolygonCornerCoordinates = baked.PolygonCornerCoordinates };
-                            primitiveMaps.Add(await staging.StageAsync(colorMap, Snapshot.SourceRoot, MemoryBudget, token).ConfigureAwait(false));
+                            var colorStaged = await StageMapAsync(colorMap).ConfigureAwait(false);
                             if (graph.Opacity is not null || graph.AlphaCutoff is not null)
                             {
                                 if (pixels > options.MaximumTexturePixels - texturePixels)
@@ -408,12 +421,27 @@ public sealed partial class NativeModelSession
                                 var transparency = MaterialSurfaceMapBaker.CreateTransparencyMap(baked, token);
                                 coverageMemory.ReduceTo(checked(transparency.Document.OriginalBytes.Length + 4096L));
                                 texturePixels = checked(texturePixels + pixels);
-                                primitiveMaps.Add(await staging.StageAsync(colorMap with { Role = MaterialTextureRole.Opacity, Document = transparency.Document, Surface = transparency.Surface },
-                                    Snapshot.SourceRoot, MemoryBudget, token).ConfigureAwait(false));
-                                coverageMemory.Dispose();
+                                if (await StageMapAsync(colorMap with { Role = MaterialTextureRole.Opacity, Document = transparency.Document,
+                                    Surface = transparency.Surface }).ConfigureAwait(false)) coverageMemory.Dispose();
                             }
-                            mapMemory.Dispose();
+                            if (colorStaged) mapMemory.Dispose();
                             return primitiveMaps;
+
+                            async Task<bool> StageMapAsync(FbxBakedMaterialMapInput map)
+                            {
+                                try
+                                {
+                                    primitiveMaps.Add(await staging.StageAsync(map, MemoryBudget, token).ConfigureAwait(false));
+                                    return true;
+                                }
+                                catch (IOException error) when (IsOptionalExportStorageFailure(error))
+                                {
+                                    token.ThrowIfCancellationRequested();
+                                    // The caller's pixel reservation remains owned until FBX publication.
+                                    residentMaps.Add(map);
+                                    return false;
+                                }
+                            }
 
                         }
 
@@ -442,7 +470,7 @@ public sealed partial class NativeModelSession
                 result.Add(new(exportMaterial, joined.Where(join => join.Resolution.Candidates[0] == identity).ToArray(),
                     materialTextures.Where(texture => directSlots.Contains(texture.SlotOrdinal)).ToArray(),
                     CreateContainerSourceValidation(container))
-                    { StagedMaps = maps, BakingDiagnostics = bakeDiagnostics, GraphSources = graphSources });
+                    { StagedMaps = maps, BakedMaps = residentMaps, BakingDiagnostics = bakeDiagnostics, GraphSources = graphSources });
                 foreach (var texture in materialTextures)
                 {
                     var textureIdentity = texture.Resolution.Candidates[0];
@@ -458,7 +486,20 @@ public sealed partial class NativeModelSession
             materialJobCompleted = true;
             return preparedInputs;
         }
-        catch { for (var i = retained.Count - 1; i >= 0; i--) retained[i].Dispose(); throw; }
+        catch (Exception error)
+        {
+            for (var i = retained.Count - 1; i >= 0; i--)
+                try { retained[i].Dispose(); }
+                catch (Exception cleanup)
+                {
+                    if (!error.Data.Contains("MaterialCleanupError"))
+                    {
+                        var detail = cleanup.GetType().Name + ": " + cleanup.Message;
+                        error.Data["MaterialCleanupError"] = detail[..Math.Min(detail.Length, 2048)];
+                    }
+                }
+            throw;
+        }
         finally
         {
             if (collectCounters)
@@ -468,6 +509,7 @@ public sealed partial class NativeModelSession
                     ["TextureSlots"] = slots, ["TexturePixels"] = texturePixels,
                     ["RetainedSourceBytes"] = retainedTextureSourceBytes,
                     ["StagedMaps"] = result.Sum(input => (long)input.StagedMaps.Count),
+                    ["ResidentMaps"] = result.Sum(input => (long)input.BakedMaps.Count),
                     ["Completed"] = materialJobCompleted ? 1 : 0
                 });
         }
@@ -512,12 +554,16 @@ public sealed partial class NativeModelSession
         CancellationToken token = default)
     {
         try { return await prepared().ConfigureAwait(false); }
-        catch (IOException error) when (error.Data["ErrorCode"] is "CacheStorageLimit" || (error.HResult & 0xffff) is 112 or 39)
+        catch (IOException error) when (IsOptionalExportStorageFailure(error))
         {
             token.ThrowIfCancellationRequested();
             return await fallback().ConfigureAwait(false);
         }
     }
+
+    private static bool IsOptionalExportStorageFailure(IOException error) =>
+        !error.Data.Contains("ScratchCleanupError") && !error.Data.Contains("CacheCleanupError") &&
+        (error.Data["ErrorCode"] is "CacheStorageLimit" || (error.HResult & 0xffff) is 112 or 39);
 
     private sealed class EmptyExportPreparationLease : IAsyncDisposable
     {
