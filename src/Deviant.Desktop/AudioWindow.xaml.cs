@@ -111,7 +111,11 @@ public partial class AudioWindow : Window, IAssetNavigator
         InitializeCommonGroups();
         familyView.PreviewUnavailableReason="";
         player.PlaybackStopped+=Player_PlaybackStopped;
-        filterTimer.Tick += async (_, _) => { filterTimer.Stop(); await QueryAsync(resetOffset: true); };
+        filterTimer.Tick += async (_, _) =>
+        {
+            filterTimer.Stop();
+            if (currentView == "audio" && !closingInProgress) await QueryAsync(resetOffset: true);
+        };
         playbackTimer.Tick += PlaybackTimer_Tick;
         seekTimer.Tick += SeekTimer_Tick;
         DeviceBox.ItemsSource=outputDevices;
@@ -444,7 +448,7 @@ public partial class AudioWindow : Window, IAssetNavigator
 
     private void FilterChanged(object sender, RoutedEventArgs e)
     {
-        if (syncingControls || session is null || closingInProgress) return;
+        if (syncingControls || session is null || currentView != "audio" || closingInProgress) return;
         queryCancellation?.Cancel();Interlocked.Increment(ref queryGeneration);
         filterTimer.Stop(); filterTimer.Start();
     }

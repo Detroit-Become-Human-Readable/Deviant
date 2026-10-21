@@ -51,6 +51,12 @@ public partial class AudioWindow
             await Step("Rendering", DisposeSceneRenderingAsync);
             await Step("Textures", ClearTextureCatalogsAsync);
             await Step("Catalog references", ClearSharedCatalogReferencesAsync);
+            foreach (var item in advancedWindows.ToArray())
+                await Step("Advanced archive", async () =>
+                {
+                    await item.Controller.CloseAsync(acknowledgeManifestFailure: true);
+                    item.Window.Close();
+                });
             var closedSession = session;
             session = null; admittedWorkspace = null;
             if (closedSession is not null) await Step("Archive", () => closedSession.DisposeAsync().AsTask());

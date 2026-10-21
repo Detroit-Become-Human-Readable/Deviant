@@ -645,13 +645,20 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
     private async Task LoadSelectionRelationshipEvidenceAsync(ITextureDiscoveryCatalog catalog,
         NativeTextureSession owner, ResourceIdentity identity, long version, CancellationToken token)
     {
-        var expectedEntry = selected;
         try
         {
-            var details = await Task.Run(() => catalog.GetDetailsAsync(identity, token), token);
-            if (details is null || !Current(owner, identity, version) || !ReferenceEquals(selected, expectedEntry)) return;
-            selected = details;
-            RenderDetails(false);
+            while (Current(owner, identity, version))
+            {
+                var selectedAtRequest = selected;
+                var details = await Task.Run(() => catalog.GetDetailsAsync(identity, token), token);
+                if (details is null || !Current(owner, identity, version)) return;
+                // A name-only browse refresh keeps the native version. Reread its relationship evidence
+                // rather than restoring an older entry or leaving the refreshed entry without details.
+                if (!ReferenceEquals(selected, selectedAtRequest)) continue;
+                selected = details;
+                RenderDetails(false);
+                return;
+            }
         }
         catch (OperationCanceledException) { }
     }
