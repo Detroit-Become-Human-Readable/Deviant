@@ -548,16 +548,59 @@ public sealed partial class CharacterCatalogSession
             descriptor = descriptor with { SearchTerms = ModelCatalogClassification.SearchTerms(descriptor) };
             var full = enriched with { Descriptor = descriptor, Coverage = names.Coverage };
             lease.EnsureUnchanged(); await references.ValidateSnapshotAsync(linked.Token).ConfigureAwait(false); ValidateCurrentSourceStamps();
-            if (features is not null && EstimatePersistedEntryBytes(full) <= MaximumPersistedEntryBytes)
-                features.SaveBounded(ModelEntryFeatureKey(identity), modelEntryVersion, full,
-                    checked((int)MaximumPersistedEntryBytes), linked.Token);
             retained.Add(memoryBudget.Reserve(EstimateEntryRetention(accumulator), "selected model details"));
+            await PublishSelectedModelEntryAsync(full, lease, linked.Token).ConfigureAwait(false);
             linked.Token.ThrowIfCancellationRequested(); return new(full, retained.Detach());
         }
         finally
         {
             if (acquired) operationGate.Release();
             EndForegroundModelSelection();
+        }
+    }
+
+    private async Task PublishSelectedModelEntryAsync(CharacterCatalogModelEntry full,
+        NativeContainerLease lease, CancellationToken token)
+    {
+        if (features is not { } store || EstimatePersistedEntryBytes(full) > MaximumPersistedEntryBytes) return;
+        token.ThrowIfCancellationRequested();
+        AssetMemoryBudget.Reservation publicationMemory;
+        try
+        {
+            publicationMemory = memoryBudget.Reserve(checked(MaximumPersistedEntryBytes * 12L + 16384),
+                "selected model publication scratch");
+        }
+        catch (ArchiveException error) when (error.Code == "AssetMemoryLimit") { return; }
+        using (publicationMemory)
+        {
+            var metadata = new Dictionary<string, string>(full.Descriptor.Metadata, StringComparer.Ordinal)
+            {
+                ["model.inventory-only"] = "true",
+                ["model.name-profile"] = NameIndexVersion
+            };
+            var seedEntry = full with
+            {
+                Descriptor = full.Descriptor with { Metadata = metadata },
+                SourceSummary = full.SourceSummary with
+                {
+                    StatisticsAvailability = CharacterModelStatisticsAvailability.DeferredUntilSelection
+                },
+                Bindings = []
+            };
+            BoundedFeatureWrite names, detail;
+            try
+            {
+                names = BoundedFeatureWrite.Create(NameEntryFeatureKey(full.Descriptor.Identity), InventoryNameSeedVersion,
+                    CreateInventoryNameSeed(seedEntry), checked((int)MaximumPersistedEntryBytes));
+                detail = BoundedFeatureWrite.Create(ModelEntryFeatureKey(full.Descriptor.Identity), modelEntryVersion, full,
+                    checked((int)MaximumPersistedEntryBytes));
+            }
+            catch (Exception error) when (error is InvalidDataException or JsonException) { return; }
+            token.ThrowIfCancellationRequested();
+            lease.EnsureUnchanged();
+            await references.ValidateSnapshotAsync(token).ConfigureAwait(false);
+            ValidateCurrentSourceStamps();
+            _ = store.PublishBoundedAssetWithEvidence(new(names, full.Descriptor), [detail], token);
         }
     }
 }

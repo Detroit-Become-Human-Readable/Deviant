@@ -130,11 +130,32 @@ public sealed partial class FeatureStore
     /// <returns>Identities whose evidence and asset family passed the atomic ownership check.</returns>
     public IReadOnlySet<ResourceIdentity> PublishBoundedAssetsBatch(
         IReadOnlyList<BoundedFeatureAssetWrite> writes, CancellationToken token = default)
+        => PublishBoundedAssetsCore(writes, [], token);
+
+    /// <summary>Commits an asset's name projection and related evidence under the same ownership check.</summary>
+    public bool PublishBoundedAssetWithEvidence(BoundedFeatureAssetWrite write,
+        IReadOnlyList<BoundedFeatureWrite> evidence, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(write);
+        ArgumentNullException.ThrowIfNull(evidence);
+        if (evidence.Count >= BoundedAssetPublicationLimit) throw new ArgumentOutOfRangeException(nameof(evidence));
+        return PublishBoundedAssetsCore([write], evidence, token).Contains(write.Asset.Identity);
+    }
+
+    private IReadOnlySet<ResourceIdentity> PublishBoundedAssetsCore(
+        IReadOnlyList<BoundedFeatureAssetWrite> writes, IReadOnlyList<BoundedFeatureWrite> evidence,
+        CancellationToken token)
     {
         ArgumentNullException.ThrowIfNull(writes);
         if (writes.Count == 0) return new HashSet<ResourceIdentity>();
         if (writes.Count > BoundedAssetPublicationLimit) throw new ArgumentOutOfRangeException(nameof(writes));
         var totalBytes = ValidateBoundedAssetWrites(writes);
+        if (evidence.Count > 0)
+        {
+            if (writes.Count != 1) throw new ArgumentException("Related evidence requires one asset.", nameof(writes));
+            ValidateBoundedFeatureWrites(writes.Select(write => write.Feature).Concat(evidence).ToArray());
+            totalBytes = checked(totalBytes + evidence.Sum(item => (long)item.Utf8ByteCount));
+        }
         token.ThrowIfCancellationRequested();
 
         var preparedAssets = new PreparedBoundedAssetRow[writes.Count];
@@ -175,6 +196,13 @@ public sealed partial class FeatureStore
                 feature.ExecuteNonQuery();
                 persisted.Add(writes[index].Asset.Identity);
             }
+            if (accepted.Count > 0)
+                foreach (var item in evidence)
+                {
+                    token.ThrowIfCancellationRequested();
+                    featureKey.Value = item.Key; featureVersion.Value = item.Version; featurePayload.Value = item.Payload;
+                    feature.ExecuteNonQuery();
+                }
 
             var assetIndexes = new List<int>(accepted.Count);
             foreach (var index in accepted)

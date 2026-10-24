@@ -1347,8 +1347,7 @@ public sealed partial class CharacterCatalogSession : IAsyncDisposable
             ["StoredNameCount"] = storedNames.Count.ToString(CultureInfo.InvariantCulture)
         };
         metadata["model.kind"] = classification.Kind;
-        if (summary.StatisticsAvailability == CharacterModelStatisticsAvailability.DeferredUntilSelection)
-            metadata["model.name-profile"] = NameIndexVersion;
+        metadata["model.name-profile"] = NameIndexVersion;
         metadata["model.classification-profile"] = ModelCatalogClassification.Profile;
         metadata["model.classification-evidence"] = classification.Evidence;
         metadata["model.display-label"] = inventoryOnly
