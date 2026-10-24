@@ -105,6 +105,7 @@ public partial class SceneView
         SceneViewport.MeshSelectionChanged += (_, selected) => SelectMeshes(selected);
         SceneViewport.RenderFailed += (_, error) => { WorkflowDiagnostics.Failure("Scene.Render", error, section?.Descriptor.Identity.Key); RenderStatus.Text = "Unable to render scene"; Advanced.Text = error.ToString(); };
         SceneViewport.LoadProgressChanged += (_, progress) => UpdateRenderLoadingProgress(progress);
+        SceneViewport.MaterialResidencyChanged += (_, _) => UpdateRenderedCount();
     }
 
     public void SetViewportService(AssetViewportService service) => SceneViewport.SetService(service);
@@ -319,6 +320,8 @@ public partial class SceneView
                 SetActivityTerminal("Materials incomplete");
                 diagnostic?.Partial();
             }
+            else if (SceneViewport.DeferredMaterialPartCount > 0)
+            { SetActivityTerminal("Materials streaming"); diagnostic?.Partial(); }
 
             async Task LoadCandidateAsync()
             {
@@ -729,7 +732,8 @@ public partial class SceneView
     private void UpdateRenderedCount()
     {
         if (renderSnapshot is not null) RenderStatus.Text = $"{SceneViewport.VisibleOccurrenceCount:N0} objects · {SceneViewport.VisibleMeshCount:N0} meshes" +
-            (HasIncompleteRenderedMaterials ? " · Materials incomplete" : "");
+            (HasIncompleteRenderedMaterials ? " · Materials incomplete" : "") +
+            (SceneViewport.DeferredMaterialPartCount > 0 ? $" · {SceneViewport.DeferredMaterialPartCount:N0} parts awaiting materials" : "");
     }
     private bool HasIncompleteRenderedMaterials => renderSnapshot?.HasIncompleteMaterials == true ||
         SceneViewport.RendererIssues.Any(issue => issue.Code == AssetViewportService.UnsupportedMaterialPassIssueCode);

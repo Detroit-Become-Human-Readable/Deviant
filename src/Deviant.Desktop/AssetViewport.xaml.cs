@@ -64,6 +64,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
         flyTimer.Stop();
         hiddenTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(33), DispatcherPriority.Render, HiddenTick, Dispatcher);
         hiddenTimer.Stop();
+        InitializeMaterialResidency();
         LostKeyboardFocus += (_, _) => StopFlight();
         Loaded += (_, _) => RefreshHiddenAnimation();
         IsVisibleChanged += (_, _) => RefreshHiddenAnimation();
@@ -109,6 +110,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
             if (visibility.ShowHidden == value) return;
             visibility.ShowHidden = value;
             foreach (var part in parts) ApplyInstances(part);
+            MarkMaterialResidencyDirty();
             UpdateVisibleStatus(); RefreshHiddenAnimation(); RenderView.InvalidateRender();
         }
     }
@@ -140,6 +142,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
         if (service is null) throw new InvalidOperationException("The viewport service has not been assigned.");
         long currentGeneration = ++generation;
         loadCancellation?.Cancel();
+        StopMaterialResidency();
         var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
         loadCancellation = cancellation;
         bool entered = false;
@@ -185,6 +188,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
             int total = source.Meshes.Values.Sum(m => m.Geometry.Primitives.Sum(p => Math.Max(1, p.Submeshes.Count)));
             int completed = 0;
             int queuedUploads = 0;
+            var pendingMaterialUses = new Dictionary<AssetViewportService.MaterialLease, int>();
             long queuedUploadBytes = 0;
             int uploadsSinceFrame = 0;
             long bytesSinceFrame = 0;
@@ -212,10 +216,13 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
                         model.InstanceParamArray = job.Rows.Select(x => InstanceAppearance(x.Key)).ToArray();
                         model.InstanceIdentifiers = keys; model.OctreeManager = new InstancingModel3DOctreeManager();
                         model.CullMode = SharpDX.Direct3D11.CullMode.None; model.IsHitTestVisible = true;
-                        var part = new Part(model, job.Rows, keys, job.Primitive.Key, job.Mesh.Key, job.Submesh, geometry);
+                        var partMaterial = job.Material.Retain(); leases.Add(partMaterial);
+                        var part = new Part(model, job.Rows, keys, job.Primitive.Key, job.Mesh.Key, job.Submesh, geometry, partMaterial);
                         ApplyInstances(part);
                         parts.Add(part);
                         RenderView.Items.Add(model);
+                        if (--pendingMaterialUses[job.Material] == 0)
+                        { pendingMaterialUses.Remove(job.Material); leases.Remove(job.Material); job.Material.Dispose(); }
                         Progress("Loading", ++completed, total);
                 }
                 pendingGeometry.Clear();
@@ -264,6 +271,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
                                 material.IsUnavailable ? AssetViewportService.UnsupportedMaterialPassIssueCode : "MaterialRenderer", diagnostic));
                     var submeshes = primitive.Submeshes.Count > 0 ? primitive.Submeshes :
                         [new GeometrySubmesh(primitive.Key, 0, primitive.Indices.Count, [])];
+                    pendingMaterialUses.Add(material, submeshes.Count);
                     foreach (var submesh in submeshes)
                     {
                         CheckCurrent();
@@ -398,6 +406,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
         foreach (var part in parts)
             part.Model.InstanceParamArray = part.Model.InstanceIdentifiers!.Select(id => InstanceAppearance(instanceKeys[id], part.PrimitiveKey)).ToArray();
         RenderView.InvalidateRender();
+        MarkMaterialResidencyDirty();
     }
 
     public void SetVisibility(string occurrenceKey, bool visible)
@@ -409,6 +418,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
         foreach (var part in parts.Where(p => p.Occurrences.Any(x => x.Key == occurrenceKey)))
             ApplyInstances(part);
         UpdateVisibleStatus(); RefreshHiddenAnimation(); RenderView.InvalidateRender();
+        MarkMaterialResidencyDirty();
     }
 
     public bool IsOccurrenceVisible(string key) => visibility.IsVisible(key);
@@ -597,12 +607,13 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     {
         Dispatcher.VerifyAccess();
         StopFlight();
+        StopMaterialResidency();
         ClearPoseGeometry();
         hiddenTimer.Stop();
         foreach (var part in parts) { RenderView.Items.Remove(part.Model); part.Model.Dispose(); }
         parts.Clear(); loadedGeometryKeys.Clear(); instanceKeys.Clear(); occurrences.Clear(); visibility.Clear(); rendererIssues.Clear(); selection = null; meshSelections.Clear();
         for (int i = leases.Count - 1; i >= 0; i--) leases[i].Dispose();
-        leases.Clear(); snapshot = null; StatusText.Text = "";
+        leases.Clear(); residencyRetirements.Clear(); snapshot = null; StatusText.Text = "";
         streamingSourceLease?.Dispose(); streamingSourceLease = null;
         if (previousDepthMsaa is { } msaa) { RenderView.MSAA = msaa; previousDepthMsaa = null; }
     }
@@ -611,6 +622,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     {
         Dispatcher.VerifyAccess();
         ++generation; loadCancellation?.Cancel();
+        StopMaterialResidency();
         await loadGate.WaitAsync();
         try { ClearScene(); } finally { loadGate.Release(); }
     }
@@ -625,7 +637,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     }
     private sealed record Part(InstancingMeshGeometryModel3D Model, IReadOnlyList<RenderOccurrence> Occurrences,
         IReadOnlyList<Guid> Identifiers, string PrimitiveKey, string? GeometryKey = null, GeometrySubmesh? Submesh = null,
-        AssetViewportService.GeometryLease? GeometryLease = null);
+        AssetViewportService.GeometryLease? GeometryLease = null, AssetViewportService.MaterialLease? MaterialLease = null);
     private sealed record PendingGeometry(Task<AssetViewportService.GeometryLease> Geometry, RenderMesh Mesh,
         MeshPrimitive Primitive, GeometrySubmesh Submesh, RenderOccurrence[] Rows, AssetViewportService.MaterialLease Material);
 

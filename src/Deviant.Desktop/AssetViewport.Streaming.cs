@@ -22,6 +22,7 @@ public partial class AssetViewport
         if (source.Meshes.Keys.Any(key => !loadedGeometryKeys.Contains(key))) await AppendSnapshotAsync(source, token);
         long current = ++generation;
         loadCancellation?.Cancel();
+        StopMaterialResidency();
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
         loadCancellation = cancellation;
         token = cancellation.Token;
@@ -39,51 +40,7 @@ public partial class AssetViewport
             foreach (var group in source.Occurrences.GroupBy(row => row.GeometryKey))
                 await ReconcileGeometryInstancesBatchedAsync(source, group.Key, group.ToArray(), token, instanceBatch);
             await instanceBatch.FlushAsync(token);
-            for (int index = 0; index < parts.Count; index++)
-            {
-                token.ThrowIfCancellationRequested();
-                if (current != generation || disposed) throw new OperationCanceledException(token);
-                var part = parts[index];
-                if (part.GeometryKey is null || part.Submesh is null || !source.Meshes.TryGetValue(part.GeometryKey, out var mesh))
-                    throw new InvalidDataException("The streamed mesh is unavailable.");
-                var primitive = mesh.Geometry.Primitives.Single(value => value.Key == part.PrimitiveKey);
-                RenderMaterial? materialSource = null;
-                if (mesh.MaterialsByPrimitive?.TryGetValue(primitive.Key, out var identity) == true)
-                    source.Materials.TryGetValue(identity, out materialSource);
-                var material = await service.AcquireMaterialAsync(source, materialSource, primitive, token);
-                leases.Add(material);
-                var geometry = await service.AcquireGeometryAsync(source, mesh, primitive, part.Submesh,
-                    material.UvSet, material.NormalMapped, token);
-                leases.Add(geometry);
-                if (material.RequiresSceneDepth)
-                {
-                    previousDepthMsaa ??= RenderView.MSAA;
-                    if (RenderView.MSAA == HelixToolkit.SharpDX.MSAALevel.Disable) RenderView.MSAA = HelixToolkit.SharpDX.MSAALevel.Two;
-                }
-                var model = new SurfaceInstancingModel(material.TechniqueName)
-                {
-                    Geometry = geometry.Geometry, Material = material.Material, IsTransparent = material.IsTransparent,
-                    Instances = part.Model.Instances, InstanceParamArray = part.Model.InstanceParamArray,
-                    InstanceIdentifiers = part.Model.InstanceIdentifiers,
-                    OctreeManager = new InstancingModel3DOctreeManager(),
-                    CullMode = part.Model.CullMode, IsHitTestVisible = true
-                };
-                RenderView.Items.Remove(part.Model); part.Model.Dispose();
-                if (streamedInstanceAllocations.Remove(part.Model, out var allocation))
-                { allocation.Model = model; streamedInstanceAllocations.Add(model, allocation); }
-                part.GeometryLease?.Dispose();
-                if (part.GeometryLease is not null) leases.Remove(part.GeometryLease);
-                var updated = part with { Model = model, GeometryLease = geometry }; parts[index] = updated;
-                ApplyInstances(updated); RenderView.Items.Add(model);
-                if (materialSource is not null)
-                    foreach (var diagnostic in material.Diagnostics)
-                        rendererIssues.Add(new(materialSource.Asset.Identity,
-                            material.IsUnavailable ? AssetViewportService.UnsupportedMaterialPassIssueCode : "MaterialRenderer", diagnostic));
-                LoadProgressChanged?.Invoke(this, new("Materials", index + 1, parts.Count, source.MemoryBudget.UsedBytes));
-                if ((index + 1) % 64 == 0) await WaitForFrameAsync(token);
-                else if ((index + 1) % 8 == 0) await Dispatcher.Yield(DispatcherPriority.Background);
-            }
-            await WaitForFrameAsync(token);
+            await InitializeSceneMaterialsAsync(source, current, token);
             UpdateVisibleStatus(); RefreshHiddenAnimation();
             await service.PrepareShaderBundleAsync(source, token);
         }

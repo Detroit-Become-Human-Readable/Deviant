@@ -131,7 +131,7 @@ public sealed partial class AssetViewportService : IDisposable
         long limit = ReadGpuLimit();
         if (bytes >= 0) unusedGeometries.TrimUntil(() => bytes <= limit - gpuBytes);
         if (bytes < 0 || bytes > limit - gpuBytes)
-            throw new InvalidOperationException($"The {category} exceeds the graphics memory limit.");
+            throw new ViewportGpuBudgetException(category, bytes, gpuBytes, limit);
         gpuBytes = checked(gpuBytes + bytes);
         return new ActionLease(() => gpuBytes -= bytes);
     }
@@ -190,7 +190,7 @@ public sealed partial class AssetViewportService : IDisposable
     }
 
     internal async Task<MaterialLease> AcquireMaterialAsync(RenderAssetSnapshot snapshot, RenderMaterial? source,
-        MeshPrimitive primitive, CancellationToken token)
+        MeshPrimitive primitive, CancellationToken token, bool deferred = false)
     {
         using var timing = AssetLoadDiagnostics.Measure("ViewportMaterial", source?.Asset.Identity.Key);
         dispatcher.VerifyAccess();
@@ -209,7 +209,7 @@ public sealed partial class AssetViewportService : IDisposable
         var state = ViewportMaterialStates.Create(source?.Asset.NativeRenderParameters);
         var key = $"{snapshot.Revision}/{source?.Asset.Identity.Key ?? "neutral"}/{string.Join(',', inputs.Order())}" +
             $"/normal-uv/{string.Join(',', primitiveNormalUvSets.Order())}/normals/{normalsAvailable}/tbn/{normalFrameAvailable}" +
-            $"/samplers/{string.Join(';', source?.TexturesBySlot.OrderBy(pair => pair.Key).Select(pair => $"{pair.Key}:{pair.Value.Sampling?.RawWord}") ?? [])}/state/{state.Key}";
+            $"/samplers/{string.Join(';', source?.TexturesBySlot.OrderBy(pair => pair.Key).Select(pair => $"{pair.Key}:{pair.Value.Sampling?.RawWord}") ?? [])}/state/{state.Key}/deferred/{deferred}";
         bool materialHit = materials.TryGetValue(key, out var cached);
         AssetLoadDiagnostics.Cache("MaterialCache", key, materialHit);
         if (materialHit) { TrackMaterialShaderUse(snapshot, cached!.GraphTechnique); cached.References++; return new(this, key, cached); }
@@ -224,7 +224,7 @@ public sealed partial class AssetViewportService : IDisposable
                 diagnostics.Add("Normal: Face normals used for display.");
             if (source?.Asset.NativeRenderParameters is { BlendSelector: >= 8 } unavailableState)
                 diagnostics.Add($"Blend: Mode {unavailableState.BlendSelector} is unavailable.");
-            if (source?.Asset.SurfaceGraph is { } graph)
+            if (!deferred && source?.Asset.SurfaceGraph is { } graph)
             {
                 var availableGraph = RestrictMissingTextures(graph, source.TexturesBySlot, diagnostics);
                 try
@@ -248,12 +248,13 @@ public sealed partial class AssetViewportService : IDisposable
             if (unavailableReason is not null)
                 graphTechnique = AcquireNormalTechnique(snapshot, state, includeDepthPrepass: false);
             else if (graphTechnique is null && source?.Asset.NativeRenderParameters is not null)
-                graphTechnique = AcquireNormalTechnique(snapshot, state);
+                graphTechnique = AcquireNormalTechnique(snapshot, state,
+                    includeDepthPrepass: !deferred || state.Depth.DepthWriteMask != SharpDX.Direct3D11.DepthWriteMask.Zero);
             var availableNormalUvSets = primitiveNormalUvSets.Where(index => graphTechnique?.IsSurfaceGraph != true || index == 0).ToHashSet();
-            var normalTexture = unavailableReason is null
+            var normalTexture = unavailableReason is null && !deferred
                 ? ViewportMaterials.FindUsableNormalTexture(source, availableNormalUvSets, normalFrameAvailable) : null;
             if (normalTexture is not null) texture = await AcquireTextureAsync(snapshot, normalTexture, normalMap: true, token);
-            var prepared = ViewportMaterials.Create(unavailableReason is null ? source : null, surface =>
+            var prepared = ViewportMaterials.Create(unavailableReason is null && !deferred ? source : null, surface =>
             {
                 if (!ReferenceEquals(surface, normalTexture) || texture is null)
                     throw new InvalidDataException("The normal texture changed during material preparation.");
@@ -306,26 +307,27 @@ public sealed partial class AssetViewportService : IDisposable
         var key = TextureContentKey.Create(source, snapshot.Revision, srgb);
         if (textures.TryAcquire(key, out var existing)) return new(this, existing!);
         EnsureResourceAdmission(snapshot.MemoryBudget, surface.PixelSource.ByteLength, surface.PixelSource.ByteLength);
-        IDisposable? held = snapshot.AcquireLease();
+        IDisposable? gpu = ReserveGpu(surface.PixelSource.ByteLength, "texture buffers");
+        IDisposable? held = null;
         RawTextureLoader? loader = null;
         try
         {
+            held = snapshot.AcquireLease();
             loader = await RawTextureLoader.CreateBackedAsync(surface, srgb, snapshot.MemoryBudget, token);
             token.ThrowIfCancellationRequested();
             var leased = textures.Acquire(key, () =>
             {
-                var gpu = ReserveGpu(surface.PixelSource.ByteLength, "texture buffers");
                 try
                 {
                     var model = new TextureModel(Guid.NewGuid(), loader);
-                    var entry = new TextureEntry(model, loader, null, gpu, held);
-                    loader = null; held = null; return entry;
+                    var entry = new TextureEntry(model, loader, null, gpu!, held);
+                    loader = null; held = null; gpu = null; return entry;
                 }
-                catch { gpu.Dispose(); throw; }
+                catch { gpu?.Dispose(); gpu = null; throw; }
             });
             return new(this, leased);
         }
-        finally { loader?.Dispose(); held?.Dispose(); }
+        finally { loader?.Dispose(); held?.Dispose(); gpu?.Dispose(); }
     }
 
     private TextureLease AcquireTexture(RenderAssetSnapshot snapshot, RenderTexture source, bool normalMap)
@@ -605,6 +607,12 @@ public sealed partial class AssetViewportService : IDisposable
     internal sealed class MaterialLease(AssetViewportService owner, string key, MaterialEntry entry) : IDisposable
     {
         private AssetViewportService? current = owner; public PhongMaterial Material => entry.Material;
+        public MaterialLease Retain()
+        {
+            var active = current ?? throw new ObjectDisposedException(nameof(MaterialLease));
+            active.dispatcher.VerifyAccess(); entry.References++;
+            return new(active, key, entry);
+        }
         public int UvSet => entry.UvSet; public bool NormalMapped => entry.NormalMapped;
         public string TechniqueName => entry.GraphTechnique?.TechniqueName ?? DefaultRenderTechniqueNames.InstancingMesh;
         public IReadOnlyList<string> Diagnostics => entry.Diagnostics;
