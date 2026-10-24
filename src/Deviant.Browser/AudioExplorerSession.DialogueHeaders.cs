@@ -11,6 +11,8 @@ namespace Deviant.Browser;
 public sealed partial class AudioExplorerSession
 {
     private const string DialogueHeaderCacheVersion = "audio-dialogue-header-associations-v1";
+    private const string DialogueHeaderCheckpointVersion = "audio-dialogue-header-associations-v2-streamed";
+    private const int MaximumDialogueHeaderCheckpointBytes = 4 * 1024 * 1024;
     private const int MaximumDialogueHeaderCacheBytes = 128 * 1024 * 1024;
     private const int MaximumDialogueCandidates = 200_000;
     private const int MaximumDialogueDigests = 200_000;
@@ -18,6 +20,10 @@ public sealed partial class AudioExplorerSession
     private sealed record DialogueHeaderEnvelope(string IndexContentId, string PhysicalSourceStamp,
         FileStamp IndexStamp, IReadOnlyList<VolumeSource> Volumes, int SchemaVersion, bool Complete,
         int Count, string RowsSha256, IReadOnlyList<DialogueHeaderAssociation> Rows);
+
+    private sealed record DialogueHeaderCheckpoint(string IndexContentId, string PhysicalSourceStamp,
+        FileStamp IndexStamp, IReadOnlyList<VolumeSource> Volumes, int SchemaVersion, bool Complete,
+        int Count, string RowsSha256);
 
     public bool AreDialogueHeadersReady => Catalog.DialogueHeaderVersion == DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion ||
         browseSummary?.DialogueHeaderVersion == DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion;
@@ -34,7 +40,7 @@ public sealed partial class AudioExplorerSession
         try
         {
             if (Catalog.DialogueHeaderVersion != DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion)
-                await LoadDialogueHeadersAsync(featureStore, BuildSnapshotFeatureKey(Snapshot), Snapshot, Catalog, token).ConfigureAwait(false);
+                await LoadDialogueHeadersAsync(featureStore, cache, BuildSnapshotFeatureKey(Snapshot), Snapshot, Catalog, token).ConfigureAwait(false);
             if (Catalog.DialogueHeaderVersion != DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion)
             {
                 browseSummary = null;
@@ -46,12 +52,62 @@ public sealed partial class AudioExplorerSession
 
     private static string DialogueHeaderKey(string featureKey) => featureKey + "/dialogue-headers";
 
-    private static async Task LoadDialogueHeadersAsync(FeatureStore store, string featureKey,
+    private static async Task LoadDialogueHeadersAsync(FeatureStore store, CacheManager cache, string featureKey,
         ArchiveSnapshot snapshot, AudioCatalog catalog, CancellationToken token)
     {
-        await Task.Run(() =>
+        await Task.Run(async () =>
         {
             ValidateDialogueSnapshot(snapshot, token);
+            DialogueHeaderCheckpoint? checkpoint;
+            try { checkpoint = store.LoadBounded<DialogueHeaderCheckpoint>(DialogueHeaderKey(featureKey),
+                DialogueHeaderCheckpointVersion, MaximumDialogueHeaderCheckpointBytes, token); }
+            catch (Exception error) when (error is InvalidDataException or JsonException) { return; }
+            if (checkpoint is not null)
+            {
+                if (!checkpoint.Complete || checkpoint.IndexStamp is null || checkpoint.Volumes is null ||
+                    checkpoint.Volumes.Any(volume => volume is null || volume.Stamp is null) ||
+                    checkpoint.SchemaVersion != DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion ||
+                    checkpoint.IndexContentId != snapshot.IndexContentId || checkpoint.PhysicalSourceStamp != snapshot.PhysicalSourceStamp ||
+                    !SourceIdentity.SameStamp(checkpoint.IndexStamp, snapshot.IndexStamp) ||
+                    !MetadataCacheSourcePolicy.SameVolumes(checkpoint.Volumes, snapshot.Volumes) ||
+                    checkpoint.Count < 0 || checkpoint.Count > DetroitAudioSnapshotReader.MaximumDialogueHeaders ||
+                    checkpoint.RowsSha256 is not { Length: 64 } digest || !digest.All(Uri.IsHexDigit)) return;
+                List<DialogueHeaderAssociation> restored;
+                try
+                {
+                    await using var artifact = await AudioDialogueHeaderArtifact.AcquireAsync(cache,
+                        new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp), checkpoint.Count, checkpoint.RowsSha256,
+                        MaximumDialogueHeaderCacheBytes, null, token).ConfigureAwait(false);
+                    restored = await artifact.ReadAsync(token).ConfigureAwait(false);
+                    ValidateDialogueRows(snapshot, restored, token);
+                    if (checkpoint.RowsSha256 != DialogueRowsHash(restored, token)) return;
+                }
+                catch (Exception error) when (error is IOException or InvalidDataException or JsonException)
+                {
+                    using var repair = AssetLoadDiagnostics.Measure("DialogueArtifactRepair");
+                    var sourceRows = await new DetroitAudioSnapshotReader().ReadDialogueHeaderAssociationsAsync(snapshot, token).ConfigureAwait(false);
+                    ValidateDialogueRows(snapshot, sourceRows, token);
+                    if (sourceRows.Count != checkpoint.Count || DialogueRowsHash(sourceRows, token) != checkpoint.RowsSha256) return;
+                    try
+                    {
+                        await using var rebuilt = await AudioDialogueHeaderArtifact.AcquireAsync(cache,
+                            new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp), checkpoint.Count, checkpoint.RowsSha256,
+                            MaximumDialogueHeaderCacheBytes, sourceRows, token).ConfigureAwait(false);
+                    }
+                    catch (IOException storage) when (storage.Data["ErrorCode"] is "CacheStorageLimit" ||
+                        (storage.HResult & 0xffff) is 112 or 39)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        AssetLoadDiagnostics.Counters("DialogueArtifactRepair", checkpoint.RowsSha256,
+                            new Dictionary<string, long> { ["Rows"] = sourceRows.Count, ["CacheWriteDeferred"] = 1 });
+                    }
+                    restored = sourceRows.ToList();
+                }
+                ValidateDialogueSnapshot(snapshot, token);
+                catalog.DialogueHeaderAssociations = restored;
+                catalog.DialogueHeaderVersion = checkpoint.SchemaVersion;
+                return;
+            }
             DialogueHeaderEnvelope? envelope;
             try { envelope = store.LoadBounded<DialogueHeaderEnvelope>(DialogueHeaderKey(featureKey),
                 DialogueHeaderCacheVersion, MaximumDialogueHeaderCacheBytes, token); }
@@ -65,7 +121,7 @@ public sealed partial class AudioExplorerSession
             try
             {
                 ValidateDialogueRows(snapshot, envelope.Rows, token);
-                if (envelope.Count != envelope.Rows.Count || envelope.RowsSha256 != DialogueRowsHash(envelope.Rows)) return;
+                if (envelope.Count != envelope.Rows.Count || envelope.RowsSha256 != DialogueRowsHash(envelope.Rows, token)) return;
             }
             catch (InvalidDataException) { return; }
             ValidateDialogueSnapshot(snapshot, token);
@@ -74,24 +130,28 @@ public sealed partial class AudioExplorerSession
         }, token).ConfigureAwait(false);
     }
 
-    private static async Task<LinkedFeatureDependencies?> SaveDialogueHeadersAsync(FeatureStore store, string featureKey,
+    private static async Task<LinkedFeatureDependencies?> SaveDialogueHeadersAsync(FeatureStore store, CacheManager cache, string featureKey,
         ArchiveSnapshot snapshot, AudioCatalog catalog, CancellationToken token, LinkedFeatureScope? browseScope = null,
         LinkedFeatureDependencies? expected = null)
     {
-        return await Task.Run(() =>
+        return await Task.Run(async () =>
         {
             ValidateDialogueSnapshot(snapshot, token);
             ValidateDialogueRows(snapshot, catalog.DialogueHeaderAssociations, token);
             var rows = catalog.DialogueHeaderAssociations.ToArray();
-            var envelope = new DialogueHeaderEnvelope(snapshot.IndexContentId, snapshot.PhysicalSourceStamp,
+            var checkpoint = new DialogueHeaderCheckpoint(snapshot.IndexContentId, snapshot.PhysicalSourceStamp,
                 snapshot.IndexStamp, snapshot.Volumes, DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion,
-                true, rows.Length, DialogueRowsHash(rows), rows);
+                true, rows.Length, DialogueRowsHash(rows, token));
+            await using var artifact = await AudioDialogueHeaderArtifact.AcquireAsync(cache,
+                new(snapshot.IndexContentId, snapshot.PhysicalSourceStamp), checkpoint.Count, checkpoint.RowsSha256,
+                MaximumDialogueHeaderCacheBytes, rows, token).ConfigureAwait(false);
+            ValidateDialogueSnapshot(snapshot, token);
             token.ThrowIfCancellationRequested();
             LinkedFeatureDependencies? fence = null;
             if (browseScope is null)
-                store.SaveBounded(DialogueHeaderKey(featureKey), DialogueHeaderCacheVersion, envelope, MaximumDialogueHeaderCacheBytes, token);
+                store.SaveBounded(DialogueHeaderKey(featureKey), DialogueHeaderCheckpointVersion, checkpoint, MaximumDialogueHeaderCheckpointBytes, token);
             else if (expected is not null) fence = store.TrySaveLinkedFeatureCheckpoint(expected,
-                BoundedFeatureWrite.Create(DialogueHeaderKey(featureKey), DialogueHeaderCacheVersion, envelope, MaximumDialogueHeaderCacheBytes), token);
+                BoundedFeatureWrite.Create(DialogueHeaderKey(featureKey), DialogueHeaderCheckpointVersion, checkpoint, MaximumDialogueHeaderCheckpointBytes), token);
             ValidateDialogueSnapshot(snapshot, token);
             return fence;
         }, token).ConfigureAwait(false);
@@ -106,7 +166,7 @@ public sealed partial class AudioExplorerSession
             var rows = await new DetroitAudioSnapshotReader().ReadDialogueHeaderAssociationsAsync(Snapshot, token).ConfigureAwait(false);
             var candidate = new AudioCatalog { DialogueHeaderAssociations = rows.ToList(),
                 DialogueHeaderVersion = DetroitAudioSnapshotReader.DialogueHeaderAssociationVersion };
-            var finalFence = await SaveDialogueHeadersAsync(featureStore, featureKey, Snapshot, candidate, token,
+            var finalFence = await SaveDialogueHeadersAsync(featureStore, cache, featureKey, Snapshot, candidate, token,
                 BrowseScope, cachedBrowseDependencies).ConfigureAwait(false);
             token.ThrowIfCancellationRequested();
             lock (catalogGate)
@@ -145,15 +205,15 @@ public sealed partial class AudioExplorerSession
         }
     }
 
-    private static string DialogueRowsHash(IReadOnlyList<DialogueHeaderAssociation> rows)
+    private static string DialogueRowsHash(IReadOnlyList<DialogueHeaderAssociation> rows, CancellationToken token)
     {
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        using var stream = new DialogueHashStream(hash);
+        using var stream = new DialogueHashStream(hash, token);
         JsonSerializer.Serialize(stream, rows);
         return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
     }
 
-    private sealed class DialogueHashStream(IncrementalHash hash) : Stream
+    private sealed class DialogueHashStream(IncrementalHash hash, CancellationToken token) : Stream
     {
         private long written;
         public override bool CanRead => false;
@@ -165,6 +225,7 @@ public sealed partial class AudioExplorerSession
         public override void Write(byte[] buffer, int offset, int count) => Write(buffer.AsSpan(offset, count));
         public override void Write(ReadOnlySpan<byte> buffer)
         {
+            token.ThrowIfCancellationRequested();
             if (buffer.Length > MaximumDialogueHeaderCacheBytes - written)
                 throw new InvalidDataException("Dialogue header serialization exceeds its limit.");
             hash.AppendData(buffer); written += buffer.Length;

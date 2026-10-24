@@ -258,8 +258,12 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
                 if (assetFence is null) continue;
                 var mediaFence = await SaveSnapshotItemsAsync(featureKey, result, progress, token, assetFence).ConfigureAwait(false);
                 if (mediaFence is null) continue;
-                finalFence = await SaveDialogueHeadersAsync(featureStore, featureKey, Snapshot,
+                ReportEnrichmentProgress("Saving dialogue links", 0, result.Catalog.DialogueHeaderAssociations.Count, progress);
+                finalFence = await SaveDialogueHeadersAsync(featureStore, cache, featureKey, Snapshot,
                     result.Catalog, token, BrowseScope, mediaFence).ConfigureAwait(false);
+                if (finalFence is not null)
+                    ReportEnrichmentProgress("Saving dialogue links", result.Catalog.DialogueHeaderAssociations.Count,
+                        result.Catalog.DialogueHeaderAssociations.Count, progress);
             }
             if (finalFence is null) throw new InvalidDataException("Audio metadata changed while saving. Retry indexing after the other update finishes.");
             Interlocked.Exchange(ref enrichmentComplete, 1);

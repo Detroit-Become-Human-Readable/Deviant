@@ -39,7 +39,7 @@ public sealed partial class AudioExplorerSession
             await RestoreRecoveryCountAsync(token).ConfigureAwait(false);
             return;
         }
-        await LoadDialogueHeadersAsync(featureStore, featureKey, Snapshot, result.Catalog, token).ConfigureAwait(false);
+        await LoadDialogueHeadersAsync(featureStore, cache, featureKey, Snapshot, result.Catalog, token).ConfigureAwait(false);
         var marker = await Task.Run(() => featureStore.Load<AudioFeatureMarker>("audio-feature-index", AssetIndexVersion, token), token).ConfigureAwait(false);
         var projectionCount = await Task.Run(() => featureStore.Count(new(Family: AssetFamily), token), token).ConfigureAwait(false);
         cachedBrowseDependencies = await ReplaceSnapshotAsync(result, initializeFeatures: true, token,
