@@ -11,7 +11,6 @@ namespace Deviant.Export.Models;
 /// <remarks>The instance reuses its scratch storage and must not be evaluated concurrently.</remarks>
 public sealed class MaterialSurfaceExpressionEvaluator
 {
-    private const int MaximumDepth = 64;
     private const int MaximumNodes = 4096;
 
     private readonly CompiledNode[] _nodes;
@@ -27,28 +26,21 @@ public sealed class MaterialSurfaceExpressionEvaluator
         var topological = CompileOrder(root);
         _nodes = new CompiledNode[topological.Count];
         var indices = new Dictionary<MaterialExpression, int>(ReferenceEqualityComparer.Instance);
-        var heights = new Dictionary<MaterialExpression, int>(ReferenceEqualityComparer.Instance);
 
         for (var index = 0; index < topological.Count; index++)
         {
             var expression = topological[index];
             var width = Width(expression.ValueType);
             var arguments = new int[expression.Arguments.Count];
-            var height = 1;
             for (var argumentIndex = 0; argumentIndex < arguments.Length; argumentIndex++)
             {
                 var argument = expression.Arguments[argumentIndex];
                 arguments[argumentIndex] = indices[argument];
-                height = Math.Max(height, heights[argument] + 1);
             }
-
-            if (height > MaximumDepth)
-                throw InvalidGraph("The expression graph exceeds the nesting limit.");
 
             ValidateNode(expression, width);
             _nodes[index] = new CompiledNode(expression, arguments, width);
             indices.Add(expression, index);
-            heights.Add(expression, height);
         }
 
         _rootIndex = indices[root];
@@ -391,54 +383,7 @@ public sealed class MaterialSurfaceExpressionEvaluator
     }
 
     private static List<MaterialExpression> CompileOrder(MaterialExpression root)
-    {
-        var colors = new Dictionary<MaterialExpression, byte>(ReferenceEqualityComparer.Instance);
-        var nodes = new List<MaterialExpression>();
-        Visit(root, 1, colors, nodes);
-
-        var heights = new Dictionary<MaterialExpression, int>(ReferenceEqualityComparer.Instance);
-        foreach (var node in nodes)
-        {
-            var height = 1;
-            foreach (var argument in node.Arguments)
-                height = Math.Max(height, heights[argument] + 1);
-            if (height > MaximumDepth)
-                throw InvalidGraph("The expression graph exceeds the nesting limit.");
-            heights.Add(node, height);
-        }
-
-        return nodes;
-    }
-
-    private static void Visit(
-        MaterialExpression node,
-        int depth,
-        Dictionary<MaterialExpression, byte> colors,
-        List<MaterialExpression> nodes)
-    {
-        if (depth > MaximumDepth)
-            throw InvalidGraph("The expression graph exceeds the nesting limit.");
-        if (colors.TryGetValue(node, out var color))
-        {
-            if (color == 1)
-                throw InvalidGraph("The expression graph contains a cycle.");
-            return;
-        }
-        if (nodes.Count >= MaximumNodes)
-            throw InvalidGraph("The expression graph exceeds the node limit.");
-
-        colors.Add(node, 1);
-        if (node.Arguments is null)
-            throw InvalidGraph("An expression has no argument list.");
-        foreach (var argument in node.Arguments)
-        {
-            if (argument is null)
-                throw InvalidGraph("An expression contains a missing argument.");
-            Visit(argument, depth + 1, colors, nodes);
-        }
-        colors[node] = 2;
-        nodes.Add(node);
-    }
+        => MaterialExpressionGraph.GetPostOrder(root, MaximumNodes).ToList();
 
     private static void ValidateNode(MaterialExpression node, int width)
     {

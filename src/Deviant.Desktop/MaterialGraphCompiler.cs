@@ -18,7 +18,7 @@ public static class MaterialGraphCompiler
 {
     public const int MaximumTextureSlots = 16;
     public const int MaximumNodes = 4096;
-    public const int MaximumDepth = 64;
+    public const int MaximumDepth = MaximumNodes;
     public const int MaximumSourceCharacters = 128 * 1024;
 
     public static CompiledMaterialGraph Compile(MaterialSurfaceGraph graph,
@@ -78,7 +78,7 @@ public static class MaterialGraphCompiler
             {
                 if (!outputTypes.Contains(expression.ValueType)) throw new InvalidDataException("Invalid output type.");
                 var emitter = new Emitter(role, declaredSlots, availableInputs, token, samplerGroups is not null);
-                string result = emitter.Emit(expression, 0);
+                string result = emitter.Emit(expression);
                 if (slots.Concat(emitter.TextureSlots).Distinct().Count() > MaximumTextureSlots)
                     throw new InvalidDataException("The role exceeds the texture limit.");
                 if (output.Length + emitter.Statements.Length + 4096 > MaximumSourceCharacters)
@@ -111,10 +111,18 @@ public static class MaterialGraphCompiler
         public HashSet<int> TextureSlots { get; } = [];
         public HashSet<MaterialInput> Inputs { get; } = [];
 
-        public string Emit(MaterialExpression expression, int depth)
+        public string Emit(MaterialExpression expression)
+        {
+            IReadOnlyList<MaterialExpression> order;
+            try { order = MaterialExpressionGraph.GetPostOrder(expression, MaximumNodes, token); }
+            catch (ArgumentException error) { throw new InvalidDataException(error.Message, error); }
+            foreach (var node in order) EmitNode(node);
+            return emitted[expression];
+        }
+
+        private string EmitNode(MaterialExpression expression)
         {
             token.ThrowIfCancellationRequested();
-            if (depth > MaximumDepth) throw new InvalidDataException("The expression is too deep.");
             if (emitted.TryGetValue(expression, out var existing)) return existing;
             if (emitted.Count + visiting.Count >= MaximumNodes) throw new InvalidDataException("The expression is too large.");
             if (!visiting.Add(expression)) throw new InvalidDataException("The expression contains a cycle.");
@@ -122,8 +130,10 @@ public static class MaterialGraphCompiler
             {
                 int width = Width(expression.ValueType);
                 var arguments = expression.Arguments;
+                if (arguments is null) throw new InvalidDataException("An expression has no argument list.");
                 if (arguments.Count > 4) throw new InvalidDataException("Too many expression arguments.");
-                string[] args = arguments.Select(x => Emit(x, depth + 1)).ToArray();
+                string[] args = arguments.Select(argument => argument is not null && emitted.TryGetValue(argument, out var dependency)
+                    ? dependency : throw new InvalidDataException("An expression dependency changed during compilation.")).ToArray();
                 string code = expression.Operation switch
                 {
                     MaterialExpressionOperation.Constant => Constant(),

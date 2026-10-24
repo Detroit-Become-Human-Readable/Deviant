@@ -132,6 +132,7 @@ public partial class CharactersView
         }
         catch (Exception error)
         {
+            WorkflowDiagnostics.Failure("Characters.Export", error, descriptor.Identity.Key);
             if (IsCurrentExport(version, descriptor, binding, lod, provider, request, includeCancellation: true))
             {
                 if (ExportStatus is not null)

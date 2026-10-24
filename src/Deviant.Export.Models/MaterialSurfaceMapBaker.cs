@@ -463,8 +463,13 @@ public static class MaterialSurfaceMapBaker
     public static string ComputeGraphHash(MaterialSurfaceGraph graph)
     {
         ArgumentNullException.ThrowIfNull(graph);
-        foreach (var root in new[] { graph.BaseColor, graph.Opacity, graph.AlphaCutoff }.OfType<MaterialExpression>())
-            _ = new MaterialSurfaceExpressionEvaluator(root);
+        try
+        {
+            foreach (var root in new[] { graph.BaseColor, graph.Opacity, graph.AlphaCutoff }.OfType<MaterialExpression>())
+                _ = new MaterialSurfaceExpressionEvaluator(root);
+        }
+        catch (ArgumentException error) when (error.ParamName == "root")
+        { throw new InvalidDataException("The material expression graph is invalid: " + error.Message, error); }
         return GraphHash(graph);
     }
     private static string GraphHash(MaterialSurfaceGraph graph)
@@ -474,10 +479,14 @@ public static class MaterialSurfaceMapBaker
         {
             if (node is null) return null;
             if (indices.TryGetValue(node, out int existing)) return existing;
-            var arguments = node.Arguments.Select(argument => Visit(argument)!.Value).ToArray();
-            int index = nodes.Count; indices.Add(node, index);
-            nodes.Add(new { node.Operation, node.ValueType, Arguments = arguments, node.Constants, node.Input, node.TextureSlot, node.Components });
-            return index;
+            foreach (var item in MaterialExpressionGraph.GetPostOrder(node))
+            {
+                if (indices.ContainsKey(item)) continue;
+                var arguments = item.Arguments.Select(argument => indices[argument]).ToArray();
+                int index = nodes.Count; indices.Add(item, index);
+                nodes.Add(new { item.Operation, item.ValueType, Arguments = arguments, item.Constants, item.Input, item.TextureSlot, item.Components });
+            }
+            return indices[node];
         }
         int? color = Visit(graph.BaseColor), opacity = Visit(graph.Opacity), cutoff = Visit(graph.AlphaCutoff);
         return Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new { Color = color, Opacity = opacity, Cutoff = cutoff, Nodes = nodes }))).ToLowerInvariant();
