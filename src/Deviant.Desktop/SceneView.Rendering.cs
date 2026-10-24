@@ -229,6 +229,12 @@ public partial class SceneView
         using var diagnostic = WorkflowDiagnostics.Begin("Scene.Load", request.Section.Descriptor.Identity.Key);
         using var foreground = ForegroundWorkProvider?.Invoke();
         var previousSnapshot = renderSnapshot;
+        var previousOccurrenceKey = selectedOccurrence?.Key;
+        var previousMeshSelections = SceneViewport.SelectedMeshes;
+        var previousRenderTreeKey = RenderedTab.IsSelected
+            ? (RenderHierarchy.SelectedItem as RenderTreeRow)?.Node.Key : null;
+        var previousStructureIdentity = previousOccurrenceKey is null && SceneTabs.SelectedIndex == 1
+            ? selectedEntity ?? selectedNode?.Identity : null;
         var viewportTouched = false;
         bool streamed = false;
         IDisposable? provisionalLease = null;
@@ -276,7 +282,16 @@ public partial class SceneView
                 if (!ReferenceEquals(section, request.Section) || request.Section.Result.Revision != session?.Revision)
                     throw new OperationCanceledException(cancellation.Token);
                 ApproveLargeData(request.Section);
-                await ReleaseRenderSnapshotAsync();
+                var releasedPrevious = previousSnapshot;
+                previousSnapshot = null;
+                previousOccurrenceKey = null;
+                previousMeshSelections = [];
+                previousRenderTreeKey = null;
+                previousStructureIdentity = null;
+                previousCamera = null;
+                viewportTouched = true;
+                try { await ReleaseRenderSnapshotAsync(); }
+                finally { releasedPrevious?.Dispose(); }
                 provisionalLease?.Dispose();
                 provisionalLease = null;
                 UpdateRenderLoadingProgress(new("Reading scene", 0, 0, 0));
@@ -336,17 +351,17 @@ public partial class SceneView
                     throw new OperationCanceledException(cancellation.Token);
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException error)
         {
             diagnostic?.Cancel();
-            if (viewportTouched) await RestorePreviousSnapshotAsync();
+            if (viewportTouched) await RestorePreviousSnapshotAsync(error);
             SetActivityTerminal("Cancelled");
             throw;
         }
         catch (Exception error)
         {
             diagnostic?.Fail(error, error is ArchiveException archive ? archive.Code : null, partial: viewportTouched);
-            if (viewportTouched) await RestorePreviousSnapshotAsync();
+            if (viewportTouched) await RestorePreviousSnapshotAsync(error);
             SetActivityTerminal("Failed");
             throw;
         }
@@ -363,15 +378,20 @@ public partial class SceneView
             }
         }
 
-        async Task RestorePreviousSnapshotAsync()
+        async Task RestorePreviousSnapshotAsync(Exception originalFailure)
         {
-            await SceneViewport.UnloadAsync();
-            candidate?.Dispose();
-            candidate = null;
-            renderSnapshot = previousSnapshot;
-            if (previousSnapshot is null || !ReferenceEquals(renderSnapshot, previousSnapshot)) return;
             try
             {
+                await SceneViewport.UnloadAsync();
+                var discarded = candidate;
+                candidate = null;
+                discarded?.Dispose();
+                if (previousSnapshot is null)
+                {
+                    await ReleaseRenderSnapshotAsync();
+                    return;
+                }
+                renderSnapshot = previousSnapshot;
                 await LoadViewportSnapshotAsync(previousSnapshot, CancellationToken.None);
                 if (previousCamera is not null && SceneViewport.Viewport.Camera is HelixToolkit.Wpf.SharpDX.PerspectiveCamera camera)
                 {
@@ -380,8 +400,44 @@ public partial class SceneView
                     camera.UpDirection = previousCamera.UpDirection;
                     camera.NearPlaneDistance = previousCamera.NearPlaneDistance;
                 }
+                ClearRenderInspector();
+                selectedOccurrence = null;
+                BuildRenderHierarchy(previousSnapshot);
+                UpdateRenderedCount();
+                Advanced.Text = FormatCoverage(previousSnapshot) + "\n" + FormatIssues(previousSnapshot.Issues.Concat(SceneViewport.RendererIssues));
+                if (previousMeshSelections.Count > 0)
+                    SelectMeshes(previousMeshSelections);
+                else if (previousOccurrenceKey is { } occurrenceKey && previousSnapshot.Occurrences.Any(item => item.Key == occurrenceKey))
+                    SelectOccurrence(occurrenceKey);
+                else if (previousRenderTreeKey is { } treeKey && renderRows.TryGetValue(treeKey, out var selectedRow))
+                {
+                    RenderedTab.IsSelected = true;
+                    selectedRow.IsSelected = true;
+                    SelectRenderTreeItem(selectedRow);
+                }
+                else if (previousStructureIdentity is { } structureIdentity)
+                    TrySelectIdentity(request.Section, structureIdentity);
             }
-            catch { await SceneViewport.UnloadAsync(); }
+            catch (Exception restoreError)
+            {
+                originalFailure.Data["SceneRestoreError"] = restoreError.ToString();
+                WorkflowDiagnostics.Failure("Scene.Restore", restoreError, request.Section.Descriptor.Identity.Key);
+                try { await ReleaseRenderSnapshotAsync(); }
+                catch (Exception cleanupError)
+                {
+                    originalFailure.Data["SceneRestoreCleanupError"] = cleanupError.ToString();
+                    WorkflowDiagnostics.Failure("Scene.RestoreCleanup", cleanupError, request.Section.Descriptor.Identity.Key);
+                }
+                finally
+                {
+                    try { previousSnapshot?.Dispose(); }
+                    catch (Exception cleanupError)
+                    {
+                        originalFailure.Data["ScenePreviousSnapshotCleanupError"] = cleanupError.ToString();
+                        WorkflowDiagnostics.Failure("Scene.PreviousSnapshotCleanup", cleanupError, request.Section.Descriptor.Identity.Key);
+                    }
+                }
+            }
         }
     }
 
@@ -421,13 +477,23 @@ public partial class SceneView
 
     private async Task ReleaseRenderSnapshotAsync()
     {
-        await SceneViewport.UnloadAsync();
-        if (renderSnapshot is not null || selectedOccurrence is not null) ClearRenderInspector();
-        renderSnapshot?.Dispose(); renderSnapshot = null;
-        selectedOccurrence = null; renderRows.Clear();
-        RenderHierarchy.ItemsSource = null;
-        MappedTextures.ItemsSource = null; OpenModelButton.IsEnabled = false;
-        RenderSummary.Text = RenderStatus.Text = "";
+        try { await SceneViewport.UnloadAsync(); }
+        finally
+        {
+            var released = renderSnapshot;
+            renderSnapshot = null;
+            try { released?.Dispose(); }
+            finally
+            {
+                ClearRenderInspector();
+                selectedOccurrence = null; renderRows.Clear();
+                RenderHierarchy.ItemsSource = null;
+                MappedTextures.ItemsSource = null; OpenModelButton.IsEnabled = false;
+                RenderSummary.Text = RenderStatus.Text = "";
+                lastSuccessfulSceneRenderRequest = null;
+                lastSuccessfulRenderBudget = null;
+            }
+        }
     }
 
     private void BuildRenderHierarchy(RenderAssetSnapshot source)
@@ -545,7 +611,12 @@ public partial class SceneView
     private bool SelectRenderTreeItem(string occurrenceKey)
     {
         var row = renderRows.Values.FirstOrDefault(item => item.Node.OccurrenceKey == occurrenceKey);
-        if (row is null) return false;
+        return row is not null && SelectRenderTreeItem(row);
+    }
+
+    private bool SelectRenderTreeItem(RenderTreeRow selectedRow)
+    {
+        var row = selectedRow;
         var path = new Stack<RenderTreeRow>();
         var visited = new HashSet<string>();
         while (visited.Add(row.Node.Key))
@@ -567,7 +638,7 @@ public partial class SceneView
                 container.BringIntoView();
                 container.IsSelected = true;
                 parent.UpdateLayout();
-                return RenderHierarchy.SelectedItem is RenderTreeRow current && current.Node.OccurrenceKey == occurrenceKey;
+                return ReferenceEquals(RenderHierarchy.SelectedItem, selectedRow);
             }
             container.IsExpanded = true; parent = container;
         }

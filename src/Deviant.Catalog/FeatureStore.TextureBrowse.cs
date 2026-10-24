@@ -86,14 +86,12 @@ public sealed partial class FeatureStore
         string profile, long? generation, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
+        long current = ReadTextureProjectionHead(read, transaction, profile, generation);
         using var head = ReadTextureCommand(read, transaction,
-            "SELECT generation,minimum_generation FROM texture_projection_heads WHERE revision=$revision AND profile=$profile " +
-            "AND EXISTS(SELECT 1 FROM texture_projection_alias_migrations WHERE version=1) " +
+            "SELECT 1 WHERE EXISTS(SELECT 1 FROM texture_projection_alias_migrations WHERE version=1) " +
             "AND NOT EXISTS(SELECT 1 FROM texture_projection_history_dirty WHERE revision=$revision AND profile=$profile)", revision, profile);
-        using var rows = head.ExecuteReader();
-        if (!rows.Read() || (generation is { } requested && (requested < rows.GetInt64(1) || requested > rows.GetInt64(0))))
-            throw new ArchiveException("TextureBrowseGenerationUnavailable", "The texture index has changed. Refresh the page.");
-        return generation ?? rows.GetInt64(0);
+        if (head.ExecuteScalar() is null) throw TextureGenerationUnavailable();
+        return generation ?? current;
     }
 
     private TextureBrowseToken ResolveTextureBrowsePin(SqliteConnection read, SqliteTransaction transaction,

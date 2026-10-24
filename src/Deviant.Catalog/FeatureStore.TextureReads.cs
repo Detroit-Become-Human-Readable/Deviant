@@ -91,9 +91,7 @@ public sealed partial class FeatureStore
         SqliteConnection read, SqliteTransaction transaction, string profile, CancellationToken token)
         => CatalogService.ExecuteInterruptible(read, token, () =>
         {
-            using var head = ReadTextureCommand(read, transaction,
-                "SELECT generation FROM texture_projection_heads WHERE revision=$revision AND profile=$profile", revision, profile);
-            var generation = Convert.ToInt64(head.ExecuteScalar() ?? 0L);
+            long generation = ReadTextureProjectionHead(read, transaction, profile, null);
             using var version = read.CreateCommand(); version.Transaction = transaction;
             version.CommandText = "PRAGMA data_version";
             var dataVersion = Convert.ToInt64(version.ExecuteScalar() ?? 0L);

@@ -751,8 +751,8 @@ public sealed partial class FeatureStore
     private bool UseCurrentTextureProjection(string profile, long generation, SqliteTransaction transaction)
     {
         using var diagnostic = TextureDiagnostic("TextureBrowser.Store.CurrentIndex", TextureDiagnosticKey());
-        using var head = TextureCommand("SELECT generation FROM texture_projection_heads WHERE revision=$revision AND profile=$profile", profile, transaction);
-        if (head.ExecuteScalar() is not long current || current != generation)
+        long current = ReadTextureProjectionHead(connection, transaction, profile, generation);
+        if (current != generation)
         { RefreshTextureHistory(profile, transaction); return false; }
         using var pending = TextureCommand("SELECT 1 FROM texture_projection_current_dirty WHERE revision=$revision AND profile=$profile LIMIT 1", profile, transaction);
         if (pending.ExecuteScalar() is null) return true;
@@ -971,15 +971,22 @@ public sealed partial class FeatureStore
         {
             waitDiagnostic?.Dispose();
             using var holdDiagnostic = TextureDiagnostic("TextureBrowser.Store.EvidenceHold", diagnosticKey);
-            EnsureTextureSchema(); using var command = TextureCommand("SELECT length(e.payload),CASE WHEN length(e.payload)<=$maximum THEN e.payload ELSE NULL END,e.sha256 FROM texture_projection_evidence e WHERE e.revision=$revision AND e.profile=$profile AND e.identity=$identity AND e.generation=(SELECT MAX(p.generation) FROM texture_projection_rows p WHERE p.revision=e.revision AND p.profile=e.profile AND p.identity=e.identity AND p.generation<=$generation)", profile);
+            EnsureTextureSchema(); using var transaction = connection.BeginTransaction(deferred: true);
+            _ = ReadTextureProjectionHead(connection, transaction, profile, generation);
+            using var command = TextureCommand("SELECT length(e.payload),CASE WHEN length(e.payload)<=$maximum THEN e.payload ELSE NULL END,e.sha256 FROM texture_projection_evidence e WHERE e.revision=$revision AND e.profile=$profile AND e.identity=$identity AND e.generation=(SELECT MAX(p.generation) FROM texture_projection_rows p WHERE p.revision=e.revision AND p.profile=e.profile AND p.identity=e.identity AND p.generation<=$generation)", profile, transaction);
             command.Parameters.AddWithValue("$identity", identity.Key); command.Parameters.AddWithValue("$generation", generation);
             command.Parameters.AddWithValue("$maximum", MaximumTextureEvidenceBytes);
-            using var reader = command.ExecuteReader(); if (!reader.Read()) return null;
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                reader.Close(); token.ThrowIfCancellationRequested(); transaction.Commit(); return null;
+            }
             if (reader.GetInt64(0) > MaximumTextureEvidenceBytes || reader.IsDBNull(1)) throw new InvalidDataException("TextureProjectionEvidenceLimit");
             var payload = (byte[])reader.GetValue(1);
             if (Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant() != reader.GetString(2))
                 throw new InvalidDataException("TextureProjectionEvidenceChecksum");
-            token.ThrowIfCancellationRequested(); return JsonSerializer.Deserialize<TextureDiscoveryEntry>(payload);
+            var result = JsonSerializer.Deserialize<TextureDiscoveryEntry>(payload);
+            reader.Close(); token.ThrowIfCancellationRequested(); transaction.Commit(); return result;
         });
     }
 
