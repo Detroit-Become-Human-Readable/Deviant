@@ -32,15 +32,18 @@ public sealed partial class FeatureStore
         if (rebindUnpublished && generation is not null) throw new ArgumentException("An explicit generation cannot be replaced.", nameof(generation));
         if (SourceIdentity.DerivedCacheKey(sourceRevision.IndexContentId, sourceRevision.PhysicalSourceStamp) != revision)
             throw new ArchiveException("TextureBrowseSourceMismatch", "The texture index belongs to a different archive revision.");
-        long published = WithTextureBrowseConnection(token, (read, transaction, cancellation) =>
-            ValidateTextureBrowseGeneration(read, transaction, profile, generation, cancellation));
-        lock (textureReadLifetimeGate)
+        TextureBrowseReadLease? lease = null;
+        RegisterTextureBrowseLease(profile, generation, token, registration =>
         {
-            ObjectDisposedException.ThrowIf(textureReadDisposed, this);
-            var lease = new TextureBrowseReadLease(this, new(sourceRevision, profile, published), evidenceValidator, rebindUnpublished);
-            textureBrowseLeases.Add(lease);
-            return lease;
-        }
+            lock (textureReadLifetimeGate)
+            {
+                ObjectDisposedException.ThrowIf(textureReadDisposed, this);
+                lease = new(this, new(sourceRevision, profile, registration.Generation), registration.Retention,
+                    evidenceValidator, rebindUnpublished);
+                textureBrowseLeases.Add(lease);
+            }
+        });
+        return lease!;
     }
 
     private T WithTextureBrowseConnection<T>(CancellationToken token,
@@ -309,9 +312,10 @@ public sealed partial class FeatureStore
         private bool disposed;
         private readonly bool rebindUnpublished;
         private bool published;
-        internal TextureBrowseReadLease(FeatureStore owner, TextureBrowseToken token,
+        private readonly IDisposable retention;
+        internal TextureBrowseReadLease(FeatureStore owner, TextureBrowseToken token, IDisposable retention,
             Func<TextureEvidence, TextureProjectionOwnerCheckpoint?, bool>? evidenceValidator, bool rebindUnpublished)
-        { this.owner = owner; Token = token; this.evidenceValidator = evidenceValidator; this.rebindUnpublished = rebindUnpublished; }
+        { this.owner = owner; Token = token; this.retention = retention; this.evidenceValidator = evidenceValidator; this.rebindUnpublished = rebindUnpublished; }
         public TextureBrowseToken Token { get; private set; }
         public Task<TextureBrowseResponse> ReadAsync(TextureDiscoveryQuery query, CancellationToken token = default)
         {
@@ -372,8 +376,12 @@ public sealed partial class FeatureStore
                 }
                 try { Task.WhenAll(active).GetAwaiter().GetResult(); }
                 catch { /* Read failures remain on the callers' tasks. */ }
-                cancellation.Dispose();
-                lock (owner.textureReadLifetimeGate) owner.textureBrowseLeases.Remove(this);
+                try { retention.Dispose(); }
+                finally
+                {
+                    cancellation.Dispose();
+                    lock (owner.textureReadLifetimeGate) owner.textureBrowseLeases.Remove(this);
+                }
             }
         }
     }

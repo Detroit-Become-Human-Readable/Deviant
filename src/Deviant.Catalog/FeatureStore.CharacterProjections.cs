@@ -458,8 +458,8 @@ public sealed partial class FeatureStore
     private void InitializeCharacterProjectionForAssetWrites()
     {
         if (characterProjectionWritesEnabled) return;
-        using var count = connection.CreateCommand(); count.CommandText = "SELECT COUNT(*) FROM assets_v2 WHERE revision=$revision";
-        count.Parameters.AddWithValue("$revision", revision); var existingRows = (long)count.ExecuteScalar()!;
+        using var existing = connection.CreateCommand(); existing.CommandText = "SELECT 1 FROM assets_v2 WHERE revision=$revision LIMIT 1";
+        existing.Parameters.AddWithValue("$revision", revision); bool hasExistingRows = existing.ExecuteScalar() is not null;
         EnsureCharacterProjectionSchema();
         string? stateValue;
         using (var state = connection.CreateCommand())
@@ -468,7 +468,7 @@ public sealed partial class FeatureStore
             state.Parameters.AddWithValue("$revision", revision); stateValue = state.ExecuteScalar() as string;
         }
         characterProjectionWritesEnabled = true;
-        if (existingRows == 0)
+        if (!hasExistingRows)
         {
             using var state = connection.CreateCommand();
             state.CommandText = "INSERT INTO character_projection_state(revision,version) VALUES($revision,$version) ON CONFLICT(revision) DO UPDATE SET version=excluded.version";

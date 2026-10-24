@@ -173,29 +173,37 @@ public sealed partial class SceneCatalogSession : ISceneCatalogSession
         if (offset < 0 || limit is < 1 or > 1000) throw new ArgumentOutOfRangeException(nameof(limit));
         return Track(async linked =>
         {
-            EnsureSourceStamps();
-            var query = new AssetQuery(Search: search, Family: AssetFamily, Offset: offset, Limit: limit)
-            { CachedPayloadFilter = new(Revision, "scene.reader", SceneSectionReader.Version, SceneSectionReader.MemberPath, Snapshot.Records.Count) };
-            var page = await worker.InvokeAsync(() =>
+            using var diagnostic = WorkflowDiagnostics.Begin("SceneCatalog.Query", Revision.IndexContentId);
+            try
             {
-                var total = store.Count(query, linked);
-                var result = store.Query(query, linked).Select(ApplyAlias).ToArray();
-                return new SceneCatalogPage(result, total, offset);
-            }, linked).ConfigureAwait(false);
-            if (!Snapshot.IndexStamp.Reliable || Snapshot.Volumes.Any(volume => !volume.Stamp.Reliable))
-            {
-                using var validation = ArchiveSourceSession.Acquire(Snapshot);
-                await validation.Session.ValidateIndexAsync(linked).ConfigureAwait(false);
-                var extents = page.Entries.SelectMany(entry => entry.Extents).Distinct().ToArray();
-                if (extents.Length > 0)
-                    await validation.Session.VerifyAsync(extents, linked, SourceExtentVerifier.MaximumBytes,
-                        SourceExtentVerifier.MaximumLargeExtentCount).ConfigureAwait(false);
-                else if (page.Entries.Count > 0)
-                    throw new ArchiveException("SourceChanged", "The cached scene has no source receipts for this archive.");
+                EnsureSourceStamps();
+                var query = new AssetQuery(Search: search, Family: AssetFamily, Offset: offset, Limit: limit)
+                { CachedPayloadFilter = new(Revision, "scene.reader", SceneSectionReader.Version, SceneSectionReader.MemberPath, Snapshot.Records.Count) };
+                diagnostic?.Progress("Waiting for reader");
+                var page = await Task.Run(() =>
+                {
+                    diagnostic?.Progress("Reading cached page");
+                    var result = store.ReadAssetPage(query, linked);
+                    return new SceneCatalogPage(result.Entries.Select(ApplyAlias).ToArray(), result.Total, result.Offset);
+                }, linked).ConfigureAwait(false);
+                diagnostic?.Progress("Validating sources", page.Entries.Count, page.Total, "scenes");
+                if (!Snapshot.IndexStamp.Reliable || Snapshot.Volumes.Any(volume => !volume.Stamp.Reliable))
+                {
+                    using var validation = ArchiveSourceSession.Acquire(Snapshot);
+                    await validation.Session.ValidateIndexAsync(linked).ConfigureAwait(false);
+                    var extents = page.Entries.SelectMany(entry => entry.Extents).Distinct().ToArray();
+                    if (extents.Length > 0)
+                        await validation.Session.VerifyAsync(extents, linked, SourceExtentVerifier.MaximumBytes,
+                            SourceExtentVerifier.MaximumLargeExtentCount).ConfigureAwait(false);
+                    else if (page.Entries.Count > 0)
+                        throw new ArchiveException("SourceChanged", "The cached scene has no source receipts for this archive.");
+                }
+                linked.ThrowIfCancellationRequested(); EnsureSourceStamps();
+                if (string.IsNullOrWhiteSpace(search)) lock (gate) cachedAvailable = checked((int)Math.Min(int.MaxValue, page.Total));
+                return page;
             }
-            linked.ThrowIfCancellationRequested(); EnsureSourceStamps();
-            if (string.IsNullOrWhiteSpace(search)) lock (gate) cachedAvailable = checked((int)Math.Min(int.MaxValue, page.Total));
-            return page;
+            catch (OperationCanceledException) { diagnostic?.Cancel(); throw; }
+            catch (Exception error) { diagnostic?.Fail(error, error is ArchiveException archive ? archive.Code : null); throw; }
         }, token);
     }
 

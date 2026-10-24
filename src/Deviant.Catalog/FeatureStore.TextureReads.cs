@@ -165,7 +165,8 @@ public sealed partial class FeatureStore
         foreach (var lease in browseLeases) lease.Dispose();
         lock (textureReadLifetimeGate)
         {
-            while (activeTextureReadConnections.Count != 0) Monitor.Wait(textureReadLifetimeGate);
+            while (activeTextureReadConnections.Count != 0 || pendingTextureLeaseAcquisitions != 0)
+                Monitor.Wait(textureReadLifetimeGate);
         }
         lock (textureBrowseSummaryGate)
         {

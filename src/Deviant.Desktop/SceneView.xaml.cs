@@ -62,18 +62,27 @@ public partial class SceneView : UserControl, IAsyncDisposable
     private SceneTreeRow? selectedNode;
     private ResourceIdentity? selectedEntity;
     private readonly HashSet<Task> queryTasks = [];
+    private bool queriesSuspended, catalogRefreshPending;
+    private int catalogNotificationQueued;
     private Task discoveryTask = Task.CompletedTask;
     private Task loadTask = Task.CompletedTask;
     private readonly HashSet<Task> textureTasks = [];
     private CancellationTokenSource? textureCancellation;
     private long textureGeneration;
-    private readonly DispatcherTimer searchTimer = new() { Interval = TimeSpan.FromMilliseconds(220) };
+    private readonly DispatcherTimer searchTimer = new() { Interval = TimeSpan.FromMilliseconds(120) };
+    private readonly DispatcherTimer catalogRefreshTimer = new() { Interval = TimeSpan.FromMilliseconds(200) };
 
     public SceneView()
     {
         InitializeComponent();
         InitializeRendering();
         searchTimer.Tick += async (_, _) => { searchTimer.Stop(); await QueryAsync(); };
+        catalogRefreshTimer.Tick += async (_, _) =>
+        {
+            catalogRefreshTimer.Stop();
+            if (queriesSuspended || !catalogRefreshPending || queryActive || searchTimer.IsEnabled) return;
+            await QueryAsync();
+        };
         Hierarchy.ItemContainerGenerator.StatusChanged += (_, _) =>
         {
             if (Hierarchy.ItemContainerGenerator.Status != System.Windows.Controls.Primitives.GeneratorStatus.ContainersGenerated ||
@@ -105,6 +114,7 @@ public partial class SceneView : UserControl, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(source);
         if (ReferenceEquals(session, source))
         {
+            queriesSuspended = false;
             await QueryAsync(token);
             return;
         }
@@ -114,6 +124,7 @@ public partial class SceneView : UserControl, IAsyncDisposable
         await ClearRenderingAsync();
         if (session is not null) session.Updated -= Session_Updated;
         session = source;
+        queriesSuspended = false;
         session.Updated += Session_Updated;
         section = null;
         ClearRegionChoices();
@@ -154,7 +165,11 @@ public partial class SceneView : UserControl, IAsyncDisposable
             Status.Text = "Discovering scenes…";
             discoveryTask = current.DiscoverMoreAsync(own.Token);
             await discoveryTask;
-            if (generation == discoveryGeneration && ReferenceEquals(current, session)) await QueryAsync(own.Token);
+            if (generation == discoveryGeneration && ReferenceEquals(current, session) && !queriesSuspended && !own.IsCancellationRequested)
+            {
+                catalogRefreshPending = true;
+                ScheduleCatalogRefresh();
+            }
         }
         catch (OperationCanceledException)
         {
@@ -196,6 +211,9 @@ public partial class SceneView : UserControl, IAsyncDisposable
 
     public async Task SuspendAsync()
     {
+        queriesSuspended = true;
+        catalogRefreshPending = false;
+        catalogRefreshTimer.Stop();
         exportCancellation?.Cancel();
         try { await exportTask; } catch (OperationCanceledException) { } catch { }
         searchTimer.Stop();
@@ -245,8 +263,11 @@ public partial class SceneView : UserControl, IAsyncDisposable
 
     private async Task QueryAsync(CancellationToken token = default)
     {
+        token.ThrowIfCancellationRequested();
         var current = session;
-        if (current is null) return;
+        if (current is null || queriesSuspended || lifetime.IsCancellationRequested) return;
+        catalogRefreshTimer.Stop();
+        catalogRefreshPending = false;
         queryCancellation?.Cancel();
         queryCancellation = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
         var own = queryCancellation;
@@ -267,6 +288,7 @@ public partial class SceneView : UserControl, IAsyncDisposable
                 queryCancellation = null;
             }
             own.Dispose();
+            ScheduleCatalogRefresh();
         }
     }
 
@@ -286,7 +308,12 @@ public partial class SceneView : UserControl, IAsyncDisposable
             }
             rows = rows.Select(row => displayLabels.TryGetValue(row.Identity, out var label) ? row with { DisplayLabel = label } : row).ToArray();
             updating = true;
-            try { Rows.ItemsSource = rows; }
+            var selected = (Rows.SelectedItem as SceneCatalogRow)?.Identity;
+            try
+            {
+                Rows.ItemsSource = rows;
+                if (selected is not null) Rows.SelectedItem = rows.FirstOrDefault(row => row.Identity == selected);
+            }
             finally { updating = false; }
             Page.Text = page.Total == 0 ? "0 scenes" : $"{page.Offset + 1:N0}–{Math.Min(page.Offset + rows.Length, page.Total):N0} / {page.Total:N0}";
             Previous.IsEnabled = page.Offset > 0;
@@ -551,12 +578,36 @@ public partial class SceneView : UserControl, IAsyncDisposable
         catch (Exception error) { Status.Text = error.Message; }
     }
 
-    private void Session_Updated(object? sender, EventArgs e) =>
-        _ = Dispatcher.InvokeAsync(async () => { if (ReferenceEquals(sender, session)) await QueryAsync(); });
-    private void SearchChanged(object sender, TextChangedEventArgs e) { if (!updating) { offset = 0; searchTimer.Stop(); searchTimer.Start(); } }
-    private async void Previous_Click(object sender, RoutedEventArgs e) { if (offset >= PageSize) { offset -= PageSize; await QueryAsync(); } }
-    private async void Next_Click(object sender, RoutedEventArgs e) { offset += PageSize; await QueryAsync(); }
-    private async void DiscoverMore_Click(object sender, RoutedEventArgs e) => await DiscoverAllAsync();
+    private void Session_Updated(object? sender, EventArgs e)
+    {
+        if (Interlocked.Exchange(ref catalogNotificationQueued, 1) != 0) return;
+        _ = Dispatcher.InvokeAsync(() =>
+        {
+            Interlocked.Exchange(ref catalogNotificationQueued, 0);
+            if (!ReferenceEquals(sender, session) || queriesSuspended || lifetime.IsCancellationRequested) return;
+            catalogRefreshPending = true;
+            ScheduleCatalogRefresh();
+        });
+    }
+
+    private void ScheduleCatalogRefresh()
+    {
+        if (catalogRefreshPending && !queriesSuspended && !lifetime.IsCancellationRequested &&
+            !queryActive && !searchTimer.IsEnabled && !catalogRefreshTimer.IsEnabled)
+            catalogRefreshTimer.Start();
+    }
+
+    private void SearchChanged(object sender, TextChangedEventArgs e)
+    {
+        if (updating) return;
+        ++queryGeneration;
+        queryCancellation?.Cancel();
+        queriesSuspended = false; offset = 0;
+        catalogRefreshTimer.Stop(); searchTimer.Stop(); searchTimer.Start();
+    }
+    private async void Previous_Click(object sender, RoutedEventArgs e) { if (offset >= PageSize) { queriesSuspended = false; offset -= PageSize; await QueryAsync(); } }
+    private async void Next_Click(object sender, RoutedEventArgs e) { queriesSuspended = false; offset += PageSize; await QueryAsync(); }
+    private async void DiscoverMore_Click(object sender, RoutedEventArgs e) { queriesSuspended = false; await DiscoverAllAsync(); }
     private async void ExportMetadata_Click(object sender, RoutedEventArgs e)
     {
         if (session is null || section is null) return;
@@ -573,7 +624,7 @@ public partial class SceneView : UserControl, IAsyncDisposable
         catch (OperationCanceledException) { Status.Text = "Export cancelled"; }
         catch (Exception error) { Status.Text = error.Message; }
     }
-    private void Cancel_Click(object sender, RoutedEventArgs e) { cancellingActivity = IsLoading; largeLoadDecision?.TrySetCanceled(); exportCancellation?.Cancel(); searchTimer.Stop(); queryCancellation?.Cancel(); loadCancellation?.Cancel(); discoveryCancellation?.Cancel(); automaticDiscoveryCancellation?.Cancel(); textureCancellation?.Cancel(); renderCancellation?.Cancel(); scenePipelineCancellation?.Cancel(); session?.CancelDiscovery(); UpdateLoadingProgress(); }
+    private void Cancel_Click(object sender, RoutedEventArgs e) { queriesSuspended = true; catalogRefreshPending = false; catalogRefreshTimer.Stop(); cancellingActivity = IsLoading; largeLoadDecision?.TrySetCanceled(); exportCancellation?.Cancel(); searchTimer.Stop(); queryCancellation?.Cancel(); loadCancellation?.Cancel(); discoveryCancellation?.Cancel(); automaticDiscoveryCancellation?.Cancel(); textureCancellation?.Cancel(); renderCancellation?.Cancel(); scenePipelineCancellation?.Cancel(); session?.CancelDiscovery(); UpdateLoadingProgress(); }
     private async void Rows_DoubleClick(object sender, MouseButtonEventArgs e)
     {
         if (Rows.SelectedItem is not SceneCatalogRow row) return;
