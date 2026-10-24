@@ -70,7 +70,15 @@ public sealed partial class NativeTextureSession
                 {
                     ValidateCompanion(inspectedCompanion);
                     var metadataCandidates = new List<(ResourceIdentity? NativeIdentity, NativeTextureMetadataPlan Metadata)>();
-                    foreach (var frame in inspectedCompanion.Directory.Objects.Where(item => item.NativeType == 2137))
+                    long? selectedMetadataOffset = metadataIdentity?.MemberPath is { } memberPath &&
+                        memberPath.StartsWith("filetext/", StringComparison.Ordinal) &&
+                        long.TryParse(memberPath.AsSpan("filetext/".Length), NumberStyles.None, CultureInfo.InvariantCulture, out var parsedOffset)
+                        ? parsedOffset : null;
+                    // FILETEXT identities address the decoded body, including records inside native frames.
+                    // The exact parsed identity and catalog references are still checked below.
+                    foreach (var frame in inspectedCompanion.Directory.Objects.Where(item => item.NativeType == 2137 &&
+                        (selectedMetadataOffset is not { } offset || item.PayloadExtent.Offset <= offset &&
+                            offset - item.PayloadExtent.Offset < item.PayloadExtent.Length)))
                     {
                         own.Token.ThrowIfCancellationRequested();
                         var metadata = await BuildAnyNativeMetadataAsync(frame.Identity, group.CatalogIdentity,
