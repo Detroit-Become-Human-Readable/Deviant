@@ -17,7 +17,7 @@ public sealed record NativeTextureDecodedDocument(DdsTextureDocument Document,
 /// <summary>Builds texture documents from supported SEGS mip layouts.</summary>
 public sealed partial class NativeTextureDecoder
 {
-    public const string Version = "native-texture-v14/" + ConvertedTextureDecoder.Version;
+    public const string Version = "native-texture-v15/" + ConvertedTextureDecoder.Version;
     public const long DefaultMaximumDecodedBytes = 32L * 1024 * 1024;
     private readonly long maximumDecodedBytes;
     public NativeTextureDecoder(long maximumDecodedBytes = DefaultMaximumDecodedBytes)

@@ -60,12 +60,12 @@ public sealed partial class NativeTextureDecoder
             {
                 int bytes = checked((int)MipByteLength(metadata.FirstByte, width, height));
                 if (BinaryPrimitives.ReadUInt16LittleEndian(remaining[4..]) > 100 ||
-                    BinaryPrimitives.ReadUInt16LittleEndian(remaining[42..]) != 0 || BinaryPrimitives.ReadUInt32LittleEndian(remaining[44..]) != 0 ||
+                    BinaryPrimitives.ReadUInt16LittleEndian(remaining[42..]) != 0 || BinaryPrimitives.ReadUInt32LittleEndian(remaining[44..]) > 15 ||
                     BinaryPrimitives.ReadUInt32LittleEndian(remaining[56..]) != bytes ||
-                    BinaryPrimitives.ReadUInt32LittleEndian(remaining[60..]) != bytes || BinaryPrimitives.ReadUInt32LittleEndian(remaining[64..]) != 0 ||
-                    bytes > remaining.Length - 80)
+                    BinaryPrimitives.ReadUInt32LittleEndian(remaining[60..]) != bytes || BinaryPrimitives.ReadUInt32LittleEndian(remaining[64..]) is not (0 or 80) ||
+                    bytes > remaining.Length - 80 - BinaryPrimitives.ReadUInt32LittleEndian(remaining[44..]))
                     throw Error("InvalidConvertedTextureRange", "The literal mip packet extent is invalid.");
-                consumed = checked(80 + bytes);
+                consumed = checked(80 + bytes + (int)BinaryPrimitives.ReadUInt32LittleEndian(remaining[44..]));
                 document = ConvertedMipDocument(source, width, height, remaining.Slice(80, bytes), nativeBlocks: true, token);
             }
             else
