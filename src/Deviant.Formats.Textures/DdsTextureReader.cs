@@ -301,6 +301,7 @@ public sealed class DdsTextureReader
 
     private static DdsTextureEncoding DxgiEncoding(uint format) => format switch
     {
+        10 => new(TextureStorageFormat.Rgba16Float, "R16G16B16A16_FLOAT", null, 8, 0, 0, 0, 0, IsHdr: true),
         71 or 72 => Compressed(TextureStorageFormat.Bc1, "BC1", CompressionFormat.Bc1WithAlpha, isSrgb: format == 72),
         74 or 75 => Compressed(TextureStorageFormat.Bc2, "BC2", CompressionFormat.Bc2, isSrgb: format == 75),
         77 or 78 => Compressed(TextureStorageFormat.Bc3, "BC3", CompressionFormat.Bc3, isSrgb: format == 78),

@@ -21,11 +21,11 @@ internal readonly record struct TextureContentKey(SourceRevision Revision, strin
             throw new InvalidDataException("The texture belongs to another source.");
         var info = document.Info;
         selection ??= document.DefaultSelection;
-        bool hdrFormat = info.Format is TextureStorageFormat.Bc6Unsigned or TextureStorageFormat.Bc6Signed;
+        bool hdrFormat = info.Format is TextureStorageFormat.Bc6Unsigned or TextureStorageFormat.Bc6Signed or TextureStorageFormat.Rgba16Float;
         if (info.IsCubeMap || info.CubeFaces.Count != 0 || info.ArrayLayerCount != 1 || info.MipCount != 1 || info.IsHdr != hdrFormat ||
             info.TrailingLength != 0 || document.Subresources.Count != 1 ||
             document.OriginalBytes.Length != checked(info.HeaderLength + info.EncodedLength) ||
-            info.Format is not (TextureStorageFormat.Bc1 or TextureStorageFormat.Bc3 or TextureStorageFormat.Bc4 or TextureStorageFormat.Bc5 or TextureStorageFormat.Luminance8 or TextureStorageFormat.Bc6Unsigned or TextureStorageFormat.Bc6Signed) ||
+            info.Format is not (TextureStorageFormat.Bc1 or TextureStorageFormat.Bc3 or TextureStorageFormat.Bc4 or TextureStorageFormat.Bc5 or TextureStorageFormat.Luminance8 or TextureStorageFormat.Bc6Unsigned or TextureStorageFormat.Bc6Signed or TextureStorageFormat.Rgba16Float) ||
             info.Format == TextureStorageFormat.Luminance8 && info.FormatName != "R8_UNORM" ||
             selection != new TextureSubresourceSelection())
             throw new InvalidDataException("The encoded texture layout is unavailable.");

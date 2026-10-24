@@ -85,7 +85,7 @@ public sealed partial class NativeModelSession
                 pixels.HdrPixels.Length == checked(pixels.Width * pixels.Height) && TextureSurface.CanRetainEncodedDds(document, selection, token))
             {
                 foreach (var pixel in pixels.HdrPixels.Span)
-                    if (!float.IsFinite(pixel.R) || !float.IsFinite(pixel.G) || !float.IsFinite(pixel.B))
+                    if (!float.IsFinite(pixel.R) || !float.IsFinite(pixel.G) || !float.IsFinite(pixel.B) || !float.IsFinite(pixel.A))
                         throw new TextureFormatException("MaterialSurfaceFormat", "The HDR texture contains invalid pixel values.");
                 var digest = Convert.ToHexString(SHA256.HashData(MemoryMarshal.AsBytes(pixels.HdrPixels.Span))).ToLowerInvariant();
                 pixelDecodeTiming?.Dispose();

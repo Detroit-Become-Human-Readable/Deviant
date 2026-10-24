@@ -97,7 +97,7 @@ public sealed partial class NativeTextureDecoder
         var dds = new byte[checked(148 + (int)plan.SelectedEncodedBytes)]; "DDS "u8.CopyTo(dds);
         bool compressed = metadata.FirstByte is 5 or 7 or 18 or 19 or 25;
         Put(4, 124); Put(8, 0x1007u | (compressed ? 0x80000u : 8u)); Put(12, (uint)plan.Height); Put(16, (uint)plan.Width);
-        Put(20, compressed ? (uint)selected.FaceBytes : (uint)plan.Width * (metadata.FirstByte == 11 ? 1u : 4u)); Put(28, 1);
+        Put(20, compressed ? (uint)selected.FaceBytes : (uint)plan.Width * (metadata.FirstByte == 2 ? 8u : metadata.FirstByte == 11 ? 1u : 4u)); Put(28, 1);
         Put(76, 32); Put(80, 4); "DX10"u8.CopyTo(dds.AsSpan(84)); Put(108, plan.IsCubeMap ? 0x1008u : 0x1000u);
         if (plan.IsCubeMap) Put(112, 0xFE00);
         Put(128, DxgiFormat(metadata.FirstByte, IsSrgb(source))); Put(132, 3); Put(136, plan.IsCubeMap ? 4u : 0u); Put(140, 1);

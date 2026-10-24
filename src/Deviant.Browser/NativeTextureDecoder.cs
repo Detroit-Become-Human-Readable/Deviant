@@ -17,7 +17,7 @@ public sealed record NativeTextureDecodedDocument(DdsTextureDocument Document,
 /// <summary>Builds texture documents from supported SEGS mip layouts.</summary>
 public sealed partial class NativeTextureDecoder
 {
-    public const string Version = "native-texture-v15/" + ConvertedTextureDecoder.Version;
+    public const string Version = "native-texture-v16/" + ConvertedTextureDecoder.Version;
     public const long DefaultMaximumDecodedBytes = 32L * 1024 * 1024;
     private readonly long maximumDecodedBytes;
     public NativeTextureDecoder(long maximumDecodedBytes = DefaultMaximumDecodedBytes)
@@ -31,7 +31,7 @@ public sealed partial class NativeTextureDecoder
     public static bool IsSrgb(NativeTextureSource source)
     {
         ArgumentNullException.ThrowIfNull(source);
-        return source.Metadata.FirstByte is not (18 or 19 or 25) && source.Metadata.RawFixedPrefix84.Length > 14 &&
+        return source.Metadata.FirstByte is not (2 or 18 or 19 or 25) && source.Metadata.RawFixedPrefix84.Length > 14 &&
             source.Metadata.RawFixedPrefix84[14] == 1;
     }
 
@@ -77,7 +77,7 @@ public sealed partial class NativeTextureDecoder
 
         var mips = new SortedDictionary<int, (byte[] Bytes, NativeTextureMipSource Evidence)>();
         long decodedBytes = 0;
-        if (metadata.FirstByte is 0 or 5 or 7 or 11 or 18 or 19 or 25)
+        if (metadata.FirstByte is 0 or 2 or 5 or 7 or 11 or 18 or 19 or 25)
             for (var index = 0; index < metadata.MipSizeCount; index++)
                 if (metadata.MipByteLengthGroups[0][index] != MipByteLength(metadata.FirstByte,
                     Math.Max(1, metadata.Mip0Width >> index), Math.Max(1, metadata.Mip0Height >> index)))
@@ -141,7 +141,7 @@ public sealed partial class NativeTextureDecoder
         var compressed = metadata.FirstByte is 5 or 7 or 18 or 19 or 25;
         Put(4, 124); Put(8, (supportedCount > 1 ? 0x21007u : 0x1007u) | (compressed ? 0x80000u : 8u));
         Put(12, metadata.Mip0Height); Put(16, metadata.Mip0Width);
-        Put(20, compressed ? (uint)supported[0].Bytes.Length : (uint)metadata.Mip0Width * (metadata.FirstByte == 11 ? 1u : 4u)); Put(28, (uint)supportedCount);
+        Put(20, compressed ? (uint)supported[0].Bytes.Length : (uint)metadata.Mip0Width * (metadata.FirstByte == 2 ? 8u : metadata.FirstByte == 11 ? 1u : 4u)); Put(28, (uint)supportedCount);
         Put(76, 32); Put(80, 4); "DX10"u8.CopyTo(dds.AsSpan(84)); Put(108, supportedCount > 1 ? 0x401008u : 0x1000u);
         Put(128, DxgiFormat(metadata.FirstByte, IsSrgb(source)));
         Put(132, 3); Put(140, 1); if (compressed && metadata.FirstByte != 7) Put(144, 3);
@@ -222,7 +222,7 @@ public sealed partial class NativeTextureDecoder
         var compressed = metadata.FirstByte is 5 or 7 or 18 or 19 or 25;
         Put(4, 124); Put(8, (supportedCount > 1 ? 0x21007u : 0x1007u) | (compressed ? 0x80000u : 8u));
         Put(12, metadata.Mip0Height); Put(16, metadata.Mip0Width);
-        Put(20, compressed ? (uint)supported[0].Bytes.Length : (uint)metadata.Mip0Width * (metadata.FirstByte == 11 ? 1u : 4u)); Put(28, (uint)supportedCount);
+        Put(20, compressed ? (uint)supported[0].Bytes.Length : (uint)metadata.Mip0Width * (metadata.FirstByte == 2 ? 8u : metadata.FirstByte == 11 ? 1u : 4u)); Put(28, (uint)supportedCount);
         Put(76, 32); Put(80, 4); "DX10"u8.CopyTo(dds.AsSpan(84));
         Put(108, supportedCount > 1 ? 0x401008u : 0x1008u); Put(112, 0xFE00);
         Put(128, DxgiFormat(metadata.FirstByte, IsSrgb(source)));
@@ -260,7 +260,7 @@ public sealed partial class NativeTextureDecoder
             throw Error("NativeTextureMetadataMismatch", "Texture metadata does not match its source.");
         if (!MatchesSerializedMetadata(metadata, source.MetadataBytes.Span))
             throw Error("NativeTextureMetadataMismatch", "Texture metadata fields do not match their serialized values.");
-        if (metadata.FirstByte is not (0 or 5 or 7 or 11 or 18 or 19 or 25) || metadata.RawFixedPrefix84[0] != metadata.FirstByte)
+        if (metadata.FirstByte is not (0 or 2 or 5 or 7 or 11 or 18 or 19 or 25) || metadata.RawFixedPrefix84[0] != metadata.FirstByte)
             throw Error("UnsupportedNativeTextureFormat", "This texture format is unavailable.");
         if (metadata.SizeGroupSelector is not (1 or 2) || metadata.SerializedSelector != 1 || metadata.ThirdU16 != 1 ||
             metadata.SkipLodSizeTables || metadata.MipByteLengthGroups.Count != (metadata.SizeGroupSelector == 2 ? 6 : 1) ||
@@ -346,7 +346,7 @@ public sealed partial class NativeTextureDecoder
             var blockDds = new byte[checked(148 + blocks.Length)]; "DDS "u8.CopyTo(blockDds);
             bool compressed = metadata.FirstByte is 5 or 7 or 18 or 19 or 25;
             Write(4, 124); Write(8, 0x1007u | (compressed ? 0x80000u : 8u)); Write(12, height); Write(16, width);
-            Write(20, compressed ? (uint)blocks.Length : (uint)width * (metadata.FirstByte == 11 ? 1u : 4u));
+            Write(20, compressed ? (uint)blocks.Length : (uint)width * (metadata.FirstByte == 2 ? 8u : metadata.FirstByte == 11 ? 1u : 4u));
             Write(28, 1); Write(76, 32); Write(80, 4); "DX10"u8.CopyTo(blockDds.AsSpan(84)); Write(108, 0x1000);
             Write(128, DxgiFormat(metadata.FirstByte, IsSrgb(source))); Write(132, 3); Write(140, 1);
             if (compressed && metadata.FirstByte != 7) Write(144, 3);
@@ -400,6 +400,7 @@ public sealed partial class NativeTextureDecoder
     private static uint DxgiFormat(byte format, bool srgb) => format switch
     {
         0 => srgb ? 91u : 87u,
+        2 => 10u,
         5 => srgb ? 72u : 71u,
         7 => srgb ? 78u : 77u,
         11 => 61u,
@@ -411,7 +412,7 @@ public sealed partial class NativeTextureDecoder
 
     private static long MipByteLength(byte format, int width, int height) => format is 5 or 7 or 18 or 19 or 25
         ? checked(((width + 3L) / 4) * ((height + 3L) / 4) * (format is 7 or 19 or 25 ? 16 : 8))
-        : checked((long)width * height * (format == 11 ? 1 : 4));
+        : checked((long)width * height * (format == 2 ? 8 : format == 11 ? 1 : 4));
 
     private static NativeTexturePayload GetPayload(NativeTextureSource source,
         TextureFileTextV24ResourceReference reference, uint type)

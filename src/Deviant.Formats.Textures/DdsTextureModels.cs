@@ -23,7 +23,8 @@ public enum TextureStorageFormat
     Bc6Signed,
     Bc7,
     Luminance8,
-    Alpha8
+    Alpha8,
+    Rgba16Float
 }
 
 public sealed record TextureMipLevel(int Index, int Width, int Height, long SourceOffset, int EncodedLength);
@@ -80,7 +81,7 @@ public sealed class DdsTextureDocument
     internal DdsTextureEncoding Encoding { get; }
 }
 
-public readonly record struct HdrPixel(float R, float G, float B);
+public readonly record struct HdrPixel(float R, float G, float B, float A = 1);
 public readonly record struct Rgba8Pixel(byte R, byte G, byte B, byte A);
 public enum TextureToneMapOperator { Reinhard, Aces }
 public sealed record TextureDisplayTransform(TextureToneMapOperator Operator, float ExposureStops,
@@ -101,7 +102,8 @@ public sealed partial class TextureSurface
         if (document.Info.IsHdr)
             return !document.Info.IsSrgb && (document.Info.Format == TextureStorageFormat.Bc6Unsigned &&
                 encoding.Compression == CompressionFormat.Bc6U || document.Info.Format == TextureStorageFormat.Bc6Signed &&
-                encoding.Compression == CompressionFormat.Bc6S);
+                encoding.Compression == CompressionFormat.Bc6S || document.Info.Format == TextureStorageFormat.Rgba16Float &&
+                encoding.Compression is null && encoding.BytesPerPixel == 8);
         if (document.Info.Format == TextureStorageFormat.Luminance8)
             return !document.Info.IsSrgb && encoding.Compression is null && !encoding.Luminance && !encoding.AlphaOnly &&
                 encoding.BytesPerPixel == 1 && encoding.RedMask == 0xff && encoding.GreenMask == 0 &&

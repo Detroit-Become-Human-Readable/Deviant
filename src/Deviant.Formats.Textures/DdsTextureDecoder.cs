@@ -5,7 +5,7 @@ using BCnEncoder.Shared;
 namespace Deviant.Formats.Textures;
 
 /// <summary>Decodes validated DDS mip levels to WPF-independent pixels.</summary>
-public sealed class DdsTextureDecoder
+public sealed partial class DdsTextureDecoder
 {
     public const long DefaultMaximumEstimatedWorkingSetBytes = 2L * 1024 * 1024 * 1024;
     public const long MaximumEstimatedWorkingSetSafetyLimit = 4L * 1024 * 1024 * 1024;
@@ -92,7 +92,7 @@ public sealed class DdsTextureDecoder
             }
         }
 
-        return DecodeUncompressed(document, level, selection, bytes.Span);
+        return document.Info.Format == TextureStorageFormat.Rgba16Float ? DecodeHalf(document, level, selection, bytes.Span, default) : DecodeUncompressed(document, level, selection, bytes.Span);
     }
 
     public Task<TextureSurface> DecodeMipAsync(DdsTextureDocument document, int mipIndex = 0,
@@ -110,6 +110,9 @@ public sealed class DdsTextureDecoder
         cancellationToken.ThrowIfCancellationRequested();
         var extent = FindSubresource(document, selection);
         EnsureDecodeBudget(extent, document.Encoding);
+        if (document.Info.Format == TextureStorageFormat.Rgba16Float) return await Task.Run(() => DecodeHalf(document,
+            new(selection.MipIndex, extent.Width, extent.Height, extent.SourceOffset, extent.EncodedLength), selection,
+            document.OriginalBytes.Span.Slice(checked((int)extent.SourceOffset), extent.EncodedLength), cancellationToken), cancellationToken).ConfigureAwait(false);
         if (document.Encoding.BlockBytes > 0 && document.Encoding.Compression is null)
             throw new TextureFormatException("UnsupportedFormat", $"Pixel decoding for {document.Info.FormatName} is unavailable.");
         var bytes = document.OriginalBytes.Slice(checked((int)extent.SourceOffset), extent.EncodedLength);
@@ -267,7 +270,7 @@ public sealed class DdsTextureDecoder
         var pixels = checked((long)extent.Width * extent.Height);
         if (encoding.BlockBytes > 0 && encoding.Compression is null)
             throw new TextureFormatException("UnsupportedFormat", $"Pixel decoding for {encoding.FormatName} is unavailable.");
-        var bytesPerPixel = encoding.IsHdr ? 24 : encoding.Compression is null ? 4 : 8;
+        var bytesPerPixel = encoding.IsHdr ? 28 : encoding.Compression is null ? 4 : 8;
         return checked(pixels * bytesPerPixel);
     }
 

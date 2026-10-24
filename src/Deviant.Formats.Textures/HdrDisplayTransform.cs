@@ -48,7 +48,8 @@ public static class HdrDisplayTransform
         var exposure = MathF.Pow(2, exposureStops);
         return new(EncodeSrgb(ToneMap(Expose(pixel.R, exposure), toneMap)),
             EncodeSrgb(ToneMap(Expose(pixel.G, exposure), toneMap)),
-            EncodeSrgb(ToneMap(Expose(pixel.B, exposure), toneMap)), 255);
+            EncodeSrgb(ToneMap(Expose(pixel.B, exposure), toneMap)),
+            (byte)(Math.Clamp(float.IsNaN(pixel.A) ? 0 : pixel.A, 0, 1) * 255 + 0.5f));
     }
 
     private static float Expose(float value, float exposure)

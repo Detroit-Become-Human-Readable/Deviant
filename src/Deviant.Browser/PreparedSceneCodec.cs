@@ -432,7 +432,7 @@ public static class PreparedSceneCodec
             Enum.IsDefined(EncodingKind) && (EncodingKind is TextureEncodingKind.Rgba8 or TextureEncodingKind.BackedRgba8
                 ? BlobSha256 == RgbaSha256 && EncodedSelection is null
                 : EncodedSelection is not null && DisplayTransform is null && !Resized &&
-                    (!SourceIsHdr || !IsSrgb && Format is TextureStorageFormat.Bc6Unsigned or TextureStorageFormat.Bc6Signed));
+                    (!SourceIsHdr || !IsSrgb && Format is TextureStorageFormat.Bc6Unsigned or TextureStorageFormat.Bc6Signed or TextureStorageFormat.Rgba16Float));
         public static TextureEncodingKind Encoding(TextureSurface surface) => surface.PixelSource is not null
             ? TextureEncodingKind.BackedRgba8 : surface.EncodedDds is null ? TextureEncodingKind.Rgba8 : TextureEncodingKind.Dds;
         public TextureSurface RestoreBacking(ITexturePixelSource pixels) => TextureSurface.RestoreBackedRgba8(Width, Height,
