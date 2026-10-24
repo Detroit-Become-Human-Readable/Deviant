@@ -3,7 +3,10 @@ using System.Text;
 using System.Text.Json;
 namespace Deviant.Catalog;
 
-public sealed record CacheSettings(string Location, long LimitBytes = 4L * 1024 * 1024 * 1024, int Workers = 0,IReadOnlyList<string>? PreviousLocations=null);
+public sealed record CacheSettings(string Location, long LimitBytes = CacheSettings.DefaultLimitBytes, int Workers = 0,IReadOnlyList<string>? PreviousLocations=null)
+{
+    public const long DefaultLimitBytes = 100L * 1024 * 1024 * 1024;
+}
 public sealed class CacheLease(string path, Func<ValueTask> release) : IAsyncDisposable, IDisposable
 {
     private int disposed;

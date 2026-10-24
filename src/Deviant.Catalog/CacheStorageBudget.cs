@@ -8,7 +8,7 @@ namespace Deviant.Catalog;
 /// <summary>Coordinates file growth for a cache root, including separate SQLite connections and processes.</summary>
 internal sealed class CacheStorageBudget
 {
-    private const long DefaultLimit = 20L * 1024 * 1024 * 1024;
+    private const long DefaultLimit = CacheSettings.DefaultLimitBytes;
     private const long Magic = 0x4456434255444731;
     private const int SlotCount = 64;
     private const int SlotStart = 64;

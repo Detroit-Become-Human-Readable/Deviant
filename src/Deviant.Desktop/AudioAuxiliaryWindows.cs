@@ -146,7 +146,7 @@ internal sealed class AudioCacheWindow : Window
     private readonly Func<CancellationToken, Task> reopen;
     private readonly TextBlock location = new() { TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock usage = new();
-    private readonly TextBox limit = new() { Width = 100, Text = "4" };
+    private readonly TextBox limit = new() { Width = 100 };
     private readonly ComboBox workers = new() { Width = 100, ItemsSource = new[] { "Auto", "1", "2", "4" } };
 
     public AudioCacheWindow(CacheManager cache, string? sourceRoot,
@@ -159,7 +159,7 @@ internal sealed class AudioCacheWindow : Window
         panel.Children.Add(new TextBlock { Text = "Location", FontWeight = FontWeights.SemiBold });
         panel.Children.Add(location); panel.Children.Add(usage);
         var limitPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 6) };
-        limitPanel.Children.Add(new TextBlock { Text = "Disk cache limit (GB)", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) });
+        limitPanel.Children.Add(new TextBlock { Text = "Disk cache limit (GiB)", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0) });
         limit.Text = (cache.LimitBytes / (1024d * 1024 * 1024)).ToString("0.##", CultureInfo.InvariantCulture);
         limitPanel.Children.Add(limit); var save = new Button { Content = "Save limit", Margin = new Thickness(8, 0, 0, 0) };
         save.Click += async (_, _) => await SaveLimitAsync(); limitPanel.Children.Add(save); panel.Children.Add(limitPanel);
@@ -195,7 +195,7 @@ internal sealed class AudioCacheWindow : Window
         try
         {
             var values = await Task.Run(() => (Preview: cache.PreviewUsageBytes, Metadata: cache.MetadataUsageBytes, Total:cache.UsageBytes, Free: cache.AvailableBytes));
-            usage.Text = $"Previews {values.Preview / 1048576d:N1} MB · Metadata {values.Metadata / 1048576d:N1} MB\nTotal {values.Total / 1048576d:N1} MB · Free {values.Free / 1073741824d:N1} GB";
+            usage.Text = $"Previews {values.Preview / 1048576d:N1} MiB · Metadata {values.Metadata / 1048576d:N1} MiB\nTotal {values.Total / 1048576d:N1} MiB · Free {values.Free / 1073741824d:N1} GiB";
         }
         catch (Exception ex) { usage.Text = ex.Message; }
     }
@@ -203,7 +203,7 @@ internal sealed class AudioCacheWindow : Window
     private async Task SaveLimitAsync()
     {
         if (!double.TryParse(limit.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var gb) || gb < 0 || gb > long.MaxValue / (1024d * 1024 * 1024))
-        { MessageBox.Show(this, "Enter zero or a positive cache size in GB.", "Audio cache", MessageBoxButton.OK, MessageBoxImage.Information); return; }
+        { MessageBox.Show(this, "Enter zero or a positive cache size in GiB.", "Cache", MessageBoxButton.OK, MessageBoxImage.Information); return; }
         try { await cache.SetLimitAsync(checked((long)(gb * 1024 * 1024 * 1024))); await RefreshTextAsync(); }
         catch (Exception ex) { MessageBox.Show(this, ex.Message, "Audio cache", MessageBoxButton.OK, MessageBoxImage.Error); }
     }
