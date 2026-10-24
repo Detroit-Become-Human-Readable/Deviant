@@ -626,6 +626,7 @@ public partial class TextureExplorerView : UserControl, IAsyncDisposable
             if (Current(owner, identity, version))
             {
                 CurrentPreviewState = TexturePreviewState.Failed;
+                WorkflowDiagnostics.Failure("Texture.Preview", error, identity.Key);
                 PreviewFailure = new(error is TextureFormatException format ? format.Code : error is ArchiveException archive ? archive.Code : "TexturePreviewFailed", error.Message);
                 PreviewStatus.Text = error.Message; nativeThumbnails.Remove(identity); thumbnailVersions.Remove(identity);
             }

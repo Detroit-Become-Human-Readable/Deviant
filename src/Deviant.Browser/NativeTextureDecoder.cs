@@ -17,7 +17,7 @@ public sealed record NativeTextureDecodedDocument(DdsTextureDocument Document,
 /// <summary>Builds texture documents from supported SEGS mip layouts.</summary>
 public sealed partial class NativeTextureDecoder
 {
-    public const string Version = "native-texture-v12/" + ConvertedTextureDecoder.Version;
+    public const string Version = "native-texture-v13/" + ConvertedTextureDecoder.Version;
     public const long DefaultMaximumDecodedBytes = 32L * 1024 * 1024;
     private readonly long maximumDecodedBytes;
     public NativeTextureDecoder(long maximumDecodedBytes = DefaultMaximumDecodedBytes)
@@ -71,7 +71,7 @@ public sealed partial class NativeTextureDecoder
 
         var mips = new SortedDictionary<int, (byte[] Bytes, NativeTextureMipSource Evidence)>();
         long decodedBytes = 0;
-        if (metadata.FirstByte is 5 or 7 or 11 or 18 or 19 or 25)
+        if (metadata.FirstByte is 0 or 5 or 7 or 11 or 18 or 19 or 25)
             for (var index = 0; index < metadata.MipSizeCount; index++)
                 if (metadata.MipByteLengthGroups[0][index] != MipByteLength(metadata.FirstByte,
                     Math.Max(1, metadata.Mip0Width >> index), Math.Max(1, metadata.Mip0Height >> index)))
@@ -268,7 +268,7 @@ public sealed partial class NativeTextureDecoder
             (long)metadata.Mip0Width * metadata.Mip0Height > DdsTextureReader.MaximumPixelCount ||
             metadata.MipSizeCount == 0 || metadata.MipSizeCount > MaximumMipCount(metadata.Mip0Width, metadata.Mip0Height))
             throw Error("InvalidNativeTextureDimensions", "Texture dimensions or mip count are invalid.");
-        if (metadata.DescriptorCount < 1 || metadata.FirstByte == 0 && metadata.DescriptorCount < 2 ||
+        if (metadata.DescriptorCount < 1 ||
             metadata.LodDescriptors.Count != metadata.DescriptorCount ||
             metadata.References.Count != metadata.DescriptorCount)
             throw Error("NativeBaseMipUnavailable", "The base mip is unavailable.");
