@@ -952,13 +952,10 @@ public sealed partial class CharacterCatalogSession : IAsyncDisposable
             }
         }
 
-        var cacheAllowed = rows.Count > 0 && contexts.Count == rows.Count &&
-            unsupportedCatalogs == 0 && ownerFailures == 0 &&
-            contexts.All(context => revalidated.Contains(context.Identity));
         NameIndexWriteResult nameWrite;
         using (AssetLoadDiagnostics.Measure("ModelIndexPersistence", $"{startCatalogIndex}:{nextCatalogIndex}"))
             nameWrite = await PersistNameIndexAsync(contexts, ownerContexts, membershipCandidates,
-                revalidated, entries, cacheAllowed, inventoryOnly, token).ConfigureAwait(false);
+                revalidated, entries, inventoryOnly, token).ConfigureAwait(false);
         var persistedModelIdentities = nameWrite.PersistedModels;
         var checkpointedPasses = nameWrite.CoveredCatalogs;
         var catalogIndexes = references.CatalogIdentities
@@ -1012,7 +1009,10 @@ public sealed partial class CharacterCatalogSession : IAsyncDisposable
         return new(Revision, startCatalogIndex, nextCatalogIndex, totalCatalogs,
             rows.Count, verifiedCatalogs, unsupportedCatalogs, referenceRowsRead,
             ownerContexts.Count, ownersOpened, allLinks.ToArray(), entries, issueList,
-            unscanned, requestedCatalogsComplete, allCatalogsVisited, isComplete, retained.Detach());
+            unscanned, requestedCatalogsComplete, allCatalogsVisited, isComplete, retained.Detach())
+        {
+            CheckpointedCatalogs = Array.AsReadOnly(checkpointedPasses.OrderBy(identity => identity.Ordinal).ToArray())
+        };
     }
 
     private CharacterCatalogModelEntry BuildInventoryEntry(NativeContainerLease lease,

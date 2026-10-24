@@ -133,6 +133,7 @@ public partial class AudioWindow
                 return;
             }
             var attemptedCatalogs = new HashSet<int>(inventoriedCharacterCatalogs);
+            nextCharacterCatalogIndex = FirstUncoveredCharacterCatalog(references, attemptedCatalogs);
             int failedCatalogs = 0;
             var lastPublication = System.Diagnostics.Stopwatch.StartNew();
             charactersView.SetIndexingState(true, requestedIdentity is null && nextCharacterCatalogIndex < references.CatalogIdentities.Count);
@@ -155,10 +156,14 @@ public partial class AudioWindow
                 token.ThrowIfCancellationRequested();
                 if (!IsCurrent()) return;
                 if (batch.NextCatalogIndex <= nextCharacterCatalogIndex) break;
+                var checkpointedCatalogs = batch.CheckpointedCatalogs.ToHashSet();
                 for (var index = catalogIndex; index < batch.NextCatalogIndex; index++)
                 {
                     attemptedCatalogs.Add(index);
-                    inventoriedCharacterCatalogs.Add(index);
+                    if (checkpointedCatalogs.Contains(references.CatalogIdentities[index]))
+                        inventoriedCharacterCatalogs.Add(index);
+                    else
+                        failedCatalogs++;
                 }
                 nextCharacterCatalogIndex = FirstUncoveredCharacterCatalog(references, attemptedCatalogs);
                 if ((!published || lastPublication.ElapsedMilliseconds >= 1000) && characterResultsOffset == 0)
@@ -172,7 +177,7 @@ public partial class AudioWindow
                 {
                     await catalog.WaitForForegroundSelectionsAsync(token);
                 }
-                catch (Exception error) when (error is Deviant.Core.ArchiveException archive && archive.Code != "SourceChanged" ||
+                catch (Exception error) when (error is Deviant.Core.ArchiveException archive && !archive.Code.EndsWith("SourceChanged", StringComparison.Ordinal) ||
                     error is System.IO.InvalidDataException or System.Text.Json.JsonException)
                 {
                     System.Diagnostics.Trace.TraceError(error.ToString());

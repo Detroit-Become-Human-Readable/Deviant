@@ -141,6 +141,7 @@ public sealed class CharacterCatalogDiscoveryResult : IDisposable
     public IReadOnlyList<CharacterCatalogLink> CatalogLinks { get; }
     public IReadOnlyList<CharacterCatalogModelEntry> Models { get; }
     public IReadOnlyList<CharacterCatalogIssue> Issues { get; }
+    public IReadOnlyList<ResourceIdentity> CheckpointedCatalogs { get; internal init; } = [];
     public int UnscannedCatalogs { get; }
     public bool RequestedCatalogsComplete { get; }
     public bool AllCatalogsVisited { get; }

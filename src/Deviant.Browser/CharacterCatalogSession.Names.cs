@@ -258,12 +258,22 @@ public sealed partial class CharacterCatalogSession
         Dictionary<ResourceIdentity, List<CatalogContext>> owners,
         Dictionary<(ResourceIdentity Catalog, ResourceIdentity Owner), OwnerMembershipBuilder> candidates,
         IReadOnlySet<ResourceIdentity> revalidated, IReadOnlyList<CharacterCatalogModelEntry> entries,
-        bool cacheAllowed, bool inventoryOnly, CancellationToken token)
+        bool inventoryOnly, CancellationToken token)
     {
         var persisted = new HashSet<ResourceIdentity>(); var covered = new HashSet<ResourceIdentity>();
-        if (!cacheAllowed || features is null) return new(persisted, covered);
+        if (features is null) return new(persisted, covered);
         var entryByIdentity = entries.ToDictionary(entry => entry.Descriptor.Identity);
         await references.ValidateSnapshotAsync(token).ConfigureAwait(false); ValidateCurrentSourceStamps();
+        using var eligibilityRetention = memoryBudget.Reserve(checked(4096L +
+            candidates.Values.Sum(candidate => (long)candidate.ModelIdentities.Count) * 128L), "model name publication eligibility");
+        var eligibleModels = new HashSet<ResourceIdentity>();
+        foreach (var candidate in candidates.Values)
+        {
+            token.ThrowIfCancellationRequested();
+            if (!revalidated.Contains(candidate.Context.Identity) || !candidate.EnumerationComplete ||
+                !ValidateSourceExtents(candidate.OwnerExtents)) continue;
+            foreach (var identity in candidate.ModelIdentities) eligibleModels.Add(identity);
+        }
         const int batchLimit = 64;
         var batch = new List<BoundedFeatureAssetWrite>(batchLimit);
         var batchReservations = new ReservationGroup();
@@ -279,7 +289,8 @@ public sealed partial class CharacterCatalogSession
             foreach (var entry in entries)
             {
                 token.ThrowIfCancellationRequested();
-                if (entry.SourceSummary.Revision != Revision || !ValidateSourceExtents(entry.SourceSummary.SourceExtents)) continue;
+                if (!eligibleModels.Contains(entry.Descriptor.Identity) || entry.Descriptor.Identity != entry.SourceSummary.Identity ||
+                    entry.SourceSummary.Revision != Revision || !ValidateSourceExtents(entry.SourceSummary.SourceExtents)) continue;
                 var compactSeed = inventoryOnly && IsInventoryNameSeedCandidate(entry);
                 var featureVersion = compactSeed ? InventoryNameSeedVersion : NameIndexVersion;
                 BoundedFeatureWrite feature;
