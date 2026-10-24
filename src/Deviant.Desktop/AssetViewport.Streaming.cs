@@ -77,7 +77,8 @@ public partial class AssetViewport
                 ApplyInstances(updated); RenderView.Items.Add(model);
                 if (materialSource is not null)
                     foreach (var diagnostic in material.Diagnostics)
-                        rendererIssues.Add(new(materialSource.Asset.Identity, "MaterialRenderer", diagnostic));
+                        rendererIssues.Add(new(materialSource.Asset.Identity,
+                            material.IsUnavailable ? AssetViewportService.UnsupportedMaterialPassIssueCode : "MaterialRenderer", diagnostic));
                 LoadProgressChanged?.Invoke(this, new("Materials", index + 1, parts.Count, source.MemoryBudget.UsedBytes));
                 if ((index + 1) % 64 == 0) await WaitForFrameAsync(token);
                 else if ((index + 1) % 8 == 0) await Dispatcher.Yield(DispatcherPriority.Background);

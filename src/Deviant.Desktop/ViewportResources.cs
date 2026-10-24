@@ -21,6 +21,8 @@ namespace Deviant.Desktop;
 /// <summary>Application-owned Direct3D resources shared by the scene and model viewports.</summary>
 public sealed partial class AssetViewportService : IDisposable
 {
+    internal const string UnsupportedMaterialPassIssueCode = "MaterialPassUnavailable";
+
     private readonly Dispatcher dispatcher;
     private readonly Dictionary<string, GeometryEntry> geometries = [];
     private readonly ViewportResourceCache unusedGeometries = new();
@@ -217,6 +219,7 @@ public sealed partial class AssetViewportService : IDisposable
         try
         {
             var diagnostics = new List<string>();
+            string? unavailableReason = null;
             if (!normalsAvailable)
                 diagnostics.Add("Normal: Face normals used for display.");
             if (source?.Asset.NativeRenderParameters is { BlendSelector: >= 8 } unavailableState)
@@ -224,7 +227,17 @@ public sealed partial class AssetViewportService : IDisposable
             if (source?.Asset.SurfaceGraph is { } graph)
             {
                 var availableGraph = RestrictMissingTextures(graph, source.TexturesBySlot, diagnostics);
-                graphTechnique = await AcquireGraphTechniqueAsync(snapshot, availableGraph, inputs, source.TexturesBySlot, state, diagnostics, token);
+                try
+                {
+                    graphTechnique = await AcquireGraphTechniqueAsync(snapshot, availableGraph, inputs, source.TexturesBySlot, state, diagnostics, token);
+                }
+                catch (UnsupportedMaterialPassException error)
+                {
+                    unavailableReason = error.Message;
+                    diagnostics.Add(error.Message);
+                    WorkflowDiagnostics.Failure("Viewport.Material", error, source.Asset.Identity.Key,
+                        partial: true, phase: UnsupportedMaterialPassIssueCode);
+                }
                 token.ThrowIfCancellationRequested();
                 if (graphTechnique is not null)
                 {
@@ -232,12 +245,15 @@ public sealed partial class AssetViewportService : IDisposable
                         graphTextures.Add(await AcquireTextureAsync(snapshot, source.TexturesBySlot[slot], normalMap: false, token));
                 }
             }
-            if (graphTechnique is null && source?.Asset.NativeRenderParameters is not null)
+            if (unavailableReason is not null)
+                graphTechnique = AcquireNormalTechnique(snapshot, state, includeDepthPrepass: false);
+            else if (graphTechnique is null && source?.Asset.NativeRenderParameters is not null)
                 graphTechnique = AcquireNormalTechnique(snapshot, state);
             var availableNormalUvSets = primitiveNormalUvSets.Where(index => graphTechnique?.IsSurfaceGraph != true || index == 0).ToHashSet();
-            var normalTexture = ViewportMaterials.FindUsableNormalTexture(source, availableNormalUvSets, normalFrameAvailable);
+            var normalTexture = unavailableReason is null
+                ? ViewportMaterials.FindUsableNormalTexture(source, availableNormalUvSets, normalFrameAvailable) : null;
             if (normalTexture is not null) texture = await AcquireTextureAsync(snapshot, normalTexture, normalMap: true, token);
-            var prepared = ViewportMaterials.Create(source, surface =>
+            var prepared = ViewportMaterials.Create(unavailableReason is null ? source : null, surface =>
             {
                 if (!ReferenceEquals(surface, normalTexture) || texture is null)
                     throw new InvalidDataException("The normal texture changed during material preparation.");
@@ -245,6 +261,13 @@ public sealed partial class AssetViewportService : IDisposable
             }, availableNormalUvSets, normalFrameAvailable);
             diagnostics.AddRange(prepared.Diagnostics);
             PhongMaterial material = prepared.Material;
+            if (unavailableReason is not null)
+            {
+                material.DiffuseColor = new Color4(1, 0, 1, 1);
+                material.AmbientColor = new Color4(1, 0, 1, 1);
+                material.SpecularColor = new Color4(0, 0, 0, 1);
+                material.RenderDiffuseMap = material.RenderNormalMap = false;
+            }
             if (graphTechnique is not null)
             {
                 material = new SurfacePhongMaterial(prepared.Material, graphTextures.Select(x => x.Texture).ToArray(),
@@ -260,7 +283,8 @@ public sealed partial class AssetViewportService : IDisposable
                 TrackMaterialShaderUse(snapshot, cached.GraphTechnique);
                 return new(this, key, cached);
             }
-            var entry = new MaterialEntry(material, texture, graphTextures, graphTechnique, uvSet, prepared.NormalMapped, diagnostics);
+            var entry = new MaterialEntry(material, texture, graphTextures, graphTechnique, uvSet, prepared.NormalMapped, diagnostics)
+            { UnavailableReason = unavailableReason };
             materials.Add(key, entry);
             return new(this, key, entry);
         }
@@ -567,6 +591,7 @@ public sealed partial class AssetViewportService : IDisposable
         public IReadOnlyList<TextureLease> GraphTextures { get; } = graphTextures;
         public GraphTechniqueLease? GraphTechnique { get; } = graphTechnique;
         public IReadOnlyList<string> Diagnostics { get; } = diagnostics;
+        internal string? UnavailableReason { get; init; }
         public int UvSet { get; } = uvSet; public bool NormalMapped { get; } = normalMapped; public int References = 1;
     }
     internal sealed class TextureEntry(TextureModel texture, RawTextureLoader loader, IDisposable? cpu, IDisposable gpu,
@@ -583,6 +608,7 @@ public sealed partial class AssetViewportService : IDisposable
         public int UvSet => entry.UvSet; public bool NormalMapped => entry.NormalMapped;
         public string TechniqueName => entry.GraphTechnique?.TechniqueName ?? DefaultRenderTechniqueNames.InstancingMesh;
         public IReadOnlyList<string> Diagnostics => entry.Diagnostics;
+        internal bool IsUnavailable => entry.UnavailableReason is not null;
         public bool SurfaceMapped => entry.GraphTechnique?.IsSurfaceGraph == true;
         public bool IsTransparent => entry.GraphTechnique?.IsTransparent ?? false;
         public bool RequiresSceneDepth => entry.GraphTechnique?.RequiresSceneDepth == true;

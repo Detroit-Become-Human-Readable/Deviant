@@ -260,7 +260,8 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
                     }
                     if (materialSource is not null)
                         foreach (string diagnostic in material.Diagnostics)
-                            rendererIssues.Add(new(materialSource.Asset.Identity, "MaterialRenderer", diagnostic));
+                            rendererIssues.Add(new(materialSource.Asset.Identity,
+                                material.IsUnavailable ? AssetViewportService.UnsupportedMaterialPassIssueCode : "MaterialRenderer", diagnostic));
                     var submeshes = primitive.Submeshes.Count > 0 ? primitive.Submeshes :
                         [new GeometrySubmesh(primitive.Key, 0, primitive.Indices.Count, [])];
                     foreach (var submesh in submeshes)

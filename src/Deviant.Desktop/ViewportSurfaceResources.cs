@@ -13,6 +13,8 @@ namespace Deviant.Desktop;
 
 public sealed partial class AssetViewportService
 {
+    private sealed class UnsupportedMaterialPassException(string message) : Exception(message);
+
     private readonly Dictionary<string, GraphTechniqueEntry> graphTechniques = [];
     private CacheManager? shaderDiskCache;
     private ShaderBytecodeCache? shaderBytecodeCache;
@@ -60,7 +62,7 @@ public sealed partial class AssetViewportService
         }
         var program = await Task.Run(() => MaterialGraphCompiler.Compile(graph, inputs, token, samplerGroups), token);
         if (program.RequiresSceneDepth && !state.IsTransparent)
-            throw new InvalidDataException("Scene depth is available to transparent materials.");
+            throw new UnsupportedMaterialPassException("This material requires scene depth in an unsupported opaque pass.");
         diagnostics.AddRange(program.Diagnostics);
         if (!program.HasBaseColor && !program.HasOpacity && !program.HasAlphaCutoff) return null;
         string techniqueKey = program.Signature + "-" + state.Key;
@@ -227,33 +229,41 @@ public sealed partial class AssetViewportService
         }
     }
 
-    private GraphTechniqueLease AcquireNormalTechnique(RenderAssetSnapshot snapshot, ViewportMaterialState state)
+    private GraphTechniqueLease AcquireNormalTechnique(RenderAssetSnapshot snapshot, ViewportMaterialState state,
+        bool includeDepthPrepass = true)
     {
         dispatcher.VerifyAccess();
-        string key = "normal-" + state.Key;
+        string suffix = includeDepthPrepass ? "" : "-no-depth-prepass";
+        string key = "normal-" + state.Key + suffix;
         if (graphTechniques.TryGetValue(key, out var cached))
         { cached.References++; return new(this, key, cached, [], []); }
         var cpu = snapshot.MemoryBudget.Reserve(normalPixelBytecode.Length, "material shader bytecode");
         IDisposable? gpu = null;
-        string name = "NativeNormal_" + state.Key;
+        string name = "NativeNormal_" + state.Key + suffix;
         try
         {
             gpu = ReserveGpu(normalPixelBytecode.Length, "material shaders");
-            effects.AddTechnique(new TechniqueDescription(name)
+            var passes = new List<ShaderPassDescription>
             {
-                InputLayoutDescription = new InputLayoutDescription(DefaultVSShaderByteCodes.VSMeshInstancing, DefaultInputLayout.VSInputInstancing),
-                PassDescriptions = [new ShaderPassDescription(DefaultPassNames.Default)
+                new(DefaultPassNames.Default)
                 {
                     ShaderList = [DefaultVSShaderDescriptions.VSMeshInstancing,
                         new ShaderDescription(name, ShaderStage.Pixel, new ShaderReflector(), normalPixelBytecode)],
                     BlendStateDescription = state.Blend, DepthStencilStateDescription = state.Depth
-                }, new ShaderPassDescription(DefaultPassNames.DepthPrepass)
+                }
+            };
+            if (includeDepthPrepass)
+                passes.Add(new(DefaultPassNames.DepthPrepass)
                 {
                     ShaderList = [DefaultVSShaderDescriptions.VSMeshInstancing,
                         new ShaderDescription(name, ShaderStage.Pixel, new ShaderReflector(), normalPixelBytecode)],
                     BlendStateDescription = DefaultBlendStateDescriptions.NoBlend,
                     DepthStencilStateDescription = DefaultDepthStencilDescriptions.DSSDepthLessEqual
-                }]
+                });
+            effects.AddTechnique(new TechniqueDescription(name)
+            {
+                InputLayoutDescription = new InputLayoutDescription(DefaultVSShaderByteCodes.VSMeshInstancing, DefaultInputLayout.VSInputInstancing),
+                PassDescriptions = passes
             });
             var entry = new GraphTechniqueEntry(name, cpu, gpu, state.IsTransparent, false);
             graphTechniques.Add(key, entry);

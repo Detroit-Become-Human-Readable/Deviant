@@ -314,7 +314,7 @@ public partial class SceneView
             Advanced.Text = FormatCoverage(renderSnapshot) + "\n" + FormatIssues(renderSnapshot.Issues.Concat(SceneViewport.RendererIssues));
             lastSuccessfulSceneRenderRequest = request;
             lastSuccessfulRenderBudget = renderSnapshot.MemoryBudget;
-            if (renderSnapshot.HasIncompleteMaterials)
+            if (HasIncompleteRenderedMaterials)
             {
                 SetActivityTerminal("Materials incomplete");
                 diagnostic?.Partial();
@@ -729,8 +729,10 @@ public partial class SceneView
     private void UpdateRenderedCount()
     {
         if (renderSnapshot is not null) RenderStatus.Text = $"{SceneViewport.VisibleOccurrenceCount:N0} objects · {SceneViewport.VisibleMeshCount:N0} meshes" +
-            (renderSnapshot.HasIncompleteMaterials ? " · Materials incomplete" : "");
+            (HasIncompleteRenderedMaterials ? " · Materials incomplete" : "");
     }
+    private bool HasIncompleteRenderedMaterials => renderSnapshot?.HasIncompleteMaterials == true ||
+        SceneViewport.RendererIssues.Any(issue => issue.Code == AssetViewportService.UnsupportedMaterialPassIssueCode);
     private void RenderHierarchy_SelectionChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
     {
         if (selectingRenderTree || e.NewValue is not RenderTreeRow row) return;
