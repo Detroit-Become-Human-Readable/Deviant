@@ -105,6 +105,7 @@ public sealed partial class AudioExplorerSession
                 }
             }
         }
+        if (media is not null && RestoreResolvedSourceClassification(media)) persist = true;
         if(media is null||!HasSelectedClassification(media,scope)||!media.MetadataReadCoverageComplete||media.MetadataReadDigests.Count==0)
         {
             token.ThrowIfCancellationRequested();
@@ -208,6 +209,26 @@ public sealed partial class AudioExplorerSession
             RememberBrowseRow(prepared,serialized);
         }
         return (prepared,serialized);
+    }
+
+    private static bool RestoreResolvedSourceClassification(MediaEntry media)
+    {
+        if (media.SourceDeclarationProcessingComplete || media.Completeness != MediaCompleteness.Unverified ||
+            media.State != MediaState.CompleteExternal || media.ContainerValidity != ContainerValidity.Valid ||
+            media.Availability != SourceAvailability.Available || !media.MetadataReadCoverageComplete ||
+            media.MetadataReadDigests.Count == 0 || media.SourceEvidence.Count == 0 ||
+            media.Identity is not { } identity || media.PayloadIdentity is not { } payload ||
+            payload.IndexContentId != identity.IndexContentId || payload == identity ||
+            !MediaPolicy.CanPreview(media)) return false;
+        var bankKey = identity.IndexContentId + ":resource:" + identity.Ordinal.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (media.BankKey != bankKey || media.SourceEvidence.Any(item => item.BankKey != bankKey || item.Declaration.Id != media.Id)) return false;
+        // Older resolved-source checkpoints predate the processing marker. Their
+        // canonical member path records the complete native declaration group.
+        var declarations = string.Join(";", media.SourceEvidence.Select(item =>
+            $"{item.ObjectId:X8}-{item.Offset:X}-{item.Declaration.StreamType}").Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal));
+        if (identity.MemberPath != $"source/{declarations}/media/{media.Id:X8}") return false;
+        media.SourceDeclarationProcessingComplete = true;
+        return true;
     }
 
     private static bool HasSelectedClassification(MediaEntry media,SelectedAudioClassificationScope? scope)

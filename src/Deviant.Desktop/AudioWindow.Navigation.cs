@@ -341,6 +341,7 @@ public partial class AudioWindow
     private IReadOnlyDictionary<string,string> CaptureAudioFilter()=>new Dictionary<string,string>
     {
         ["search"]=SearchBox.Text,["bank"]=(BankBox.SelectedItem as AudioBankChoice)?.Key??"",["language"]=LanguageBox.SelectedItem as string??"Any",
+        ["category"]=CategoryBox.SelectedItem as string??"Any",
         ["codec"]=CodecBox.SelectedItem as string??"Any",["channels"]=ChannelsBox.SelectedItem?.ToString()??"Any",
         ["availability"]=AvailabilityBox.SelectedIndex.ToString(),["completeness"]=CompletenessBox.SelectedIndex.ToString(),["minimum"]=MinimumDurationBox.Text,["maximum"]=MaximumDurationBox.Text,
         ["sort"]=((AudioSortBox.SelectedItem as AssetSortChoice)?.Sort??AssetSort.Name).ToString(),["descending"]=(AudioDescending.IsChecked==true).ToString()
@@ -411,10 +412,11 @@ public partial class AudioWindow
         if(view=="scenes"){await ShowScenesAsync(token);if(generation!=navigationGeneration)return;await sceneView.SelectResourceAsync(identity,token);return;}
         if(view=="shader"){await InspectShaderResourceAsync(identity,token);if(generation!=navigationGeneration)return;await shaderView.SelectResourceAsync(identity,token);return;}
         if(view=="strings"){await ShowStringsAsync(token);if(generation!=navigationGeneration)return;await stringsView.SelectRecordAsync(identity,token);return;}
-        ShowBrowse("audio");StatusText.Text="Finding saved item…";await current.EnrichmentTask.WaitAsync(token);if(generation!=navigationGeneration||!ReferenceEquals(current,session))return;
-        var row=current.ResolveSelection([identity]).SingleOrDefault()??throw new InvalidOperationException("The saved clip is unavailable.");
+        ShowBrowse("audio");StatusText.Text="Finding saved item…";
+        var row=await current.PrepareSelectedMediaAsync(identity,token);
+        if(generation!=navigationGeneration||!ReferenceEquals(current,session))return;
         filterTimer.Stop();queryCancellation?.Cancel();++queryGeneration;
-        syncingControls=true;try{SearchBox.Text="";BankBox.SelectedIndex=0;LanguageBox.SelectedIndex=CodecBox.SelectedIndex=ChannelsBox.SelectedIndex=AvailabilityBox.SelectedIndex=CompletenessBox.SelectedIndex=0;MinimumDurationBox.Clear();MaximumDurationBox.Clear();}finally{syncingControls=false;}
+        syncingControls=true;try{SearchBox.Text="";BankBox.SelectedIndex=0;CategoryBox.SelectedIndex=LanguageBox.SelectedIndex=CodecBox.SelectedIndex=ChannelsBox.SelectedIndex=AvailabilityBox.SelectedIndex=CompletenessBox.SelectedIndex=0;MinimumDurationBox.Clear();MaximumDurationBox.Clear();}finally{syncingControls=false;}
         suppressSelectionTracking=true;try{MediaList.ItemsSource=new[]{row};MediaList.SelectedItem=row;}finally{suppressSelectionTracking=false;}
         selectedIdentities.Clear();selectedAudioRows.Clear();selectedIdentities.Add(identity.Key);selectedAudioRows[identity.Key]=row;SelectionText.Text="1 selected";PageText.Text="Saved item";UpdateSelectedDetails();SelectionForLibraryChanged();
     }
@@ -431,8 +433,13 @@ public partial class AudioWindow
             await textureExplorer.ApplyFilterAsync(filter.Values,token);return;
         }
         if(filter.View=="strings"){await ShowStringsAsync(token);if(generation!=navigationGeneration)return;await stringsView.ApplyFilterAsync(filter.Values,token);return;}
-        var current=session;if(current is null)return;await current.EnrichmentTask.WaitAsync(token);if(generation!=navigationGeneration||!ReferenceEquals(current,session))return;UpdateFilterChoices(current);ShowBrowse("audio");var values=filter.Values;
-        foreach(var pair in new[]{("language",LanguageBox),("codec",CodecBox),("channels",ChannelsBox)})
+        var current=session;if(current is null)return;
+        await current.PrepareBrowseAsync(token);
+        var values=filter.Values;
+        if(values.GetValueOrDefault("category","Any")!="Any")await current.PrepareCategoryChoicesAsync(token);
+        if(generation!=navigationGeneration||!ReferenceEquals(current,session))return;
+        UpdateFilterChoices(current);ShowBrowse("audio");
+        foreach(var pair in new[]{("category",CategoryBox),("language",LanguageBox),("codec",CodecBox),("channels",ChannelsBox)})
             if(!pair.Item2.Items.Cast<object>().Any(item=>item.ToString()==values.GetValueOrDefault(pair.Item1,"Any")))throw new InvalidOperationException($"The saved {pair.Item1} is unavailable.");
         var sort=Enum.TryParse<AssetSort>(values.GetValueOrDefault("sort","Name"),out var parsed)?parsed:throw new InvalidOperationException("The saved sort is unavailable.");
         var choice=AudioSortBox.Items.Cast<AssetSortChoice>().FirstOrDefault(item=>item.Sort==sort)??throw new InvalidOperationException("The saved sort is unavailable.");
@@ -441,6 +448,7 @@ public partial class AudioWindow
         {
             var bank=values.GetValueOrDefault("bank","");BankBox.SelectedItem=bank.Length==0?BankBox.Items[0]:BankBox.Items.Cast<AudioBankChoice>().FirstOrDefault(item=>item.Key==bank)??throw new InvalidOperationException("The saved bank is unavailable.");
             SearchBox.Text=values.GetValueOrDefault("search","");LanguageBox.SelectedItem=values.GetValueOrDefault("language","Any");CodecBox.SelectedItem=values.GetValueOrDefault("codec","Any");ChannelsBox.SelectedItem=values.GetValueOrDefault("channels","Any");
+            CategoryBox.SelectedItem=values.GetValueOrDefault("category","Any");
             AvailabilityBox.SelectedIndex=int.TryParse(values.GetValueOrDefault("availability"),out var availability)?Math.Clamp(availability,0,5):0;CompletenessBox.SelectedIndex=int.TryParse(values.GetValueOrDefault("completeness"),out var completeness)?Math.Clamp(completeness,0,3):0;
             MinimumDurationBox.Text=values.GetValueOrDefault("minimum","");MaximumDurationBox.Text=values.GetValueOrDefault("maximum","");
             AudioSortBox.SelectedItem=choice;AudioDescending.IsChecked=bool.TryParse(values.GetValueOrDefault("descending"),out var descending)&&descending;

@@ -76,6 +76,7 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
         using var temporary=connection.CreateCommand();temporary.CommandText="CREATE TEMP TABLE asset_replacement_keys(identity TEXT PRIMARY KEY); CREATE INDEX IF NOT EXISTS assets_v2_lookup ON assets_v2(revision,family,lookup_key,bank,sort_key,identity)";temporary.ExecuteNonQuery();
         InitializeLocalizationStreamedGroups();
         InitializeLinkedFeatures();
+        InitializeAudioCategories();
         }
         catch { connection.Dispose(); throw; }
     }
@@ -384,6 +385,8 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
             indexHint=" INDEXED BY assets_v2_language";
         if(select=="row_id"&&query.Sort is Deviant.Assets.AssetSort.Name or Deviant.Assets.AssetSort.Default&&query.Family is not null&&query.GroupKey is null&&string.IsNullOrWhiteSpace(query.Search)&&query.ExactKey is null&&query.ExactIdentityKey is null&&query.Language is null&&query.Codec is null&&query.Channels is null&&query.Availability is null&&query.Completeness is null&&query.MinimumDuration is null&&query.MaximumDuration is null)
             indexHint=query.Sort==Deviant.Assets.AssetSort.Name?(allowNameIndex?" INDEXED BY assets_v2_name_v1":""):" INDEXED BY assets_v2_family_sort";
+        if (!useTrigram && query.AudioCategory is not null && query.Family is not null)
+            indexHint = " INDEXED BY assets_v2_audio_category";
         var command = (readConnection ?? connection).CreateCommand(); command.Transaction = transaction;
         command.CommandText = $"SELECT {select} FROM assets_v2{indexHint} WHERE revision=$revision";
         command.Parameters.AddWithValue("$revision", revision);
@@ -402,6 +405,7 @@ public sealed partial class FeatureStore : IDisposable, Deviant.Assets.IAssetCat
         Filter("lookup_key", "=", query.ExactKey);
         Filter("identity", "=", query.ExactIdentityKey);
         Filter("family", "=", query.Family);
+        Filter("audio_category", "=", query.AudioCategory);
         if (query.CachedPayloadFilter is { } cachedPayload)
         {
             if (query.Family is null || cachedPayload.MaximumOrdinal < 0 || cachedPayload.MaximumPayloadBytes < 1)

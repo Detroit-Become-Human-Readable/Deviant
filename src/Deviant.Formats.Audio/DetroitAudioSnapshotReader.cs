@@ -1101,8 +1101,12 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
     private static void ClassifyEmbeddedMediaForBank(BankInfo bank, IReadOnlyList<MediaEntry> entries,
         Func<uint, IReadOnlyList<MediaSourceEvidence>> sourceEvidenceForId)
     {
+        var musicIds = bank.Objects.Values.Where(item => item.Type == 11)
+            .SelectMany(item => item.Sources.Select(source => source.Id).Concat(item.Clips.Select(clip => clip.MediaId)))
+            .ToHashSet();
         foreach (var entry in entries)
         {
+            if (musicIds.Contains(entry.Id)) entry.Category = "Music";
             var evidence = sourceEvidenceForId(entry.Id);
             try
             {
@@ -1269,6 +1273,7 @@ public sealed partial class DetroitAudioSnapshotReader(ISourceRevisionProvider? 
                     Slice = selected?.Slice ?? new DataSlice(bank.Slice.FilePath, bank.Slice.Offset, 0),
                     OriginalSlice = selected?.OriginalSlice ?? selected?.Slice, State = state,
                     Completeness = selected is null || resolvedFromRaw ? MediaCompleteness.Unverified : MediaCompleteness.Complete,
+                    SourceDeclarationProcessingComplete = true,
                     ContainerValidity = selected?.ContainerValidity ?? ContainerValidity.Unknown,
                     Availability = selected is not null ? SourceAvailability.Available : candidates.Count > 1 ? SourceAvailability.Ambiguous : SourceAvailability.Missing,
                     MetadataReadDigests = metadataReadDigests ?? [],

@@ -38,6 +38,7 @@ public sealed record AssetQuery(string? Search = null, string? GroupKey = null, 
     AssetSort Sort = AssetSort.Default, bool Descending = false)
 {
     public string? ExactIdentityKey { get; init; }
+    public string? AudioCategory { get; init; }
     public string? ModelKind { get; init; }
     public string? ModelNameProfile { get; init; }
     public string? CharacterGroup { get; init; }

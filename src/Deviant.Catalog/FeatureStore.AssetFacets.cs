@@ -6,7 +6,7 @@ using System.Text;
 
 namespace Deviant.Catalog;
 
-public enum AssetFacet { Language, Codec, Channels, Group }
+public enum AssetFacet { Language, Codec, Channels, Group, AudioCategory }
 public sealed record AssetFacetValue(string Value, long Count);
 public sealed record AssetFacetPage(SourceRevision Revision, long FamilyEpoch, long MatchedCount,
     long DistinctCount, IReadOnlyList<AssetFacetValue> Values, string? Continuation);
@@ -74,7 +74,7 @@ public sealed partial class FeatureStore
         string column = facet switch
         {
             AssetFacet.Language => "language", AssetFacet.Codec => "codec", AssetFacet.Channels => "channels",
-            AssetFacet.Group => "bank", _ => throw new ArgumentOutOfRangeException(nameof(facet))
+            AssetFacet.Group => "bank", AssetFacet.AudioCategory => "audio_category", _ => throw new ArgumentOutOfRangeException(nameof(facet))
         };
         string valid = facet == AssetFacet.Channels ? "typeof(channels)='integer' AND channels>0"
             : $"typeof({column})='text' AND length(trim({column}))>0";
@@ -128,7 +128,11 @@ public sealed partial class FeatureStore
     private long? ReadFacetEpoch(SqliteConnection read, SqliteTransaction transaction, string family)
     {
         using var command = read.CreateCommand(); command.Transaction = transaction;
-        command.CommandText = "SELECT epoch FROM linked_feature_dependencies WHERE revision=$revision AND kind=1 AND dependency_key=$family";
+        // Category projection repairs change matching membership without replacing typed compact-cache evidence.
+        // Both counters only advance, so their sum changes whenever either publication changes.
+        command.CommandText = family == "audio.media"
+            ? "SELECT d.epoch+COALESCE((SELECT c.epoch FROM linked_feature_dependencies c WHERE c.revision=d.revision AND c.kind=1 AND c.dependency_key='audio.media/categories'),0) FROM linked_feature_dependencies d WHERE d.revision=$revision AND d.kind=1 AND d.dependency_key=$family"
+            : "SELECT epoch FROM linked_feature_dependencies WHERE revision=$revision AND kind=1 AND dependency_key=$family";
         command.Parameters.AddWithValue("$revision", revision); command.Parameters.AddWithValue("$family", family);
         return command.ExecuteScalar() is long value ? value : null;
     }

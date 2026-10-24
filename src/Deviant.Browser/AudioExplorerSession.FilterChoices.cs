@@ -11,7 +11,7 @@ public sealed partial class AudioExplorerSession
     private readonly SemaphoreSlim recoveryFilterChoiceGate = new(1, 1);
     private bool recoveryFacetPreparationReady;
     private long recoveryFilterChoiceEpoch = -1;
-    private string[] recoveryLanguages = [], recoveryCodecs = [];
+    private string[] recoveryLanguages = [], recoveryCodecs = [], recoveryCategories = [];
     private int[] recoveryChannels = [];
     private bool recoveryFilterChoicesTruncated;
 
@@ -27,7 +27,7 @@ public sealed partial class AudioExplorerSession
             await Task.Run(() =>
             {
                 var cancellation = linked.Token;
-                lock (catalogGate) if (IsCatalogLoaded || browseSummary is not null) return;
+                lock (catalogGate) if (IsCatalogLoaded || browseSummary is { Categories.Count: > 0 }) return;
                 if (!recoveryFacetPreparationReady)
                 {
                     owner.Store.PrepareAssetFacets(owner.Revision, AssetFamily, cancellation);
@@ -50,21 +50,25 @@ public sealed partial class AudioExplorerSession
                     if (codecs is null) continue;
                     var channels = ReadRecoveryFacetValues(owner.Store, owner.Revision, AssetFacet.Channels, epoch.Value, ref bytes, cancellation);
                     if (channels is null) continue;
+                    var categories = ReadRecoveryFacetValues(owner.Store, owner.Revision, AssetFacet.AudioCategory, epoch.Value, ref bytes, cancellation);
+                    if (categories is null) continue;
                     var channelValues = channels.Values.Select(value => int.Parse(value, NumberStyles.None, CultureInfo.InvariantCulture)).ToArray();
                     if (owner.Store.ReadAssetFacetEpoch(owner.Revision, AssetFamily, cancellation) != epoch.Value) continue;
                     cancellation.ThrowIfCancellationRequested();
                     lock (catalogGate)
                     {
-                        if (IsCatalogLoaded || browseSummary is not null) return;
+                        if (IsCatalogLoaded) return;
                         recoveryLanguages = languages.Values; recoveryCodecs = codecs.Values; recoveryChannels = channelValues;
+                        recoveryCategories = categories.Values;
                         recoveryFilterChoiceEpoch = epoch.Value;
-                        recoveryFilterChoicesTruncated = languages.Truncated || codecs.Truncated || channels.Truncated;
+                        recoveryFilterChoicesTruncated = languages.Truncated || codecs.Truncated || channels.Truncated || categories.Truncated;
                         MergeRecoveryFilterChoicesUnsafe();
                     }
                     AssetLoadDiagnostics.Counters("AudioRecovery.FilterChoices", Snapshot.PhysicalSourceStamp, new Dictionary<string, long>
                     {
                         ["FamilyEpoch"] = epoch.Value, ["Languages"] = languages.Values.Length,
                         ["Codecs"] = codecs.Values.Length, ["Channels"] = channels.Values.Length,
+                        ["Categories"] = categories.Values.Length,
                         ["EstimatedBytes"] = bytes, ["Truncated"] = recoveryFilterChoicesTruncated ? 1 : 0
                     });
                     return;
@@ -79,7 +83,9 @@ public sealed partial class AudioExplorerSession
 
     private void MergeRecoveryFilterChoicesUnsafe()
     {
-        if (recoveryFilterChoiceEpoch < 0 || IsCatalogLoaded || browseSummary is not null) return;
+        if (recoveryFilterChoiceEpoch < 0 || IsCatalogLoaded) return;
+        Categories = recoveryCategories.Concat(stagedCategories).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+        if (browseSummary is not null) return;
         Languages = recoveryLanguages.Concat(stagedLanguages).Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToArray();
         Codecs = recoveryCodecs.Concat(stagedCodecs).Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToArray();
         ChannelCounts = recoveryChannels.Concat(stagedChannels).Distinct().Order().ToArray();

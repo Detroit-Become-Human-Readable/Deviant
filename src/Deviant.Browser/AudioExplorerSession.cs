@@ -55,13 +55,15 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
     private readonly Dictionary<string, long> stagedGroupCounts = new(StringComparer.Ordinal);
     private readonly HashSet<string> stagedLanguages = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> stagedCodecs = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> stagedCategories = new(StringComparer.Ordinal);
     private readonly HashSet<int> stagedChannels = [];
     private readonly Dictionary<string, long> stagedLanguageCounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, long> stagedCodecCounts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, long> stagedCategoryCounts = new(StringComparer.Ordinal);
     private readonly Dictionary<int, long> stagedChannelCounts = [];
     private readonly Dictionary<string, StagedMediaFilterEntry> stagedMediaFilters = new(StringComparer.Ordinal);
 
-    private sealed record StagedMediaFilterEntry(string Group, string? Language, string? Codec, int? Channels);
+    private sealed record StagedMediaFilterEntry(string Group, string? Language, string? Codec, int? Channels, string? Category);
     private sealed record AudioUserLabelDelta(Dictionary<string, string> Labels,
         Dictionary<string, MediaEntry> Entries,
         Dictionary<(string Bank, uint Id), SortedDictionary<(long Ordinal, string MemberPath), MediaEntry>?> Groups,
@@ -98,6 +100,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
     public IReadOnlyList<AudioBankChoice> Banks { get; private set; } = [];
     public IReadOnlyList<string> Languages { get; private set; } = [];
     public IReadOnlyList<string> Codecs { get; private set; } = [];
+    public IReadOnlyList<string> Categories { get; private set; } = [];
     public IReadOnlyList<int> ChannelCounts { get; private set; } = [];
     public bool IsEnrichmentComplete => Volatile.Read(ref enrichmentComplete) != 0;
     public AudioExplorerProgress CurrentProgress => Volatile.Read(ref currentProgress);
@@ -364,8 +367,8 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
     {
         if (changedMedia is null)
         {
-            stagedGroupCounts.Clear(); stagedLanguages.Clear(); stagedCodecs.Clear(); stagedChannels.Clear();
-            stagedLanguageCounts.Clear(); stagedCodecCounts.Clear(); stagedChannelCounts.Clear(); stagedMediaFilters.Clear();
+            stagedGroupCounts.Clear(); stagedLanguages.Clear(); stagedCodecs.Clear(); stagedChannels.Clear(); stagedCategories.Clear();
+            stagedLanguageCounts.Clear(); stagedCodecCounts.Clear(); stagedChannelCounts.Clear(); stagedCategoryCounts.Clear(); stagedMediaFilters.Clear();
             foreach (var media in catalog.Media) UpdateStagedMediaFilter(media);
         }
         else foreach (var media in changedMedia) UpdateStagedMediaFilter(media);
@@ -386,6 +389,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         Banks = choices;
         Languages = stagedLanguages.Order(StringComparer.OrdinalIgnoreCase).ToArray();
         Codecs = stagedCodecs.Order(StringComparer.OrdinalIgnoreCase).ToArray();
+        Categories = stagedCategories.Order(StringComparer.Ordinal).ToArray();
         ChannelCounts = stagedChannels.Order().ToArray();
         MergeRecoveryFilterChoices();
     }
@@ -400,6 +404,8 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
                 stagedLanguages.Remove(oldLanguage);
             if (prior.Codec is { } oldCodec && Decrement(stagedCodecCounts, oldCodec, out var noCodec) && noCodec)
                 stagedCodecs.Remove(oldCodec);
+            if (prior.Category is { } oldCategory && Decrement(stagedCategoryCounts, oldCategory, out var noCategory) && noCategory)
+                stagedCategories.Remove(oldCategory);
             if (prior.Channels is { } oldChannels && Decrement(stagedChannelCounts, oldChannels, out var noChannels) && noChannels)
                 stagedChannels.Remove(oldChannels);
         }
@@ -407,11 +413,13 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         var current = new StagedMediaFilterEntry(GroupKey(media),
             string.IsNullOrWhiteSpace(media.Language) ? null : media.Language,
             string.IsNullOrWhiteSpace(media.Codec) || media.Codec == "Unknown" ? null : media.Codec,
-            media.Channels > 0 ? media.Channels : null);
+            media.Channels > 0 ? media.Channels : null,
+            string.IsNullOrWhiteSpace(media.Category) ? null : media.Category);
         stagedMediaFilters[identity.Key] = current;
         Increment(stagedGroupCounts, current.Group);
         if (current.Language is { } language) { Increment(stagedLanguageCounts, language); stagedLanguages.Add(language); }
         if (current.Codec is { } codec) { Increment(stagedCodecCounts, codec); stagedCodecs.Add(codec); }
+        if (current.Category is { } category) { Increment(stagedCategoryCounts, category); stagedCategories.Add(category); }
         if (current.Channels is { } channels) { Increment(stagedChannelCounts, channels); stagedChannels.Add(channels); }
     }
 
@@ -525,6 +533,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(query);
         ValidateQuery(query);
         ThrowIfDisposed();
+        if (query.Category is not null) await PrepareAudioCategoriesAsync(cancellationToken).ConfigureAwait(false);
         var cachedPage = await ReadBrowsePageAsync(query, cancellationToken).ConfigureAwait(false);
         if (cachedPage is not null) return cachedPage;
         if (!IsCatalogLoaded && !hasCachedAudioSnapshot)
@@ -862,7 +871,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
             media.ResolutionDetails.Length == 0 ? null : media.ResolutionDetails,
             NaturalOrder.Key(label))
         {
-            Metadata = new Dictionary<string, string> { ["audio.source-label"] = labelOverride ?? UserLabel(media) },
+            Metadata = new Dictionary<string, string> { ["audio.source-label"] = labelOverride ?? UserLabel(media), ["audio.category"] = media.Category },
             SearchTerms = string.Join('\n', names.Select(name => name.Text).Concat(media.Aliases)
                 .Prepend(label).Append(identity.Key).Append(media.IdText).Append(media.Name).Append(media.BankName))
         };
@@ -907,7 +916,8 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
         Channels: query.Channels,
         Availability: query.Availability,
         Completeness: query.Completeness is { } completeness ? MapCompleteness(completeness) : null,
-        Offset: query.Offset, Limit: query.Limit, Family: AssetFamily,Sort:query.Sort==AssetSort.Name?AssetSort.Default:query.Sort,Descending:query.Descending);
+        Offset: query.Offset, Limit: query.Limit, Family: AssetFamily,Sort:query.Sort==AssetSort.Name?AssetSort.Default:query.Sort,Descending:query.Descending)
+        { AudioCategory = string.IsNullOrWhiteSpace(query.Category) ? null : query.Category };
 
     private string UserLabel(MediaEntry media) => media.Identity is not null && labelsByIdentity.TryGetValue(media.Identity.Key, out var label)
         ? label : FallbackMediaLabel(media);
@@ -1127,6 +1137,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
 
     private static void ValidateQuery(AudioExplorerQuery query)
     {
+        if (query.Category is { Length: > 512 }) throw new ArgumentException("The audio type filter is too long.", nameof(query));
         if (query.Offset < 0) throw new ArgumentOutOfRangeException(nameof(query), "Page offset must be zero or greater.");
         if (query.Limit is < 1 or > 10_000) throw new ArgumentOutOfRangeException(nameof(query), "Page limit must be between 1 and 10000.");
         if (query.MinimumDuration < 0 || query.MaximumDuration < 0) throw new ArgumentOutOfRangeException(nameof(query), "Duration filters must be zero or greater.");

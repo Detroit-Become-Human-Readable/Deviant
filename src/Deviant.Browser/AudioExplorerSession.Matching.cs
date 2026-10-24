@@ -12,6 +12,8 @@ public sealed partial class AudioExplorerSession
         IProgress<AudioExplorerProgress>? progress = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(query);
+        ValidateQuery(query);
+        if (query.Category is not null) await PrepareAudioCategoriesAsync(cancellationToken).ConfigureAwait(false);
         using var owner = AcquireSharedFeatureStore();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, owner.SourceCancellation);
         var token = linked.Token;

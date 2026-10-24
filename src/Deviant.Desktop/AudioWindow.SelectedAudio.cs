@@ -119,6 +119,23 @@ public partial class AudioWindow
             if (cancellation.IsCancellationRequested || generation != selectedAudioDetailsGeneration ||
                 !ReferenceEquals(owner, session) || CurrentRow?.Identity != identity) return;
             selectedAudioRows[identity.Key] = row;
+            var visible = CurrentRows;
+            if (visible.Any(item => item.Identity == identity))
+            {
+                var focused = (MediaList.SelectedItem as AudioExplorerRow)?.Identity;
+                var rows = visible.Select(item => item.Identity == identity ? row : item).ToArray();
+                suppressSelectionTracking = true;
+                try
+                {
+                    MediaList.ItemsSource = rows;
+                    MediaList.SelectedItems.Clear();
+                    foreach (var item in rows.Where(item => selectedIdentities.Contains(item.Identity.Key)))
+                        MediaList.SelectedItems.Add(item);
+                    if (focused is not null && rows.FirstOrDefault(item => item.Identity == focused) is { } focus)
+                        MediaList.SelectedItem = focus;
+                }
+                finally { suppressSelectionTracking = false; }
+            }
             UpdateSelectedDetails();
         }
         catch (OperationCanceledException) { }

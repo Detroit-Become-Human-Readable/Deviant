@@ -127,6 +127,8 @@ public partial class AudioWindow : Window, IAssetNavigator
         CompletenessBox.ItemsSource = new[] { "Any", "Complete", "Unclassified", "Partial" };
         AvailabilityBox.SelectedIndex = 0;
         CompletenessBox.SelectedIndex = 0;
+        CategoryBox.ItemsSource = new[] { "Any" };
+        CategoryBox.SelectedIndex = 0;
         InitializeNavigation();
         InitializeActivity();
     }
@@ -429,7 +431,8 @@ public partial class AudioWindow : Window, IAssetNavigator
                 AssetCompleteness.Complete => MediaCompleteness.Complete,
                 AssetCompleteness.Partial => MediaCompleteness.Fragment,
                 _ => MediaCompleteness.Unverified
-            }, offset, limit,Sort:(AudioSortBox.SelectedItem as AssetSortChoice)?.Sort??AssetSort.Name,Descending:AudioDescending.IsChecked==true) with { Availability = availability };
+            }, offset, limit,Sort:(AudioSortBox.SelectedItem as AssetSortChoice)?.Sort??AssetSort.Name,Descending:AudioDescending.IsChecked==true,
+            Category:CategoryBox.SelectedItem is string category && category != "Any" ? category : null) with { Availability = availability };
     }
 
     private static double? ParseNonnegative(string text) => double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value) && value >= 0 ? value : null;
@@ -438,12 +441,47 @@ public partial class AudioWindow : Window, IAssetNavigator
     {
         syncingControls = true;
         var selectedBank = (BankBox.SelectedItem as AudioBankChoice)?.Key;
+        UpdateCategoryChoices(current);
         BankBox.ItemsSource = new[] { new AudioBankChoice("", "All banks", current.MediaCount, 0, "") }.Concat(current.Banks).ToArray();
         BankBox.SelectedItem = BankBox.Items.Cast<AudioBankChoice>().FirstOrDefault(item => item.Key == selectedBank) ?? BankBox.Items[0];
         var lang = LanguageBox.SelectedItem as string; LanguageBox.ItemsSource = new[] { "Any" }.Concat(current.Languages).ToArray(); LanguageBox.SelectedItem = lang is not null && LanguageBox.Items.Contains(lang) ? lang : "Any";
         var codec = CodecBox.SelectedItem as string; CodecBox.ItemsSource = new[] { "Any" }.Concat(current.Codecs).ToArray(); CodecBox.SelectedItem = codec is not null && CodecBox.Items.Contains(codec) ? codec : "Any";
         var ch = ChannelsBox.SelectedItem; ChannelsBox.ItemsSource = new object[] { "Any" }.Concat(current.ChannelCounts.Cast<object>()).ToArray(); ChannelsBox.SelectedItem = ch is not null && ChannelsBox.Items.Contains(ch) ? ch : "Any";
         syncingControls = false;
+    }
+
+    private void UpdateCategoryChoices(AudioExplorerSession current)
+    {
+        var categories = new[] { "Any" }.Concat(current.Categories).ToArray();
+        if (CategoryBox.Items.Cast<string>().SequenceEqual(categories, StringComparer.Ordinal)) return;
+        var category = CategoryBox.SelectedItem as string;
+        CategoryBox.ItemsSource = categories;
+        CategoryBox.SelectedItem = category is not null && CategoryBox.Items.Contains(category) ? category : "Any";
+    }
+
+    private async void CategoryBox_DropDownOpened(object? sender, EventArgs e)
+    {
+        if (session is not { } current || currentView != "audio" || closingInProgress) return;
+        var generation = navigationGeneration;
+        try
+        {
+            await current.PrepareCategoryChoicesAsync(navigationCancellation.Token);
+            if (generation == navigationGeneration && ReferenceEquals(current, session) && currentView == "audio" && !closingInProgress)
+            {
+                var open = CategoryBox.IsDropDownOpen;
+                syncingControls = true;
+                try { UpdateCategoryChoices(current); }
+                finally { syncingControls = false; }
+                if (open) CategoryBox.IsDropDownOpen = true;
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception error)
+        {
+            WorkflowDiagnostics.Failure("Audio.TypeChoices", error);
+            if (generation == navigationGeneration && ReferenceEquals(current, session) && currentView == "audio" && !closingInProgress)
+                StatusText.Text = error.Message;
+        }
     }
 
     private void FilterChanged(object sender, RoutedEventArgs e)
@@ -457,7 +495,7 @@ public partial class AudioWindow : Window, IAssetNavigator
     {
         syncingControls = true; SearchBox.Clear(); MinimumDurationBox.Clear(); MaximumDurationBox.Clear();
         if (BankBox.Items.Count > 0) BankBox.SelectedIndex = 0; LanguageBox.SelectedIndex = CodecBox.SelectedIndex = ChannelsBox.SelectedIndex = 0;
-        AvailabilityBox.SelectedIndex = CompletenessBox.SelectedIndex = 0; syncingControls = false; _ = QueryAsync(true);
+        CategoryBox.SelectedIndex = AvailabilityBox.SelectedIndex = CompletenessBox.SelectedIndex = 0; syncingControls = false; _ = QueryAsync(true);
     }
 
     private async void Previous_Click(object sender, RoutedEventArgs e)
@@ -600,6 +638,8 @@ public partial class AudioWindow : Window, IAssetNavigator
             token.ThrowIfCancellationRequested();
             if (request != previewRequestVersion || !ReferenceEquals(current, session)) return;
             SetBusy(true, partial ? "Preparing partial preview…" : "Preparing preview…");
+            PreviewFailure.Text = "";
+            PreviewFailure.Visibility = Visibility.Collapsed;
             row = await current.PrepareSelectedMediaAsync(row.Identity, token);
             using var previewProgress = new CoalescedProgress<AudioProgress>(value => Dispatcher.BeginInvoke(new Action(() =>
             {
@@ -623,7 +663,16 @@ public partial class AudioWindow : Window, IAssetNavigator
             playbackTimer.Start(); SetBusy(false, partial ? "Partial preview · original fragment" : "Preview ready");
         }
         catch (OperationCanceledException) { if (request == previewRequestVersion && ReferenceEquals(current, session) && !indexOpeningActive && !closingInProgress) SetBusy(false, "Preview cancelled"); }
-        catch (Exception ex) { WorkflowDiagnostics.Failure("Audio.Operation", ex); if (request == previewRequestVersion && ReferenceEquals(current, session) && !indexOpeningActive && !closingInProgress) SetBusy(false, ex.Message); }
+        catch (Exception ex)
+        {
+            WorkflowDiagnostics.Failure("Audio.Operation", ex);
+            if (request == previewRequestVersion && ReferenceEquals(current, session) && !indexOpeningActive && !closingInProgress)
+            {
+                PreviewFailure.Text = "Preview failed: " + ex.Message;
+                PreviewFailure.Visibility = Visibility.Visible;
+                SetBusy(false, ex.Message);
+            }
+        }
         finally
         {
             acceptPreviewProgress = false;

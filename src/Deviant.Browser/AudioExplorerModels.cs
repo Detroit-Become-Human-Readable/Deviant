@@ -26,7 +26,8 @@ public sealed record AudioExplorerQuery(
     long Offset = 0,
     int Limit = 100,
     AssetSort Sort = AssetSort.Default,
-    bool Descending = false);
+    bool Descending = false,
+    string? Category = null);
 
 public enum AudioMediaHydrationState { SourceDetailsRequired, Ready }
 

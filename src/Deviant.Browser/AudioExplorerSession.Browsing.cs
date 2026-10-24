@@ -26,7 +26,10 @@ public sealed partial class AudioExplorerSession
     private sealed record AudioBrowseSummary(string IndexContentId, string PhysicalSourceStamp, FileStamp IndexStamp,
         IReadOnlyList<VolumeSource> Volumes, long MediaCount, int BankCount, IReadOnlyList<AudioBankChoice> Banks,
         IReadOnlyList<string> Languages, IReadOnlyList<string> Codecs, IReadOnlyList<int> Channels,
-        int EventMediaVersion, int DialogueHeaderVersion);
+        int EventMediaVersion, int DialogueHeaderVersion)
+    {
+        public IReadOnlyList<string> Categories { get; init; } = [];
+    }
 
     public long MediaCount => browseSummary?.MediaCount ?? (IsCatalogLoaded?Catalog.Media.Count:
         Math.Max(Catalog.Media.Count,Interlocked.Read(ref recoveryMediaCount)));
@@ -61,7 +64,7 @@ public sealed partial class AudioExplorerSession
 
     private bool ValidBrowseSummary(AudioBrowseSummary summary) =>
         summary.IndexStamp is not null && summary.Volumes is not null && summary.Banks is not null &&
-        summary.Languages is not null && summary.Codecs is not null && summary.Channels is not null &&
+        summary.Languages is not null && summary.Codecs is not null && summary.Channels is not null && summary.Categories is not null &&
         MetadataCacheSourcePolicy.CanReuseStampHead(Snapshot) &&
         summary.IndexContentId == Snapshot.IndexContentId && summary.PhysicalSourceStamp == Snapshot.PhysicalSourceStamp &&
         SourceIdentity.SameStamp(summary.IndexStamp, Snapshot.IndexStamp) && MetadataCacheSourcePolicy.SameVolumes(summary.Volumes, Snapshot.Volumes) &&
@@ -76,6 +79,7 @@ public sealed partial class AudioExplorerSession
             browseSummary = summary;
             if (!IsCatalogLoaded) Catalog.EventMediaVersion = summary.EventMediaVersion;
             Banks = summary.Banks; Languages = summary.Languages; Codecs = summary.Codecs; ChannelCounts = summary.Channels;
+            Categories = summary.Categories.Concat(recoveryCategories).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
             bankLabelsByKey.Clear();
             foreach (var bank in summary.Banks) bankLabelsByKey[bank.Key] = bank.Label;
             Interlocked.Exchange(ref enrichmentComplete, 1);
@@ -97,7 +101,7 @@ public sealed partial class AudioExplorerSession
         if (!IsEnrichmentComplete || !MetadataCacheSourcePolicy.CanReuseStampHead(Snapshot) || !AreDialogueHeadersReady) return;
         var summary = new AudioBrowseSummary(Snapshot.IndexContentId, Snapshot.PhysicalSourceStamp, Snapshot.IndexStamp,
             Snapshot.Volumes, Catalog.Media.Count, Catalog.Banks.Count, Banks.ToArray(), Languages.ToArray(), Codecs.ToArray(),
-            ChannelCounts.ToArray(), Catalog.EventMediaVersion, Catalog.DialogueHeaderVersion);
+            ChannelCounts.ToArray(), Catalog.EventMediaVersion, Catalog.DialogueHeaderVersion) { Categories = Categories.ToArray() };
         if (!ValidBrowseSummary(summary)) return;
         var references = new LinkedFeatureReference[Catalog.Media.Count];
         for (var index = 0; index < references.Length; index++)

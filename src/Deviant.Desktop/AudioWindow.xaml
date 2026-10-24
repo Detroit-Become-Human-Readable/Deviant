@@ -123,6 +123,7 @@
                     <GroupBox Header="Browse" Padding="8" Margin="0,0,0,8">
                         <StackPanel>
                             <TextBox x:Name="SearchBox" ToolTip="Search names and aliases" TextChanged="FilterChanged" />
+                            <TextBlock Text="Type" Margin="0,8,0,2"/><ComboBox x:Name="CategoryBox" SelectionChanged="FilterChanged" DropDownOpened="CategoryBox_DropDownOpened" AutomationProperties.Name="Audio type" />
                             <TextBlock Text="Bank" Margin="0,8,0,2"/><ComboBox x:Name="BankBox" SelectionChanged="FilterChanged"><ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate></ComboBox>
                             <TextBlock Text="Language" Margin="0,8,0,2"/><ComboBox x:Name="LanguageBox" SelectionChanged="FilterChanged" />
                             <TextBlock Text="Codec" Margin="0,8,0,2"/><ComboBox x:Name="CodecBox" SelectionChanged="FilterChanged" />
@@ -176,7 +177,7 @@
                         </StackPanel>
                         <ComboBox x:Name="DeviceBox" Width="190" Margin="4,0,0,0" VerticalAlignment="Center" SelectionChanged="Device_SelectionChanged"><ComboBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Name}" /></DataTemplate></ComboBox.ItemTemplate></ComboBox>
                         </WrapPanel>
-                        <StackPanel Grid.Row="1" Margin="4,3,0,0"><TextBlock x:Name="PlayingLabel" TextTrimming="CharacterEllipsis" /><TextBlock x:Name="ActionBadge" /></StackPanel>
+                        <StackPanel Grid.Row="1" Margin="4,3,0,0"><TextBlock x:Name="PlayingLabel" TextTrimming="CharacterEllipsis" /><TextBlock x:Name="ActionBadge" /><TextBlock x:Name="PreviewFailure" TextWrapping="Wrap" Visibility="Collapsed" AutomationProperties.LiveSetting="Polite" /></StackPanel>
                         <Grid Grid.Row="2" Margin="4,6,0,0">
                             <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                             <Slider x:Name="SeekSlider" Minimum="0" Maximum="1" Margin="0,0,10,0" VerticalAlignment="Center" ValueChanged="Seek_ValueChanged" IsEnabled="False" />
