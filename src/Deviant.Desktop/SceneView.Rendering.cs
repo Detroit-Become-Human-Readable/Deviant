@@ -502,8 +502,15 @@ public partial class SceneView
     private void BuildRenderHierarchy(RenderAssetSnapshot source)
     {
         renderRows.Clear();
-        foreach (var node in source.Hierarchy) renderRows.Add(node.Key, new(node, (row, visible) =>
-        { if (row.Node.OccurrenceKey is { } key) SceneViewport.SetVisibility(key, visible); }));
+        var occurrences = source.Occurrences.ToDictionary(occurrence => occurrence.Key, StringComparer.Ordinal);
+        foreach (var node in source.Hierarchy)
+        {
+            var row = new RenderTreeRow(node, (item, visible) =>
+            { if (item.Node.OccurrenceKey is { } key) SceneViewport.SetVisibility(key, visible); });
+            if (node.OccurrenceKey is { } occurrenceKey && occurrences.TryGetValue(occurrenceKey, out var occurrence) &&
+                occurrence.SourceVisibilityKnown && !occurrence.SourceVisible) row.Label += " · Hidden in source";
+            renderRows.Add(node.Key, row);
+        }
         var roots = new List<RenderTreeRow>();
         foreach (var row in renderRows.Values)
             if (row.Node.ParentKey is { } parent && renderRows.TryGetValue(parent, out var owner)) owner.Children.Add(row);
@@ -542,7 +549,7 @@ public partial class SceneView
             .Select(identity => source.Materials[identity]).ToArray();
         SelectedName.Text = renderRows.Values.FirstOrDefault(item => item.Node.OccurrenceKey == occurrence.Key)?.Label ?? SceneNameDisplay.Project(occurrence.Label, "Mesh");
         Footer.Text = "";
-        RenderSummary.Text = $"{mesh.Geometry.Primitives.Sum(item => item.Positions.Count):N0} vertices · {mesh.Geometry.Primitives.Sum(item => item.Indices.Count / 3):N0} triangles";
+        RenderSummary.Text = $"{mesh.Geometry.Primitives.Sum(item => item.Positions.Count):N0} vertices · {mesh.Geometry.Primitives.Sum(item => item.Indices.Count / 3):N0} triangles" + (occurrence.SourceVisibilityKnown && !occurrence.SourceVisible ? " · Hidden in source" : "");
         IdentityText.Text = occurrence.PlacementOrigin == RenderPlacementOrigin.ModelLocal
             ? $"Model-local placement\nMesh anchor {mesh.Identity.Key}\nGroup {mesh.GroupIndex}\nScene entity unavailable\nScene node unavailable"
             : $"Object {occurrence.SceneEntityIdentity?.Key ?? occurrence.Entity.Key}\nNode {occurrence.SceneNodeIdentity?.Key ?? occurrence.Node.Key}\nMesh {mesh.Identity.Key}\nGroup {mesh.GroupIndex}";

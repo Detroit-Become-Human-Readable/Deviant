@@ -58,11 +58,7 @@ public partial class SceneView
                         { AllowLargeData = true }, progress, own.Token);
                     source = full;
                 }
-                var choices = entireLoadedScene || allRegions
-                    ? source.Occurrences.Where(o => includeHidden || SceneViewport.IsOccurrenceVisible(o.Key) || allRegions && o.SourceVisible)
-                        .Select(o => new RenderMeshSelection(o.Key)).ToArray()
-                    : selected.Where(s => includeHidden || SceneViewport.IsOccurrenceVisible(s.OccurrenceKey)).ToArray();
-                if (choices.Length == 0) throw new InvalidOperationException("Select a mesh to export.");
+                var choices = ResolveGeometryExportChoices(source, selected, entireLoadedScene, allRegions, includeHidden, SceneViewport.IsOccurrenceVisible);
                 var exportRequest = new SceneFbxExportRequest(choices, merge, placement, includeHidden)
                     { PreserveInstances = allRegions && !merge };
                 FbxGeometryExportReport result;
@@ -82,15 +78,45 @@ public partial class SceneView
         }
     }
 
+    private static RenderMeshSelection[] ResolveGeometryExportChoices(RenderAssetSnapshot source,
+        IEnumerable<RenderMeshSelection> selection, bool entire, bool allRegions, bool includeHidden, Func<string, bool> isVisible)
+    {
+        var selected = selection.ToArray();
+        var occurrences = source.Occurrences.ToDictionary(occurrence => occurrence.Key, StringComparer.Ordinal);
+        bool Eligible(RenderOccurrence occurrence) => includeHidden || occurrence.SourceVisible && (allRegions || isVisible(occurrence.Key));
+        var choices = entire || allRegions
+            ? source.Occurrences.Where(Eligible).Select(occurrence => new RenderMeshSelection(occurrence.Key)).ToArray()
+            : selected.Where(item => occurrences.TryGetValue(item.OccurrenceKey, out var occurrence) && Eligible(occurrence)).ToArray();
+        if (choices.Length > 0) return choices;
+        if (source.Occurrences.Count == 0) throw new InvalidOperationException("No meshes are loaded.");
+        if (entire || allRegions) throw new InvalidOperationException("No visible meshes to export. Enable Include hidden to include hidden meshes.");
+        if (selected.Length == 0) throw new InvalidOperationException("Select a mesh to export.");
+        if (!selected.Any(item => occurrences.ContainsKey(item.OccurrenceKey)))
+            throw new InvalidOperationException("The selected meshes are no longer loaded. Select a mesh to export.");
+        throw new InvalidOperationException("The selected meshes are hidden. Enable Include hidden to export them.");
+    }
     private async void ExportSelection_Click(object sender, RoutedEventArgs e) => await PickExportAsync(false, false);
     private async void ExportLoadedScene_Click(object sender, RoutedEventArgs e) => await PickExportAsync(true, false);
     private async void ExportAllRegions_Click(object sender, RoutedEventArgs e) => await PickExportAsync(false, true);
     private async Task PickExportAsync(bool entire, bool allRegions)
     {
-        var dialog = new SaveFileDialog { Filter = "FBX model (*.fbx)|*.fbx", DefaultExt = ".fbx", FileName = entire || allRegions ? "Scene.fbx" : "Selection.fbx" };
-        if (dialog.ShowDialog(Window.GetWindow(this)) != true) return;
-        try { await ExportGeometryAsync(dialog.FileName, entire, allRegions, MergeExport.IsChecked == true,
-            ExportPlacement.SelectedIndex == 1 ? SceneExportPlacement.Centered : SceneExportPlacement.Scene, IncludeHiddenExport.IsChecked == true); }
+        try
+        {
+            if (!exportTask.IsCompleted) throw new InvalidOperationException("An export is already running.");
+            if (GeometryExportProvider is null) throw new InvalidOperationException("FBX export is unavailable.");
+            var source = renderSnapshot ?? throw new InvalidOperationException("Load a scene first.");
+            bool includeHidden = IncludeHiddenExport.IsChecked == true;
+            if (allRegions)
+            {
+                if (section is null || SelectedBranchIdentity is null) throw new InvalidOperationException("Select a scene branch.");
+                if (RenderProvider is null) throw new InvalidOperationException("Scene loading is unavailable.");
+            }
+            else ResolveGeometryExportChoices(source, SceneViewport.SelectedMeshes, entire, false, includeHidden, SceneViewport.IsOccurrenceVisible);
+            var dialog = new SaveFileDialog { Filter = "FBX model (*.fbx)|*.fbx", DefaultExt = ".fbx", FileName = entire || allRegions ? "Scene.fbx" : "Selection.fbx" };
+            if (dialog.ShowDialog(Window.GetWindow(this)) != true) return;
+            await ExportGeometryAsync(dialog.FileName, entire, allRegions, MergeExport.IsChecked == true,
+                ExportPlacement.SelectedIndex == 1 ? SceneExportPlacement.Centered : SceneExportPlacement.Scene, includeHidden);
+        }
         catch (OperationCanceledException) { RenderStatus.Text = "Export cancelled"; }
         catch (Exception error) { RenderStatus.Text = error.Message; Advanced.Text = error.ToString(); }
     }
