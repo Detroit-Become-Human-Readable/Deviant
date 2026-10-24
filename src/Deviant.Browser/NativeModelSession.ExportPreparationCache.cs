@@ -258,6 +258,7 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
         Func<CancellationToken, Task> validateSource, AssetMemoryBudget budget, CancellationToken token = default,
         Func<IReadOnlyList<string>>? diagnostics = null)
     {
+        using var timing = AssetLoadDiagnostics.Measure("ExportMapsAcquire", key);
         await validateSource(token).ConfigureAwait(false);
         IReadOnlyList<FbxStagedMaterialMapInput>? created = null;
         var leases = new LeaseSet();
@@ -312,6 +313,7 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
                                 FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan)); } });
             }
             await validateSource(token).ConfigureAwait(false);
+            AssetLoadDiagnostics.Cache("ExportMapsCache", key, created is null);
             return (maps, leases, created is null, header.Diagnostics);
         }
         catch { await leases.DisposeAsync().ConfigureAwait(false); throw; }
@@ -401,6 +403,7 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
 
     private static async Task<bool> ValidateMediaAsync(string path, long length, string digest, CancellationToken token)
     {
+        using var timing = AssetLoadDiagnostics.Measure("ExportMediaVerify", relativeSource: Path.GetFileName(path), requestedBytes: length);
         try
         {
             await using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous);
@@ -526,6 +529,7 @@ public sealed class NativeModelExportPreparationCache(CacheManager cache)
         Func<NativeTextureExportSourceEvidence?, CancellationToken, Task>? validateEvidence = null)
     {
         ArgumentNullException.ThrowIfNull(cache); ArgumentNullException.ThrowIfNull(producer); ArgumentNullException.ThrowIfNull(validateSource);
+        using var timing = AssetLoadDiagnostics.Measure("ExportTextureRestore", key);
         await validateSource(token).ConfigureAwait(false);
         (DdsTextureDocument Document, TextureSurface Surface)? created = null;
         CacheLease? lease = null; FileStream? pinnedInput = null;

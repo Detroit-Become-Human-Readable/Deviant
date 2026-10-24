@@ -212,8 +212,11 @@ public sealed partial class FbxGeometryExporter
                 if (options.MediaPackaging == FbxMediaPackaging.Embedded)
                 {
                     var creationTime = FbxBinary7400Writer.FormatCreationTime(DateTimeOffset.UtcNow);
-                    var document = BuildBinaryDocument(input, plan, mediaPlan, creationTime, cancellationToken);
-                    FbxBinary7400Writer.Write(stream, document, creationTime, options.MaximumBinaryBytes, cancellationToken);
+                    IReadOnlyList<FbxBinary7400Node> document;
+                    using (AssetLoadDiagnostics.Measure("FbxBinaryBuild"))
+                        document = BuildBinaryDocument(input, plan, mediaPlan, creationTime, cancellationToken);
+                    using (AssetLoadDiagnostics.Measure("FbxBinaryWrite"))
+                        FbxBinary7400Writer.Write(stream, document, creationTime, options.MaximumBinaryBytes, cancellationToken);
                 }
                 else
                 {
@@ -263,6 +266,7 @@ public sealed partial class FbxGeometryExporter
         CancellationToken token, List<FbxGeometryExportLoss> losses,
         IReadOnlyDictionary<string, FbxMaterialExportInput>? scopedMaterials = null)
     {
+        using var timing = AssetLoadDiagnostics.Measure("FbxPlan");
         var byKey = asset.Primitives.ToDictionary(primitive => primitive.Key, StringComparer.Ordinal);
         var referenced = new HashSet<string>(StringComparer.Ordinal);
         foreach (var node in asset.Nodes)
@@ -440,6 +444,7 @@ public sealed partial class FbxGeometryExporter
         IReadOnlyList<FbxMaterialExportInput> inputs, FbxGeometryExportOptions options, CancellationToken token,
         IReadOnlyList<MeshPrimitive> primitives)
     {
+        using var timing = AssetLoadDiagnostics.Measure("FbxMaterialValidation");
         if (inputs.Count > options.MaximumMaterials)
             throw Error("MaterialLimit", "The material input count exceeds the configured limit.",
                 [new("MaterialLimit", "asset", $"Requested {inputs.Count}; limit is {options.MaximumMaterials}.")]);
@@ -903,6 +908,7 @@ public sealed partial class FbxGeometryExporter
         string sourceRoot, string stageRoot, string outputPath, FbxGeometryExportOptions options,
         List<FbxGeometryExportLoss> losses, CancellationToken token)
     {
+        using var timing = AssetLoadDiagnostics.Measure("FbxMediaStage");
         var textures = new List<FbxTexturePlan>();
         var videos = new Dictionary<string, FbxVideoPlan>(StringComparer.Ordinal);
         var reports = new List<FbxMaterialTextureExportResult>();

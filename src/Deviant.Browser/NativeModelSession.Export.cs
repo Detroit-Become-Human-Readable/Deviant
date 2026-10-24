@@ -530,6 +530,7 @@ public sealed partial class NativeModelSession
     private static Func<CancellationToken, Task> CreateBakeSourceValidation(NativeContainerLease container,
         IReadOnlyList<Func<CancellationToken, Task>> validations) => async cancellation =>
     {
+        using var timing = AssetLoadDiagnostics.Measure("ExportBakeSourceValidation");
         cancellation.ThrowIfCancellationRequested(); container.EnsureUnchanged();
         foreach (var validate in validations) await validate(cancellation).ConfigureAwait(false);
     };
@@ -537,6 +538,7 @@ public sealed partial class NativeModelSession
     private static Func<CancellationToken, Task> CreateExportSourceValidation(NativeTextureSession textures,
         NativeTextureExportPlan plan, NativeTextureExportSourceEvidence evidence) => async cancellation =>
     {
+        using var timing = AssetLoadDiagnostics.Measure("ExportTextureSourceValidation", plan.Fingerprint.NativeIdentity.Key);
         using var verified = await textures.VerifyExportEvidenceAsync(plan, evidence, cancellation).ConfigureAwait(false);
         verified.EnsureUnchanged();
     };

@@ -281,6 +281,7 @@ internal sealed class CacheStorageBudget
 
     private long MeasureRoot()
     {
+        using var timing = Deviant.Assets.AssetLoadDiagnostics.Measure("CacheStorageScan");
         long bytes = 0;
         var options = new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint, IgnoreInaccessible = false };
         foreach (var path in Directory.Exists(root) ? Directory.EnumerateFiles(root, "*", options) : [])

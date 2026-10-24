@@ -39,8 +39,9 @@ public sealed class MaterialBakeCache(CacheManager cache)
             lease = await cache.AcquireMaterialBakeOutputAsync(key, async (output, cancellation) =>
             {
                 hit = false;
-                created = await Task.Run(() => MaterialSurfaceMapBaker.Bake(material, primitive, textures, width, height,
-                    budget.Reserve, cancellation, uvSet, corners, reservedOutputBytes), cancellation).ConfigureAwait(false);
+                using (AssetLoadDiagnostics.Measure("ExportRasterize", key))
+                    created = await Task.Run(() => MaterialSurfaceMapBaker.Bake(material, primitive, textures, width, height,
+                        budget.Reserve, cancellation, uvSet, corners, reservedOutputBytes), cancellation).ConfigureAwait(false);
                 using (AssetLoadDiagnostics.Measure("BakeCacheWrite", key))
                     await WriteAsync(output, created, key, cancellation).ConfigureAwait(false);
             }, (path, cancellation) => ValidateAsync(path, key, graph, width, height, uvSet, cancellation), token).ConfigureAwait(false);
@@ -51,8 +52,10 @@ public sealed class MaterialBakeCache(CacheManager cache)
             token.ThrowIfCancellationRequested();
             hit = false;
             // A bake remains usable without retaining an optional disk entry.
-            created ??= await Task.Run(() => MaterialSurfaceMapBaker.Bake(material, primitive, textures, width, height,
-                budget.Reserve, token, uvSet, corners, reservedOutputBytes), token).ConfigureAwait(false);
+            if (created is null)
+                using (AssetLoadDiagnostics.Measure("ExportRasterize", key))
+                    created = await Task.Run(() => MaterialSurfaceMapBaker.Bake(material, primitive, textures, width, height,
+                        budget.Reserve, token, uvSet, corners, reservedOutputBytes), token).ConfigureAwait(false);
         }
         await using var heldLease = lease;
         AssetLoadDiagnostics.Cache("BakeCache", key, hit);
