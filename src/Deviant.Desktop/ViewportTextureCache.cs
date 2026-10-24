@@ -21,10 +21,11 @@ internal readonly record struct TextureContentKey(SourceRevision Revision, strin
             throw new InvalidDataException("The texture belongs to another source.");
         var info = document.Info;
         selection ??= document.DefaultSelection;
-        if (info.IsCubeMap || info.CubeFaces.Count != 0 || info.ArrayLayerCount != 1 || info.MipCount != 1 || info.IsHdr ||
+        bool hdrFormat = info.Format is TextureStorageFormat.Bc6Unsigned or TextureStorageFormat.Bc6Signed;
+        if (info.IsCubeMap || info.CubeFaces.Count != 0 || info.ArrayLayerCount != 1 || info.MipCount != 1 || info.IsHdr != hdrFormat ||
             info.TrailingLength != 0 || document.Subresources.Count != 1 ||
             document.OriginalBytes.Length != checked(info.HeaderLength + info.EncodedLength) ||
-            info.Format is not (TextureStorageFormat.Bc1 or TextureStorageFormat.Bc3 or TextureStorageFormat.Bc4 or TextureStorageFormat.Bc5 or TextureStorageFormat.Luminance8) ||
+            info.Format is not (TextureStorageFormat.Bc1 or TextureStorageFormat.Bc3 or TextureStorageFormat.Bc4 or TextureStorageFormat.Bc5 or TextureStorageFormat.Luminance8 or TextureStorageFormat.Bc6Unsigned or TextureStorageFormat.Bc6Signed) ||
             info.Format == TextureStorageFormat.Luminance8 && info.FormatName != "R8_UNORM" ||
             selection != new TextureSubresourceSelection())
             throw new InvalidDataException("The encoded texture layout is unavailable.");
@@ -45,11 +46,12 @@ internal readonly record struct TextureContentKey(SourceRevision Revision, strin
         ValidateEncoded2D(document, revision, surface.EncodedDdsSelection);
         if (surface.Revision != revision || surface.Width != document.Info.Width || surface.Height != document.Info.Height ||
             surface.IsSrgb != document.Info.IsSrgb || surface.SourceFormat != document.Info.Format ||
-            surface.DisplayTransform is not null || surface.IsHdr || surface.SourceIsHdr || texture.RgbaSha256.Length != 64 ||
+            surface.DisplayTransform is not null || surface.IsHdr != document.Info.IsHdr || surface.SourceIsHdr != document.Info.IsHdr || texture.RgbaSha256.Length != 64 ||
             !texture.RgbaSha256.All(Uri.IsHexDigit))
             throw new InvalidDataException("The encoded texture surface is invalid.");
         if (srgb && document.Info.Format is TextureStorageFormat.Bc4 or TextureStorageFormat.Bc5 or TextureStorageFormat.Luminance8)
             throw new InvalidDataException("The scalar texture requires linear sampling.");
+        if (srgb && document.Info.IsHdr) throw new InvalidDataException("HDR textures require linear sampling.");
         return new(revision, document.ContentSha256.ToUpperInvariant(), surface.Width, surface.Height, srgb)
         { EncodedFormat = document.Info.Format, MipCount = document.Info.MipCount };
     }

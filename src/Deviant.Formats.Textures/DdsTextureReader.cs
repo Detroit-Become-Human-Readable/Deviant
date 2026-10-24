@@ -99,7 +99,8 @@ public sealed class DdsTextureReader
         var flags = ReadUInt32(data, 8);
         if ((flags & DdsRequiredHeaderFlags) != DdsRequiredHeaderFlags)
             throw Error("InvalidHeaderFlags", "The DDS omits one or more required header flags.");
-        if ((flags & DdsdDepth) != 0 || ReadUInt32(data, 24) != 0)
+        // dwDepth is unused for flat textures unless DDSD_DEPTH is set.
+        if ((flags & DdsdDepth) != 0)
             throw Error("UnsupportedResourceShape", "Volume and depth textures are not supported by this reader.");
         var caps2 = ReadUInt32(data, 112);
         if ((caps2 & DdsCaps2Volume) != 0)

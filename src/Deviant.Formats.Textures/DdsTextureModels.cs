@@ -93,11 +93,15 @@ public sealed partial class TextureSurface
     {
         ArgumentNullException.ThrowIfNull(document); ArgumentNullException.ThrowIfNull(selection);
         token.ThrowIfCancellationRequested();
-        if (document.Info.IsHdr || document.Info.TrailingLength != 0) return false;
+        if (document.Info.TrailingLength != 0) return false;
         var extent = document.Subresources.SingleOrDefault(item => item.Selection == selection);
         if (extent is null || extent.SourceOffset < 0 || extent.SourceOffset > document.OriginalBytes.Length - extent.EncodedLength)
             return false;
         var encoding = document.Encoding;
+        if (document.Info.IsHdr)
+            return !document.Info.IsSrgb && (document.Info.Format == TextureStorageFormat.Bc6Unsigned &&
+                encoding.Compression == CompressionFormat.Bc6U || document.Info.Format == TextureStorageFormat.Bc6Signed &&
+                encoding.Compression == CompressionFormat.Bc6S);
         if (document.Info.Format == TextureStorageFormat.Luminance8)
             return !document.Info.IsSrgb && encoding.Compression is null && !encoding.Luminance && !encoding.AlphaOnly &&
                 encoding.BytesPerPixel == 1 && encoding.RedMask == 0xff && encoding.GreenMask == 0 &&
@@ -126,14 +130,14 @@ public sealed partial class TextureSurface
         var extent = encodedDds.Subresources.SingleOrDefault(item => item.Selection == selection);
         if (width is < 1 or > DdsTextureReader.MaximumDimension || height is < 1 or > DdsTextureReader.MaximumDimension ||
             (long)width * height > DdsTextureReader.MaximumPixelCount || extent is null || extent.Width != width || extent.Height != height ||
-            sourceIsHdr || isSrgb != encodedDds.Info.IsSrgb || sourceFormat != encodedDds.Info.Format || mipIndex < 0 ||
+            sourceIsHdr != encodedDds.Info.IsHdr || isSrgb != encodedDds.Info.IsSrgb || sourceFormat != encodedDds.Info.Format || mipIndex < 0 ||
             subresource.MipIndex != mipIndex || subresource.ArrayLayer != selection.ArrayLayer || subresource.Face != selection.Face ||
             sourcePayloadSha256 is not { Length: 64 } || !sourcePayloadSha256.All(Uri.IsHexDigit) ||
             !CanRetainEncodedDds(encodedDds, selection) ||
             encodedDds.Revision is not null && encodedDds.Revision != revision ||
             encodedDds.ContentSha256 != Convert.ToHexString(SHA256.HashData(encodedDds.OriginalBytes.Span)).ToLowerInvariant())
             throw new TextureFormatException("InvalidPreparedSurface", "The prepared encoded texture surface is invalid.");
-        return new(width, height, ReadOnlyMemory<byte>.Empty, ReadOnlyMemory<HdrPixel>.Empty, false, false, isSrgb,
+        return new(width, height, ReadOnlyMemory<byte>.Empty, ReadOnlyMemory<HdrPixel>.Empty, sourceIsHdr, sourceIsHdr, isSrgb,
             mipIndex, sourceFormat, sourceFormatName, sourcePayloadSha256, subresource, identity, revision)
             { EncodedDds = encodedDds, EncodedDdsSelection = selection };
     }

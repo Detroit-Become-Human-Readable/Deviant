@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Runtime.InteropServices;
 using Deviant.Assets;
 using Deviant.Formats.Textures;
 
@@ -80,6 +81,25 @@ public sealed partial class NativeModelSession
         {
             using var pixelDecodeTiming = AssetLoadDiagnostics.Measure("TexturePixelDecode", source.Metadata.Identity.Key);
             var pixels = await pixelDecoder.DecodeSubresourceAsync(document, selection, token).ConfigureAwait(false);
+            if (pixels.IsHdr && !document.Info.IsCubeMap && document.Info.ArrayLayerCount == 1 && document.Info.MipCount == 1 &&
+                pixels.HdrPixels.Length == checked(pixels.Width * pixels.Height) && TextureSurface.CanRetainEncodedDds(document, selection, token))
+            {
+                foreach (var pixel in pixels.HdrPixels.Span)
+                    if (!float.IsFinite(pixel.R) || !float.IsFinite(pixel.G) || !float.IsFinite(pixel.B))
+                        throw new TextureFormatException("MaterialSurfaceFormat", "The HDR texture contains invalid pixel values.");
+                var digest = Convert.ToHexString(SHA256.HashData(MemoryMarshal.AsBytes(pixels.HdrPixels.Span))).ToLowerInvariant();
+                pixelDecodeTiming?.Dispose();
+                encodedMemory = MemoryBudget.Reserve(document.OriginalBytes.Length + 4096L, "HDR texture encoded surfaces");
+                container.EnsureUnchanged();
+                using (MemoryBudget.Reserve(NativeTextureSession.MaximumResourceBytes, "texture validation"))
+                    await textures.RevalidateAsync(source, token).ConfigureAwait(false);
+                container.EnsureUnchanged(); token.ThrowIfCancellationRequested();
+                var result = new SharedSurfacePixels(pixels.Width, pixels.Height, ReadOnlyMemory<byte>.Empty,
+                    true, false, decoded.SupportedMips.First().MipIndex, pixels.SourceFormat, pixels.SourceFormatName,
+                    pixels.SourcePayloadSha256, pixels.Subresource with { MipIndex = decoded.SupportedMips.First().MipIndex },
+                    null, false, digest, encodedMemory, encodedDds: document, encodedSelection: selection);
+                encodedMemory = null; return result;
+            }
             if (pixels.IsHdr || pixels.Rgba8.Length != checked(pixels.Width * pixels.Height * 4))
                 throw new TextureFormatException("MaterialSurfaceFormat", "The material texture surface is unavailable.");
             if (resize)

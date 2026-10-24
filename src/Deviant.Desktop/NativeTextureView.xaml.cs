@@ -33,8 +33,7 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
         InitializeComponent(); ImageHost.Content = images;
         ((FrameworkElement)images.FindName("ImageName")).Visibility = Visibility.Collapsed;
         images.ActivityChanged += Images_ActivityChanged;
-        images.SurfaceChanged += (_, _) => ExportPng.IsEnabled = source is not null &&
-            images.CurrentDisplaySurface is not null && export.IsCompleted;
+        images.SurfaceChanged += (_, _) => UpdateExportButtons();
     }
 
     private void Images_ActivityChanged(object? sender, EventArgs e) => UpdateImageActivity();
@@ -56,7 +55,7 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
         selection.Cancel(); selection.Dispose(); selection = new();
         var previousPin = sourcePin; sourcePin = null;
         using var own = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token, selection.Token);
-        source = null; session = null; ExportPng.IsEnabled = FullResolution.IsEnabled = false; FullResolution.Visibility = Visibility.Collapsed; Status.Text = "";
+        source = null; session = null; ExportDds.IsEnabled = ExportPng.IsEnabled = FullResolution.IsEnabled = false; FullResolution.Visibility = Visibility.Collapsed; Status.Text = "";
         IDisposable? pendingPin = null;
         try
         {
@@ -80,7 +79,7 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
         }
         if (version != generation) return;
         ((TextBlock)images.FindName("Metadata")).Text = $"{document.Info.Width:N0} × {document.Info.Height:N0} · {document.Info.Format} · {document.Info.MipCount}/{native.Metadata.MipSizeCount} mips";
-        source = native; session = owner; sourcePin = pendingPin; pendingPin = null; ExportPng.IsEnabled = true;
+        source = native; session = owner; sourcePin = pendingPin; pendingPin = null; UpdateExportButtons();
         FullResolution.Visibility = native.Metadata.Mip0Width > document.Info.Width || native.Metadata.Mip0Height > document.Info.Height
             ? Visibility.Visible : Visibility.Collapsed;
         FullResolution.IsEnabled = true;
@@ -169,10 +168,51 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
         return task;
     }
 
+    private bool HasFullDocument(NativeTextureSource native) => images.CurrentDocument is { } document &&
+        document.Info.Width == native.Metadata.Mip0Width && document.Info.Height == native.Metadata.Mip0Height &&
+        document.Info.MipCount == native.Metadata.MipSizeCount;
+
+    private void UpdateExportButtons()
+    {
+        ExportDds.IsEnabled = source is not null && images.CurrentDocument is not null &&
+            images.CurrentSurface is not null && export.IsCompleted;
+        ExportPng.IsEnabled = source is not null && images.CurrentDisplaySurface is not null && export.IsCompleted;
+    }
+
+    public Task<TextureExportResult> ExportDdsToAsync(string destination, bool overwrite = false,
+        CancellationToken token = default)
+    {
+        if (!export.IsCompleted) throw new InvalidOperationException("An export is already running.");
+        var task = TrackActivity("Exporting DDS", 20, ExportDdsCoreAsync(destination, overwrite, token));
+        export = task; return task;
+    }
+
+    private async Task<TextureExportResult> ExportDdsCoreAsync(string destination, bool overwrite, CancellationToken token)
+    {
+        if (source is { } selected && !HasFullDocument(selected)) await LoadFullResolutionAsync(token);
+        var native = source ?? throw new InvalidOperationException("Select a texture first.");
+        var owner = session ?? throw new InvalidOperationException("Open textures first.");
+        var version = generation;
+        using var own = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token, selection.Token);
+        await images.WaitForRenderAsync(own.Token);
+        var document = images.CurrentDocument ?? throw new InvalidOperationException("The texture document is unavailable.");
+        var surface = images.CurrentSurface ?? throw new InvalidOperationException("The texture pixels are unavailable.");
+        var full = Path.GetFullPath(destination);
+        using var pins = owner.PinSource(native);
+        return await new TextureExportService().ExportAsync(document, surface, AssetExportFormat.Dds,
+            owner.Snapshot.SourceRoot, Path.GetDirectoryName(full)!, Path.GetFileName(full), overwrite, own.Token,
+            native.Revision, async cancellation =>
+            {
+                await owner.RevalidateAsync(native, cancellation);
+                if (ValidateNamingAsync is { } validateNaming) await validateNaming(native, cancellation);
+                if (version != generation || source != native) throw new OperationCanceledException(cancellation);
+            });
+    }
+
     private async Task<NativeTexturePngExportResult> ExportPngCoreAsync(string destination, bool overwrite,
         CancellationToken token)
     {
-        if (source is { PreviewDimension: not null }) await LoadFullResolutionAsync(token);
+        if (source is { } selected && !HasFullDocument(selected)) await LoadFullResolutionAsync(token);
         var native = source ?? throw new InvalidOperationException("Select a texture first.");
         var owner = session ?? throw new InvalidOperationException("Open textures first.");
         var version = generation;
@@ -214,7 +254,7 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
                 SupportedMipIndices = Enumerable.Range(0, document.Info.MipCount), TotalNativeMipCount = native.Metadata.MipSizeCount,
                 OmittedMipIndices = Enumerable.Range(document.Info.MipCount, Math.Max(0, native.Metadata.MipSizeCount - document.Info.MipCount)),
                 SelectedSubresource = surface.Subresource, surface.Width, surface.Height,
-                PixelFormat = document.Info.FormatName, NativeColorSpace = native.Metadata.RawFixedPrefix84[14] == 1 ? "sRGB" : "UNORM",
+                PixelFormat = document.Info.FormatName, NativeColorSpace = NativeTextureDecoder.IsSrgb(native) ? "sRGB" : "Linear",
                 PngSrgbEncoded = surface.IsSrgb, AlphaHandling = "RGBA bytes retained; no premultiplication transform",
                 surface.DisplayTransform, Output = new { FileName = result.RelativePath, result.Length, result.Sha256 }
             };
@@ -247,7 +287,21 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
         try { var result = await ExportPngToAsync(dialog.FileName, true); if (version == generation) Status.Text = result.ReportError is null ? "Exported" : "PNG exported · report unavailable"; }
         catch (OperationCanceledException) { if (version == generation) Status.Text = "Cancelled"; }
         catch (Exception error) { if (version == generation) Status.Text = error.Message; }
-        finally { if (version == generation) ExportPng.IsEnabled = source is not null; }
+        finally { UpdateExportButtons(); }
+    }
+
+    private async void ExportDds_Click(object sender, RoutedEventArgs e)
+    {
+        if (source is not { } native) return;
+        var dialog = new SaveFileDialog { Title = "Export DDS", Filter = "DDS image (*.dds)|*.dds",
+            FileName = (ExportStemProvider?.Invoke(native) ?? $"Texture-{GetSelectedResourceId(native):X8}-{native.SelectedIdentity.Ordinal}") + ".dds",
+            OverwritePrompt = true };
+        if (dialog.ShowDialog(Window.GetWindow(this)) != true) return;
+        ExportDds.IsEnabled = ExportPng.IsEnabled = false;
+        try { await ExportDdsToAsync(dialog.FileName, true); if (source?.Metadata.Identity == native.Metadata.Identity) Status.Text = "Exported"; }
+        catch (OperationCanceledException) { if (source?.Metadata.Identity == native.Metadata.Identity) Status.Text = "Cancelled"; }
+        catch (Exception error) { if (source?.Metadata.Identity == native.Metadata.Identity) Status.Text = error.Message; }
+        finally { UpdateExportButtons(); }
     }
 
     private uint GetSelectedResourceId(NativeTextureSource native)
@@ -256,7 +310,7 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
     public async Task ClearAsync()
     {
         CancelActivity();
-        ++generation; source = null; session = null; ExportPng.IsEnabled = FullResolution.IsEnabled = false; FullResolution.Visibility = Visibility.Collapsed; Status.Text = "";
+        ++generation; source = null; session = null; ExportDds.IsEnabled = ExportPng.IsEnabled = FullResolution.IsEnabled = false; FullResolution.Visibility = Visibility.Collapsed; Status.Text = "";
         await images.ClearAsync();
         sourcePin?.Dispose(); sourcePin = null;
         try { await export; } catch { }

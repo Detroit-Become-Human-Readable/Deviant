@@ -95,7 +95,7 @@ public static class PreparedSceneCodec
                     ? await texture.Surface.AcquireRgba8Async(token).ConfigureAwait(false) : null;
                 var surface = hydrated?.Surface ?? texture.Surface;
                 var bytes = surface.EncodedDds?.OriginalBytes ?? surface.Rgba8;
-                if (surface.IsHdr || !IsDigest(row.RgbaSha256) || Hash(bytes.Span) != row.BlobSha256 ||
+                if (surface.IsHdr && row.EncodingKind != TextureEncodingKind.Dds || !IsDigest(row.RgbaSha256) || Hash(bytes.Span) != row.BlobSha256 ||
                     row.EncodingKind is TextureEncodingKind.Rgba8 or TextureEncodingKind.BackedRgba8 && (!surface.HasRgba8 || row.BlobSha256 != row.RgbaSha256) ||
                     row.EncodingKind == TextureEncodingKind.Dds && (surface.HasRgba8 || surface.EncodedDdsSelection is null ||
                         !TextureSurface.CanRetainEncodedDds(surface.EncodedDds!, surface.EncodedDdsSelection, token)))
@@ -431,7 +431,8 @@ public static class PreparedSceneCodec
             Subresource is not null && Subresource.MipIndex == Mip && Enum.IsDefined(Format) && !string.IsNullOrWhiteSpace(FormatName) &&
             Enum.IsDefined(EncodingKind) && (EncodingKind is TextureEncodingKind.Rgba8 or TextureEncodingKind.BackedRgba8
                 ? BlobSha256 == RgbaSha256 && EncodedSelection is null
-                : EncodedSelection is not null && DisplayTransform is null && !SourceIsHdr && !Resized);
+                : EncodedSelection is not null && DisplayTransform is null && !Resized &&
+                    (!SourceIsHdr || !IsSrgb && Format is TextureStorageFormat.Bc6Unsigned or TextureStorageFormat.Bc6Signed));
         public static TextureEncodingKind Encoding(TextureSurface surface) => surface.PixelSource is not null
             ? TextureEncodingKind.BackedRgba8 : surface.EncodedDds is null ? TextureEncodingKind.Rgba8 : TextureEncodingKind.Dds;
         public TextureSurface RestoreBacking(ITexturePixelSource pixels) => TextureSurface.RestoreBackedRgba8(Width, Height,
