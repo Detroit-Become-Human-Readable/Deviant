@@ -456,7 +456,7 @@ public sealed partial class FeatureStore
                 while (reader.Read())
                 {
                     token.ThrowIfCancellationRequested(); string thin = reader.GetString(3);
-                    if (thin.Length > MaximumTextureNameProofBytes) throw new InvalidDataException("TextureRoleProjectionInvalid");
+                    if (thin.Length > MaximumTextureEvidenceBytes) throw new InvalidDataException("TextureRoleProjectionInvalid");
                     batch.Add((reader.GetInt64(0), reader.GetString(1), reader.GetInt64(2), thin));
                 }
             }
@@ -700,8 +700,11 @@ public sealed partial class FeatureStore
     {
         try
         {
-            if (thinJson.Length > MaximumTextureNameProofBytes) return false;
+            if (thinJson.Length > MaximumTextureEvidenceBytes) return false;
             var thin = JsonSerializer.Deserialize<TextureDiscoveryEntry>(thinJson);
+            if (thin is not null && payload.AsSpan().StartsWith(TextureNameProofHeader))
+                return thin.Identity.Key == identity && thin.Label == label && (int)thin.NameKind == nameKind &&
+                    thin.SearchText == search && ValidCompactTextureNameProof(payload, thin, validEvidence);
             var proof = JsonSerializer.Deserialize<TextureNameProof>(payload);
             if (thin is null || proof is null || proof.Sources.Count > 128 || thin.Identity.Key != identity || thin.Label != label ||
                 (int)thin.NameKind != nameKind || thin.SearchText != search) return false;

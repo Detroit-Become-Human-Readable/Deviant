@@ -41,10 +41,7 @@ public sealed partial class FeatureStore
             .Concat(entry.Owners.Concat(entry.Related).SelectMany(link => link.Evidence))
             .DistinctBy(evidence => (evidence.Source, evidence.Revision, evidence.Reader, evidence.ReaderVersion,
                 evidence.SourceSha256, evidence.PhysicalExtent)).ToArray();
-        if (sources.Length > 128) throw new InvalidDataException("TextureProjectionNameProofLimit");
-        byte[] proof = JsonSerializer.SerializeToUtf8Bytes(new TextureNameProof(thin with { Alias = null }, sources));
-        if (proof.Length > MaximumTextureNameProofBytes) throw new InvalidDataException("TextureProjectionNameProofLimit");
-        return proof;
+        return EncodeCompactTextureNameProof(thin, sources);
     }
 
     private bool TextureOwnerPublicationUnchanged(string profile, TextureProjectionOwnerCheckpoint checkpoint,
