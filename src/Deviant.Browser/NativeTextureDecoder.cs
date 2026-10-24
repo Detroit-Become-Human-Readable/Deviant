@@ -289,7 +289,7 @@ public sealed partial class NativeTextureDecoder
     }
 
     private static bool IsSupportedConversion(TextureFileTextV24Document metadata) =>
-        (metadata.FirstByte, metadata.PostSelectorByte1) is (5, 7) or (5, 17) or (5, 19) or (7, 1) or (7, 12) or (11, 15) or (18, 21) or (19, 23);
+        (metadata.FirstByte, metadata.PostSelectorByte1) is (5, 7) or (5, 17) or (5, 19) or (7, 1) or (7, 12) or (11, 15) or (18, 21) or (19, 22) or (19, 23);
 
     private sealed record ConvertedMip(int Index, TextureFileTextV24LodDescriptor Descriptor,
         TextureFileTextV24ResourceReference Reference);

@@ -13,7 +13,7 @@ public sealed record ConvertedTextureDocument(ReadOnlyMemory<byte> Rgba8, Conver
 /// <summary>Decodes supported version-16 coefficient packets into texture samples.</summary>
 public sealed class ConvertedTextureDecoder
 {
-    public const string Version = "converted-texture-v16-5";
+    public const string Version = "converted-texture-v16-6";
     private const int HeaderLength = 52;
     private const int DescriptorLength = 16;
     private const int MaximumChunkCount = 4096;
@@ -33,8 +33,8 @@ public sealed class ConvertedTextureDecoder
         var pixelBytes = checked((long)width * height * 4);
         if (pixelBytes > maximumDecodedBytes || pixelBytes > int.MaxValue)
             throw Error("ConvertedTextureBudget", "Texture data exceeds the decode budget.");
-        var tileEdge = selector is 15 or 17 or 19 or 21 or 23 ? 8 : 16;
-        var normalizedTileBytes = selector is 1 or 15 ? 256 : selector == 7 ? 128 : selector == 23 ? 64 : 32;
+        var tileEdge = selector is 15 or 17 or 19 or 21 or 22 or 23 ? 8 : 16;
+        var normalizedTileBytes = selector is 1 or 15 ? 256 : selector == 7 ? 128 : selector is 22 or 23 ? 64 : 32;
         var expectedTiles = checked((long)width * height / (tileEdge * tileEdge));
         long totalTiles = 0, totalNormalized = 0;
         var end = header.HeaderBytes;
@@ -63,7 +63,7 @@ public sealed class ConvertedTextureDecoder
         Span<short> coefficients = stackalloc short[64]; Span<short> planes = stackalloc short[640];
         Span<byte> tile = stackalloc byte[1024]; Span<byte> scalarSamples = stackalloc byte[64]; Span<int> predictors = stackalloc int[4];
         ConvertedTextureMath.Quantization(header.Quality, lumaQuant, chromaQuant);
-        var planeCount = selector is 17 or 23 ? 2 : selector == 19 ? 3 : selector is 15 or 21 ? 1 : selector == 1 ? 10 : 6;
+        var planeCount = selector is 17 or 22 or 23 ? 2 : selector == 19 ? 3 : selector is 15 or 21 ? 1 : selector == 1 ? 10 : 6;
         var tileIndex = 0;
         for (var chunk = 0; chunk < header.ChunkCount; chunk++)
         {
@@ -76,22 +76,22 @@ public sealed class ConvertedTextureDecoder
                 if ((block & 15) == 0) token.ThrowIfCancellationRequested();
                 for (var plane = 0; plane < planeCount; plane++)
                 {
-                    var component = selector is 17 or 19 or 23 ? plane : plane < 4 ? 0 : plane == 4 ? 1 : plane == 5 ? 2 : 3;
-                    var chroma = selector is not (17 or 19 or 23) && (component is 1 or 2);
+                    var component = selector is 17 or 19 or 22 or 23 ? plane : plane < 4 ? 0 : plane == 4 ? 1 : plane == 5 ? 2 : 3;
+                    var chroma = selector is not (17 or 19 or 22 or 23) && (component is 1 or 2);
                     ReadCoefficients(ref bits, chroma ? DcChroma : DcLuma, chroma ? AcChroma : AcLuma,
                         ref predictors[component], coefficients);
                     if (selector == 15) ConvertedTextureMath.InverseDctScalar(coefficients, lumaQuant, scalarSamples);
                     else ConvertedTextureMath.InverseDct(coefficients, chroma ? chromaQuant : lumaQuant,
                         planes.Slice(plane * 64, 64));
                 }
-                if (selector is 17 or 19 or 23)
+                if (selector is 17 or 19 or 22 or 23)
                 {
                     for (var pixel = 0; pixel < 64; pixel++)
                     {
                         tile[pixel * 4] = ConvertedTextureMath.Clamp(planes[pixel]);
                         tile[pixel * 4 + 1] = ConvertedTextureMath.Clamp(planes[64 + pixel]);
                         tile[pixel * 4 + 2] = selector == 19 ? ConvertedTextureMath.Clamp(planes[128 + pixel]) : (byte)0;
-                        tile[pixel * 4 + 3] = selector == 23 ? (byte)255 : (byte)0;
+                        tile[pixel * 4 + 3] = selector is 22 or 23 ? (byte)255 : (byte)0;
                     }
                 }
                 else if (selector is 15 or 21)
@@ -125,8 +125,8 @@ public sealed class ConvertedTextureDecoder
 
     private static Header ReadHeader(ReadOnlySpan<byte> body, ushort selector, int width, int height)
     {
-        var tileEdge = selector is 15 or 17 or 19 or 21 or 23 ? 8 : 16;
-        if (selector is not (1 or 7 or 15 or 17 or 19 or 21 or 23) || body.Length < HeaderLength ||
+        var tileEdge = selector is 15 or 17 or 19 or 21 or 22 or 23 ? 8 : 16;
+        if (selector is not (1 or 7 or 15 or 17 or 19 or 21 or 22 or 23) || body.Length < HeaderLength ||
             body.Length > TextureBufferPatternInspector.MaximumStoredBytes ||
             BinaryPrimitives.ReadUInt16LittleEndian(body) != 16 ||
             BinaryPrimitives.ReadUInt16LittleEndian(body[2..]) != selector ||
