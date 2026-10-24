@@ -40,11 +40,13 @@ public sealed partial class NativeModelSession
     private async Task<SharedSurfacePixels> DecodeSharedSurfaceAsync(NativeTextureSource source,
         NativeContainerLease container, int maximumPreviewDimension, CancellationToken token)
     {
+        using var preparationTiming = AssetLoadDiagnostics.Measure("TextureSurfacePreparation", source.Metadata.Identity.Key);
         token.ThrowIfCancellationRequested();
         var preparationKey = surfaceDiskCache is null ? null : CreateSurfacePreparationKey(source, maximumPreviewDimension);
         if (surfaceDiskCache is not null)
         {
             var prepared = await PreparedTexturePixelSource.TryAcquireAsync(surfaceDiskCache, preparationKey!, MemoryBudget, token).ConfigureAwait(false);
+            AssetLoadDiagnostics.Cache("PreparedTextureSurfaceCache", preparationKey!, prepared is not null);
             if (prepared is not null)
             {
                 try
@@ -57,10 +59,12 @@ public sealed partial class NativeModelSession
                 catch { prepared.Dispose(); throw; }
             }
         }
+        using var nativeDecodeTiming = AssetLoadDiagnostics.Measure("TextureNativePreviewDecode", source.Metadata.Identity.Key);
         var nativeDecoder = CreateSourceLoadedTextureDecoder(source, maximumPreviewDimension, token);
         using var decodeScratch = MemoryBudget.Reserve(
             nativeDecoder.EstimatePreviewWorkingSetBytes(source, maximumPreviewDimension, token), "texture decoding");
         var decoded = nativeDecoder.ReadPreview(source, maximumPreviewDimension, token);
+        nativeDecodeTiming?.Dispose();
         var document = decoded.Document;
         decodeScratch.ReduceTo(document.OriginalBytes.Length);
         var pixelDecoder = new DdsTextureDecoder(MemoryBudget.MaximumBytes);
@@ -74,6 +78,7 @@ public sealed partial class NativeModelSession
         AssetMemoryBudget.Reservation? encodedMemory = null;
         try
         {
+            using var pixelDecodeTiming = AssetLoadDiagnostics.Measure("TexturePixelDecode", source.Metadata.Identity.Key);
             var pixels = await pixelDecoder.DecodeSubresourceAsync(document, selection, token).ConfigureAwait(false);
             if (pixels.IsHdr || pixels.Rgba8.Length != checked(pixels.Width * pixels.Height * 4))
                 throw new TextureFormatException("MaterialSurfaceFormat", "The material texture surface is unavailable.");
@@ -82,6 +87,7 @@ public sealed partial class NativeModelSession
                 token.ThrowIfCancellationRequested();
                 pixels = pixelDecoder.CreateThumbnail(pixels, maximumPreviewDimension);
             }
+            pixelDecodeTiming?.Dispose();
             var nativeMip = decoded.SupportedMips.First().MipIndex;
             var encoded = !resize && document.OriginalBytes.Length < pixels.Rgba8.Length &&
                 TextureSurface.CanRetainEncodedDds(document, selection, token) ? document : null;
@@ -181,9 +187,11 @@ internal sealed class NativeModelSurfaceCache<T> where T : class, IDisposable
         ArgumentNullException.ThrowIfNull(factory);
         token.ThrowIfCancellationRequested();
         Entry entry;
+        bool cacheHit;
         lock (gate)
         {
-            if (entries.TryGetValue(key, out entry!)) entry.References++;
+            cacheHit = entries.TryGetValue(key, out entry!);
+            if (cacheHit) entry.References++;
             else
             {
                 entry = new Entry(key) { References = 1 };
@@ -203,9 +211,9 @@ internal sealed class NativeModelSurfaceCache<T> where T : class, IDisposable
                 }
             }
         }
-
         try
         {
+            AssetLoadDiagnostics.Cache("TextureSurfaceCache", key, cacheHit);
             var value = await entry.Work.WaitAsync(token).ConfigureAwait(false);
             token.ThrowIfCancellationRequested();
             return new Lease(this, entry, value);

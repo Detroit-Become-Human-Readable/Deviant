@@ -392,18 +392,22 @@ public sealed partial class NativeModelSession
         CancellationToken token)
     {
         using var timing = AssetLoadDiagnostics.Measure("TextureReadDecode", identity.Key);
+        using var estimateTiming = AssetLoadDiagnostics.Measure("TextureSourceEstimate", identity.Key);
         var estimate = await textures.EstimateNativeSourceAsync(identity, catalog, container, maximumPreviewDimension, token).ConfigureAwait(false);
+        estimateTiming?.Dispose();
         var sourceMemory = MemoryBudget.Reserve(estimate.RetainedSourceBytes, "texture source");
         IDisposable? producerContainerLease = null;
         var producerOwnsSource = 0;
         try
         {
+            using var sourceTiming = AssetLoadDiagnostics.Measure("TextureSourcePreparation", identity.Key);
             var read = await textures.ReadForNativeAsync(identity, catalog, container, token,
                 maximumPreviewDimension: maximumPreviewDimension).ConfigureAwait(false);
             var source = read.Source ?? throw new TextureFormatException("MaterialTextureUnavailable",
                 read.Reason ?? "The material texture is unavailable.");
             sourceMemory.ReduceTo(source.RetainedSourceBytes);
             var key = CreateSurfacePreparationKey(source, maximumPreviewDimension);
+            sourceTiming?.Dispose();
             producerContainerLease = container.AcquireLease();
             Func<CancellationToken, Task<SharedSurfacePixels>> factory = sharedToken =>
             {
@@ -434,10 +438,12 @@ public sealed partial class NativeModelSession
             var sharedLease = await surfaceCache.AcquireAsync(key, factory, token).ConfigureAwait(false);
             try
             {
+                using var validationTiming = AssetLoadDiagnostics.Measure("TextureSurfaceValidation", identity.Key);
                 container.EnsureUnchanged();
                 using (MemoryBudget.Reserve(NativeTextureSession.MaximumResourceBytes, "texture validation"))
                     await textures.RevalidateAsync(source, token).ConfigureAwait(false);
                 container.EnsureUnchanged();
+                validationTiming?.Dispose();
                 extents.AddRange(source.Payloads.Select(payload => payload.Extent));
                 token.ThrowIfCancellationRequested();
                 var pixels = sharedLease.Value;
