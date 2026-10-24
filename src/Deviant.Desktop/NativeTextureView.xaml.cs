@@ -1,4 +1,4 @@
-﻿using System.IO;
+using System.IO;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
@@ -80,7 +80,7 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
         if (version != generation) return;
         ((TextBlock)images.FindName("Metadata")).Text = $"{document.Info.Width:N0} × {document.Info.Height:N0} · {document.Info.Format} · {document.Info.MipCount}/{native.Metadata.MipSizeCount} mips";
         source = native; session = owner; sourcePin = pendingPin; pendingPin = null; UpdateExportButtons();
-        FullResolution.Visibility = native.Metadata.Mip0Width > document.Info.Width || native.Metadata.Mip0Height > document.Info.Height
+        FullResolution.Visibility = native.Metadata.Mip0Width > document.Info.Width || native.Metadata.Mip0Height > document.Info.Height || document.Info.MipCount < native.Metadata.MipSizeCount
             ? Visibility.Visible : Visibility.Collapsed;
         FullResolution.IsEnabled = true;
         }
@@ -116,7 +116,9 @@ public partial class NativeTextureView : UserControl, IAsyncDisposable
                 result.Reason ?? "The full-resolution texture source is unavailable.");
             acquired = fullSource.CompanionLease;
         }
-        var document = await Task.Run(() => new NativeTextureDecoder(128L * 1024 * 1024).Read(fullSource, own.Token), own.Token);
+        var decoder = new NativeTextureDecoder(128L * 1024 * 1024);
+        using var documentScratch = owner.MemoryBudget.Reserve(decoder.EstimateWorkingSetBytes(fullSource), "full-resolution texture document");
+        var document = await Task.Run(() => decoder.Read(fullSource, own.Token), own.Token);
         await owner.RevalidateAsync(fullSource, own.Token);
         own.Token.ThrowIfCancellationRequested();
         if (version != generation || native != source) throw new OperationCanceledException(own.Token);

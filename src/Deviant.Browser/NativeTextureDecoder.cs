@@ -17,7 +17,7 @@ public sealed record NativeTextureDecodedDocument(DdsTextureDocument Document,
 /// <summary>Builds texture documents from supported SEGS mip layouts.</summary>
 public sealed partial class NativeTextureDecoder
 {
-    public const string Version = "native-texture-v13/" + ConvertedTextureDecoder.Version;
+    public const string Version = "native-texture-v14/" + ConvertedTextureDecoder.Version;
     public const long DefaultMaximumDecodedBytes = 32L * 1024 * 1024;
     private readonly long maximumDecodedBytes;
     public NativeTextureDecoder(long maximumDecodedBytes = DefaultMaximumDecodedBytes)
@@ -42,6 +42,12 @@ public sealed partial class NativeTextureDecoder
         long decodedBytes;
         if (metadata.PostSelectorBoolean)
         {
+            if (source.PreviewDimension is null && maximumPreviewDimension == int.MaxValue)
+            {
+                long total = ConvertedChainOutputBytes(source);
+                if (total > maximumDecodedBytes) throw Error("NativeTextureDecodeBudget", "Mip data exceeds the decode budget.");
+                return checked(6 * total + 1024 * 1024);
+            }
             var selected = SelectConvertedMip(source, maximumPreviewDimension);
             decodedBytes = metadata.PostSelectorByte1 == 12
                 ? MipByteLength(metadata.FirstByte, selected.Descriptor.Width, selected.Descriptor.Height)
@@ -66,7 +72,7 @@ public sealed partial class NativeTextureDecoder
         if (source.PreviewDimension is { } previewDimension)
             return ReadPreview(source, previewDimension, token);
         var metadata = ValidateMetadata(source, token);
-        if (metadata.PostSelectorBoolean) return ReadConverted(source, maximumPreviewDimension, token);
+        if (metadata.PostSelectorBoolean) return maximumPreviewDimension == int.MaxValue ? ReadConvertedChain(source, token) : ReadConverted(source, maximumPreviewDimension, token);
         if (metadata.SizeGroupSelector == 2) return ReadCubemap(source, metadata, token);
 
         var mips = new SortedDictionary<int, (byte[] Bytes, NativeTextureMipSource Evidence)>();
