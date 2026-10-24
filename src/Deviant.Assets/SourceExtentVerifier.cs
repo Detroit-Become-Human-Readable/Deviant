@@ -32,10 +32,7 @@ public sealed class SourceExtentVerifier
                 var packages = snapshot.Volumes.Where(volume => names.Contains(volume.RelativeName))
                     .Select(volume => volume.Package).Distinct().ToArray();
                 await shared.Session.VerifyAsync(consumed, token, maximumBytes, maximumExtentCount).ConfigureAwait(false);
-                return new SourceExtentVerificationLease(() =>
-                {
-                    foreach (var package in packages) shared.Session.EnsureCurrent(package);
-                }, shared);
+                return new SourceExtentVerificationLease(shared, packages);
             }
             catch { shared.Dispose(); throw; }
         }
@@ -100,21 +97,46 @@ public sealed class SourceExtentVerificationLease : IDisposable, IAsyncDisposabl
 {
     private readonly IReadOnlyList<(string Path, FileStamp Stamp, SafeFileHandle Handle)> pins;
     private readonly ISourceRevisionProvider provider;
-    private readonly Action? checkShared;
-    private readonly IDisposable? sharedOwner;
+    private readonly ArchiveSourceSession.Lease? sharedOwner;
+    private readonly IReadOnlyList<uint> packages = [];
     private int disposed;
 
     internal SourceExtentVerificationLease(IReadOnlyList<(string Path, FileStamp Stamp, SafeFileHandle Handle)> pins,
         ISourceRevisionProvider provider) { this.pins = pins; this.provider = provider; }
 
-    internal SourceExtentVerificationLease(Action checkShared, IDisposable sharedOwner)
-    { pins = []; provider = new FileRevisionProvider(); this.checkShared = checkShared; this.sharedOwner = sharedOwner; }
+    internal SourceExtentVerificationLease(ArchiveSourceSession.Lease sharedOwner, IReadOnlyList<uint> packages)
+    { pins = []; provider = new FileRevisionProvider(); this.sharedOwner = sharedOwner; this.packages = packages; }
 
     public void EnsureUnchanged()
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
-        checkShared?.Invoke();
+        sharedOwner?.Session.EnsurePackagesCurrent(packages);
         foreach (var pin in pins) SourceIdentity.EnsureUnchanged(provider, pin.Handle, pin.Path, pin.Stamp);
+    }
+
+    /// <summary>Checks retained receipts together, visiting each shared archive source once.</summary>
+    public void EnsureUnchangedWith(IReadOnlyList<SourceExtentVerificationLease> additional)
+    {
+        ArgumentNullException.ThrowIfNull(additional);
+        if (additional.Count == 0) { EnsureUnchanged(); return; }
+        var sessions = new Dictionary<ArchiveSourceSession, HashSet<uint>>();
+        Collect(this);
+        foreach (var lease in additional) Collect(lease);
+        foreach (var pair in sessions) pair.Key.EnsurePackagesCurrent(pair.Value);
+
+        void Collect(SourceExtentVerificationLease lease)
+        {
+            ArgumentNullException.ThrowIfNull(lease);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref lease.disposed) != 0, lease);
+            if (lease.sharedOwner is { } owner)
+            {
+                if (!sessions.TryGetValue(owner.Session, out var consumed))
+                    sessions.Add(owner.Session, consumed = []);
+                consumed.UnionWith(lease.packages);
+            }
+            else foreach (var pin in lease.pins)
+                SourceIdentity.EnsureUnchanged(lease.provider, pin.Handle, pin.Path, pin.Stamp);
+        }
     }
 
     public void Dispose()

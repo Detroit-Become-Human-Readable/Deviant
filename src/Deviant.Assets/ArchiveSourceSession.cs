@@ -296,6 +296,20 @@ public sealed class ArchiveSourceSession : IDisposable
         }
     }
 
+    internal void EnsurePackagesCurrent(IEnumerable<uint> packages)
+    {
+        lock (gate)
+        {
+            ThrowIfDisposed();
+            if (index is { } held) SourceIdentity.EnsureUnchanged(revisions, held.Handle, held.Path, held.Stamp);
+            foreach (var package in packages.Distinct())
+            {
+                var pin = GetVolume(package);
+                SourceIdentity.EnsureUnchanged(revisions, pin.Handle, pin.Path, pin.Stamp);
+            }
+        }
+    }
+
     private Pin GetIndex()
     {
         lock (gate)

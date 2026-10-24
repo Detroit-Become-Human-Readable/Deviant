@@ -305,8 +305,7 @@ public sealed class NativeContainerLease : IDisposable
         lock (sync)
         {
             ObjectDisposedException.ThrowIf(resources is null, this);
-            verification.EnsureUnchanged();
-            foreach (var additional in additionalVerifications) additional.EnsureUnchanged();
+            verification.EnsureUnchangedWith(additionalVerifications);
         }
     }
 
