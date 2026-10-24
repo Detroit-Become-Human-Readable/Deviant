@@ -22,6 +22,7 @@ public partial class AssetModelView : UserControl, IAsyncDisposable
     public AssetModelView()
     {
         InitializeComponent();
+        ModelViewport.UseSelectionTint = false;
         ModelViewport.RenderFailed += (_, error) =>
         {
             ModelStatus.Text = "Unable to render model"; ModelDetails.Text = error.ToString();

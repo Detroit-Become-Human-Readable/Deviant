@@ -88,6 +88,7 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
     public event EventHandler<string?>? SelectionChanged;
     public event EventHandler<IReadOnlyList<RenderMeshSelection>>? MeshSelectionChanged;
     public IReadOnlyList<RenderMeshSelection> SelectedMeshes => meshSelections.ToArray();
+    internal bool UseSelectionTint { get; set; } = true;
     public event EventHandler<RenderLoadProgress>? LoadProgressChanged;
     public event EventHandler<Exception>? RenderFailed;
     public Exception? LastRenderException => renderException;
@@ -419,8 +420,8 @@ public partial class AssetViewport : UserControl, IAsyncDisposable
         primitiveKey is not null && meshSelections.Contains(new(key, primitiveKey));
     private InstanceParameter InstanceAppearance(string key, string? primitiveKey = null) => new()
     {
-        DiffuseColor = IsSelected(key, primitiveKey) ? new Color4(.95f, .64f, .22f, 1) : new Color4(.62f, .65f, .68f, 1),
-        EmissiveColor = IsSelected(key, primitiveKey)
+        DiffuseColor = UseSelectionTint && IsSelected(key, primitiveKey) ? new Color4(.95f, .64f, .22f, 1) : new Color4(.62f, .65f, .68f, 1),
+        EmissiveColor = UseSelectionTint && IsSelected(key, primitiveKey)
             ? new Color4(.1f, .06f, 0, occurrences[key].SourceVisible ? 0 : 1)
             : new Color4(0, 0, 0, occurrences[key].SourceVisible ? 0 : 1),
         TexCoordOffset = Numerics.Vector2.Zero
