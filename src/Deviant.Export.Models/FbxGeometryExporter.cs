@@ -327,7 +327,7 @@ public sealed partial class FbxGeometryExporter
                     }
                     else
                         losses.Add(new("MaterialValuesUnavailable", primitive.Key,
-                            $"Submesh {submesh.Key} has typed material and texture bindings, but scalar surface values are unavailable; neutral FBX factors remain.",
+                            $"Submesh {submesh.Key} retains material and texture bindings; some surface parameters are not represented in FBX.",
                             submesh.Materials));
                 }
                 else if (submesh.Materials.Count > 1)
@@ -393,8 +393,30 @@ public sealed partial class FbxGeometryExporter
         {
             if (!materialByKey.ContainsKey(key))
                 materialByKey.Add(key, new(key, 0, references.ToArray(), ambiguous, materialInput,
-                    primitiveKey, hasBakedBaseColor));
+                    primitiveKey, hasBakedBaseColor)
+                { DiffuseColor = ResolveDiffuseColor(materialInput?.Material, hasBakedBaseColor, token) });
         }
+    }
+
+    private static Vector3 ResolveDiffuseColor(MaterialAsset? material, bool hasBakedBaseColor, CancellationToken token)
+    {
+        if (hasBakedBaseColor) return Vector3.One;
+        var fallback = new Vector3(0.65f, 0.65f, 0.65f);
+        if (material?.SurfaceGraph?.BaseColor is not { } root ||
+            root.ValueType is not (MaterialValueType.Scalar or MaterialValueType.Vector3 or MaterialValueType.Vector4))
+            return fallback;
+        try
+        {
+            var evaluator = new MaterialSurfaceExpressionEvaluator(root);
+            var value = evaluator.Evaluate(
+                static _ => throw new InvalidDataException("The colour expression requires a surface input."),
+                static (_, _) => throw new InvalidDataException("The colour expression requires a texture sample."), token);
+            var color = root.ValueType == MaterialValueType.Scalar
+                ? new Vector3(value.X) : new Vector3(value.X, value.Y, value.Z);
+            return Finite(color) ? color : fallback;
+        }
+        catch (Exception error) when (error is ArgumentException or InvalidDataException or OverflowException)
+        { return fallback; }
     }
 
     private static string BakedMaterialKey(string sourceKey, string primitiveKey) =>
@@ -961,6 +983,7 @@ public sealed partial class FbxGeometryExporter
                 var texture = new FbxTexturePlan(nextId++, materialPlan, binding, textureInput, null, video,
                     property, property);
                 textures.Add(texture);
+                if (binding.Role == MaterialTextureRole.BaseColor) materialPlan.DiffuseColor = Vector3.One;
                 reports.Add(new(material.Identity, material.Revision, binding.SlotOrdinal, binding.Role,
                     binding.Texture, textureInput.Document.Identity!, textureInput.Document.Revision!,
                     textureInput.Document.ContentSha256, textureInput.Surface.Subresource,
@@ -1764,7 +1787,7 @@ public sealed partial class FbxGeometryExporter
     {
         var properties = new List<FbxBinary7400Node>
         {
-            PVector("DiffuseColor", "Color", material.HasBakedBaseColor ? Vector3.One : new Vector3(0.65f, 0.65f, 0.65f)),
+            PVector("DiffuseColor", "Color", material.DiffuseColor),
             PDouble("DiffuseFactor", "Number", "", 1),
             PVector("SpecularColor", "Color", Vector3.Zero),
             PDouble("TransparencyFactor", "Number", "", material.HasBakedOpacity ? 1 : 0),
@@ -2184,7 +2207,7 @@ public sealed partial class FbxGeometryExporter
         writer.WriteLine("\t\tShadingModel: \"phong\"");
         writer.WriteLine("\t\tMultiLayer: 0");
         writer.WriteLine("\t\tProperties70: {");
-        WriteNumericProperty(writer, "DiffuseColor", "Color", "", material.HasBakedBaseColor ? "1,1,1" : "0.65,0.65,0.65");
+        WriteNumericProperty(writer, "DiffuseColor", "Color", "", Format(material.DiffuseColor));
         WriteScalarProperty(writer, "DiffuseFactor", "Number", "", "1");
         WriteNumericProperty(writer, "SpecularColor", "Color", "", "0,0,0");
         WriteScalarProperty(writer, "TransparencyFactor", "Number", "", material.HasBakedOpacity ? "1" : "0");
@@ -2530,6 +2553,7 @@ public sealed partial class FbxGeometryExporter
     private sealed record FbxMaterialPlan(string Key, long Id, IReadOnlyList<ResourceReference> References, bool Ambiguous,
         FbxMaterialExportInput? MaterialInput, string? PrimitiveKey = null, bool HasBakedBaseColor = false)
     {
+        public Vector3 DiffuseColor { get; set; } = new(0.65f, 0.65f, 0.65f);
         public string Name => "DeviantMaterial_" + Key[..Math.Min(20, Key.Length)];
         public bool HasBakedOpacity => PrimitiveKey is { } primitiveKey && MaterialInput?.AllMaps.Any(map =>
             map.PrimitiveKeys.Contains(primitiveKey, StringComparer.Ordinal) &&
