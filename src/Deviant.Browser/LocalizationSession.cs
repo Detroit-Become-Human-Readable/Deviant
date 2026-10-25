@@ -76,6 +76,7 @@ public sealed partial class LocalizationSession : IAsyncDisposable
         IProgress<LocalizationReadProgress>? progress = null, CancellationToken cancellationToken = default,
         ISourceRevisionProvider? sourceRevisionProvider = null)
     {
+        using var timing = AssetLoadDiagnostics.Measure("LocalizationOpen");
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentException.ThrowIfNullOrWhiteSpace(cacheLocation);
         cancellationToken.ThrowIfCancellationRequested();
@@ -295,6 +296,29 @@ public sealed partial class LocalizationSession : IAsyncDisposable
         finally { featureGate.Release(); }
     }
 
+    internal async Task<bool> HasPublishedKindOnePointerAsync(ResourceIdentity source, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ThrowIfDisposed();
+        var query = new LocalizationQuery(Source: source, Kind: LocalizationRecordKind.Pointer, Limit: 128);
+        ValidateQuery(query);
+        using var timing = AssetLoadDiagnostics.Measure("LocalizationPointerExistence", source.Key);
+        await featureGate.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            long offset = 0;
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                var page = await QueryUnderFeatureGateAsync(ToAssetQuery(query with { Offset = offset }), token).ConfigureAwait(false);
+                if (page.Records.Any(record => record.PointerKind == 1 && record.PointerPayloadBase64 is not null)) return true;
+                offset += page.Records.Count;
+                if (page.Records.Count == 0 || offset >= page.Total) return false;
+            }
+        }
+        finally { featureGate.Release(); }
+    }
+
     internal async Task<IReadOnlyList<ResourceIdentity>> CapturePublishedPointerIdentitiesAsync(ResourceIdentity source,
         CancellationToken token = default)
     {
@@ -304,6 +328,7 @@ public sealed partial class LocalizationSession : IAsyncDisposable
             Limit: LocalizationAudioLookup.PointerPageSize);
         ValidateQuery(query);
         var identities = new List<ResourceIdentity>();
+        using var timing = AssetLoadDiagnostics.Measure("LocalizationPointerCapture", source.Key);
         await featureGate.WaitAsync(token).ConfigureAwait(false);
         try
         {

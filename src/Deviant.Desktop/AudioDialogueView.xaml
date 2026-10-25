@@ -22,7 +22,7 @@
         </DockPanel>
 
         <Grid Grid.Row="2">
-            <ListView x:Name="Occurrences" SelectionChanged="OccurrenceSelected"
+            <ListView x:Name="Occurrences" SelectionChanged="OccurrenceSelected" MaxHeight="220"
                       AutomationProperties.Name="Dialogue occurrences"
                       ScrollViewer.VerticalScrollBarVisibility="Auto"
                       VirtualizingPanel.IsVirtualizing="True"

@@ -362,31 +362,61 @@ public sealed class LocalizationAudioLookup
         List<LocalizationAudioLookupIssue> diagnostics,LocalizationPayloadVerificationLease indexLease,CancellationToken token)
     {
         var headerKeys=headers.Select(header=>header.Key).ToHashSet(StringComparer.Ordinal);
+        var headerIds=headers.Select(header=>session.Snapshot.Records[checked((int)header.Ordinal)].Id
+            .ToString(CultureInfo.InvariantCulture)).ToHashSet(StringComparer.Ordinal);
+        long sources=0,verifiedTables=0,skippedTables=0,relevantTables=0,emptyPointerSources=0,
+            pointerIdentities=0,pointerRecords=0,referenceErrors=0;
+        bool completed=false;
+        using var timing=AssetLoadDiagnostics.Measure("LocalizationAudioCandidateScan");
+        try
+        {
         foreach(var resource in session.Resources.OrderBy(resource=>resource.Ordinal))
         {
+            sources++;
             token.ThrowIfCancellationRequested();
             var source=new ResourceIdentity(session.Snapshot.IndexContentId,resource.Ordinal);
-            var identities=await session.CapturePublishedPointerIdentitiesAsync(source,token).ConfigureAwait(false);
-            if(identities.Count==0)continue;
-            await using var sourceLease=await session.AcquirePayloadVerificationAsync([source],token,indexLease).ConfigureAwait(false);
-            sourceLease.EnsureUnchanged();
             LocalizationReferenceReadResult references;
-            try{references=await referenceReader.ReadAsync(session.Snapshot,source,token).ConfigureAwait(false);}
+            try
+            {
+                using var tableTiming=AssetLoadDiagnostics.Measure("LocalizationAudioSourceTable",source.Key);
+                references=await referenceReader.ReadAsync(session.Snapshot,source,token).ConfigureAwait(false);
+            }
             catch(ArchiveException error) when(IsReferenceDataIssue(error.Code))
             {
+                if(!await session.HasPublishedKindOnePointerAsync(source,token).ConfigureAwait(false))
+                { emptyPointerSources++;continue; }
+                await using var unavailableLease=await session.AcquirePayloadVerificationAsync([source],token,indexLease).ConfigureAwait(false);
+                unavailableLease.EnsureUnchanged();
                 diagnostics.Add(new(error.Code,error.Message,LocalizationReferenceLinkStatus.Unresolved,[source]));
+                referenceErrors++;
                 continue;
             }
             if(references.Status!=LocalizationReferenceReadStatus.Verified)
             {
+                if(!await session.HasPublishedKindOnePointerAsync(source,token).ConfigureAwait(false))
+                { emptyPointerSources++;continue; }
+                await using var unavailableLease=await session.AcquirePayloadVerificationAsync([source],token,indexLease).ConfigureAwait(false);
+                unavailableLease.EnsureUnchanged();
                 diagnostics.Add(new("ReferenceContainerMissing","The localization source has no supported reference table.",
                     LocalizationReferenceLinkStatus.Unmatched,[source]));
+                referenceErrors++;
                 continue;
             }
+            verifiedTables++;
+            if(!references.Relationships.Any(relationship=>relationship.Reference.ResourceType==4091&&
+                headerIds.Contains(relationship.Reference.Id)))
+            { skippedTables++;continue; }
+            relevantTables++;
+            var identities=await session.CapturePublishedPointerIdentitiesAsync(source,token).ConfigureAwait(false);
+            pointerIdentities+=identities.Count;
+            if(identities.Count==0){emptyPointerSources++;continue;}
+            await using var sourceLease=await session.AcquirePayloadVerificationAsync([source],token,indexLease).ConfigureAwait(false);
+            sourceLease.EnsureUnchanged();
             foreach(var batch in Batch(identities,PointerPageSize))
             {
                 token.ThrowIfCancellationRequested();
                 var pointers=await session.GetRecordsAsync(batch,token).ConfigureAwait(false);
+                pointerRecords+=pointers.Count;
                 if(pointers.Count<batch.Count)
                     diagnostics.Add(new("PointerOccurrenceUnavailable","Some pointer occurrences are no longer available in this text index.",
                         LocalizationReferenceLinkStatus.Unresolved,[source],Count:batch.Count-pointers.Count));
@@ -403,6 +433,18 @@ public sealed class LocalizationAudioLookup
             sourceLease.EnsureUnchanged();
         }
         indexLease.EnsureUnchanged();
+        completed=true;
+        }
+        finally
+        {
+            AssetLoadDiagnostics.Counters("LocalizationAudioCandidateScan",null,new Dictionary<string,long>
+            {
+                ["Sources"]=sources,["VerifiedTables"]=verifiedTables,["SkippedTables"]=skippedTables,
+                ["RelevantTables"]=relevantTables,["EmptyPointerSources"]=emptyPointerSources,
+                ["PointerIdentities"]=pointerIdentities,["PointerRecords"]=pointerRecords,
+                ["ReferenceErrors"]=referenceErrors,["Completed"]=completed?1:0
+            });
+        }
     }
     private static void AddCandidate(Dictionary<string,(ResourceIdentity Pointer,List<ResourceIdentity> Headers)> candidates,
         ResourceIdentity pointer,ResourceIdentity header)

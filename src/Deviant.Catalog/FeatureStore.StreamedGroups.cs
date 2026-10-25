@@ -537,6 +537,7 @@ public sealed partial class FeatureStore
     private void ValidateCollection(SqliteTransaction tx,string generation,IReadOnlyList<BatchManifest> batches,
         string collection,bool search,string rowHashVersion,string keyHashVersion,CancellationToken token)
     {
+        using var timing=AssetLoadDiagnostics.Measure(search?"LocalizationSearchValidation":"LocalizationRecordValidation",generation);
         using var command=connection.CreateCommand();command.Transaction=tx;
         command.CommandText="SELECT sequence,item_key,payload,family,label,search,search_fold,sort_key,group_key,language,codec,duration,channels,availability,completeness,lookup_key FROM localization_generation_rows WHERE revision=$r AND generation=$g AND collection=$c ORDER BY sequence";
         command.Parameters.AddWithValue("$r",revision);command.Parameters.AddWithValue("$g",generation);command.Parameters.AddWithValue("$c",collection);

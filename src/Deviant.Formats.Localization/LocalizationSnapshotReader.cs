@@ -209,11 +209,11 @@ public sealed class LocalizationSnapshotReader(ISourceRevisionProvider? revision
                             rawLanguage, displayLanguage, recordStart, keyIndex: 0, LocalizationRecordKind.Text,
                             LocalizationRecordStatus.Complete, key, text, "UTF-16LE", Extent("Record", resource, relativeSource, recordStart, cursor - recordStart), fields, unknown));
                 }
-                else if (keyLength is > 0 and <= 64 && keyLength <= pointerCapacity)
+                else if (keyLength > 0 && keyLength <= pointerCapacity)
                 {
                     if (!TryParsePointerRecord(indexContentId, resource, relativeSource, bytes, bodyEnd, version,
                         languageIndex, rawLanguage, displayLanguage, recordStart, cursor, flags, (int)keyLength,
-                        out var pointerRows, out var pointerEnd, out var pointerDiagnostic))
+                        out var pointerRows, out var pointerEnd, out var pointerDiagnostic, cancellationToken))
                     {
                         var message = pointerDiagnostic ?? "The localization pointer record is malformed.";
                         records.Add(Opaque(indexContentId, resource, relativeSource, recordStart, bodyEnd - recordStart,
@@ -271,12 +271,15 @@ public sealed class LocalizationSnapshotReader(ISourceRevisionProvider? revision
     private static bool TryParsePointerRecord(string indexContentId, ResourceRecord resource, string relativeSource,
         ReadOnlySpan<byte> bytes, int bodyEnd, uint version, int languageIndex, string rawLanguage, string displayLanguage,
         int recordStart, int cursor, uint flags, int pointerCount, out IReadOnlyList<LocalizationRecord> rows,
-        out int next, out string? diagnostic)
+        out int next, out string? diagnostic, CancellationToken cancellationToken)
     {
+        if (pointerCount > (bodyEnd - cursor) / 6)
+            return PointerFailure(recordStart, "The pointer array is truncated.", out rows, out next, out diagnostic);
         var parsed = new List<LocalizationRecord>(pointerCount);
         var recordCursor = cursor;
         for (var keyIndex = 0; keyIndex < pointerCount; keyIndex++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (recordCursor > bodyEnd - 4) return PointerFailure(recordStart, "A pointer-key length is truncated.", out rows, out next, out diagnostic);
             var keyLengthOffset = recordCursor;
             var keyLength = BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(recordCursor, 4));

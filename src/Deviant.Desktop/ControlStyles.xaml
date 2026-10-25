@@ -307,11 +307,21 @@
                 <ControlTemplate TargetType="ListViewItem">
                     <Border x:Name="ItemBorder" Background="{TemplateBinding Background}"
                             BorderBrush="{DynamicResource GridLineBrush}" BorderThickness="0,0,0,1">
-                        <GridViewRowPresenter Content="{TemplateBinding Content}"
+                        <Grid>
+                        <ContentPresenter x:Name="PlainContent" Content="{TemplateBinding Content}"
+                            ContentTemplate="{TemplateBinding ContentTemplate}" ContentTemplateSelector="{TemplateBinding ContentTemplateSelector}"
+                            HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                            TextElement.Foreground="{TemplateBinding Foreground}" Visibility="Collapsed"/>
+                        <GridViewRowPresenter x:Name="GridContent" Content="{TemplateBinding Content}"
                             Columns="{Binding View.Columns, RelativeSource={RelativeSource AncestorType={x:Type ListView}}}"
                             SnapsToDevicePixels="True" VerticalAlignment="Center" />
+                        </Grid>
                     </Border>
                     <ControlTemplate.Triggers>
+                        <DataTrigger Binding="{Binding View, RelativeSource={RelativeSource AncestorType={x:Type ListView}}}" Value="{x:Null}">
+                            <Setter TargetName="PlainContent" Property="Visibility" Value="Visible"/>
+                            <Setter TargetName="GridContent" Property="Visibility" Value="Collapsed"/>
+                        </DataTrigger>
                         <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource ControlHoverBackground}" /></Trigger>
                         <Trigger Property="IsSelected" Value="True">
                             <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource SelectionBackground}" />
