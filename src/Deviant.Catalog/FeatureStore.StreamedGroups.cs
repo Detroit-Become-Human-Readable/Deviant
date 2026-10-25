@@ -26,10 +26,11 @@ public sealed class StagedLocalizationGeneration : IDisposable
 public sealed class PublishedLocalizationGeneration<THead> : IDisposable
 {
     internal PublishedLocalizationGeneration(FeatureStore owner, string version, string generation, THead head,
-        LocalizationGenerationIdentity identity, bool searchProjectionMatches)
-    { Owner=owner; RecordStoreVersion=version; Generation=generation; Head=head; Identity=identity; SearchProjectionMatches=searchProjectionMatches; }
+        LocalizationGenerationIdentity identity, bool searchProjectionMatches, string validationToken)
+    { Owner=owner; RecordStoreVersion=version; Generation=generation; Head=head; Identity=identity; SearchProjectionMatches=searchProjectionMatches; ValidationToken=validationToken; }
     internal FeatureStore Owner { get; }
     internal bool Active { get; set; } = true;
+    internal string ValidationToken { get; }
     public bool IsActive => Active;
     public string RecordStoreVersion { get; }
     public string Generation { get; }
@@ -119,6 +120,7 @@ public sealed partial class FeatureStore
                 INSERT INTO localization_generation_fts(rowid,search_fold) VALUES(new.row_id,new.search_fold); END;
             """;
         command.ExecuteNonQuery();
+        InitializeLocalizationValidation();
     }
 
     public StagedLocalizationGeneration BeginLocalizationGeneration(string recordStoreVersion,string searchProjectionVersion,
@@ -212,11 +214,12 @@ public sealed partial class FeatureStore
         var identity=identify(head)??throw new InvalidDataException("Generation identity is missing.");
         ValidateIdentity(identity,generation);var payload=BoundedFeatureJson.Serialize(head,MaxGenerationHeadBytes);var committed=false;
         SealLocalizationGeneration(generation,identity,token);
-        ValidateStagedLocalizationRows(generation,token);
+        var validationToken=ValidateStagedLocalizationRows(generation,token);
         lock(gate)try{CatalogService.ExecuteInterruptible(connection,token,()=>
         {
             using var tx=connection.BeginTransaction();var state=ReadWriterState(tx,generation);
             if(state.State!="validating")throw new InvalidOperationException("Generation validation was superseded.");
+            RequireLocalizationValidation(tx,generation.Generation,validationToken);
             string? active;
             using(var q=connection.CreateCommand())
             { q.Transaction=tx;q.CommandText="SELECT generation FROM localization_generation_active WHERE revision=$r AND record_store_version=$v";
@@ -237,10 +240,12 @@ public sealed partial class FeatureStore
             { activeUpdate.Transaction=tx;activeUpdate.CommandText="INSERT INTO localization_generation_active VALUES($r,$v,$g) ON CONFLICT(revision,record_store_version) DO UPDATE SET generation=excluded.generation";
               activeUpdate.Parameters.AddWithValue("$r",revision);activeUpdate.Parameters.AddWithValue("$v",generation.RecordStoreVersion);
               activeUpdate.Parameters.AddWithValue("$g",generation.Generation);activeUpdate.ExecuteNonQuery(); }
+            SaveLocalizationValidation(tx,generation.Generation,generation.RecordStoreVersion,
+                generation.SearchProjectionVersion,validationToken);
             token.ThrowIfCancellationRequested();tx.Commit();committed=true;return true;
         });}catch(OperationCanceledException)when(committed){ }
         generation.Active=false;
-        return new(this,generation.RecordStoreVersion,generation.Generation,head,identity,true);
+        return new(this,generation.RecordStoreVersion,generation.Generation,head,identity,true,validationToken);
     }
 
     private void SealLocalizationGeneration(StagedLocalizationGeneration generation,
@@ -267,11 +272,11 @@ public sealed partial class FeatureStore
         });
     }
 
-    private void ValidateStagedLocalizationRows(StagedLocalizationGeneration generation,CancellationToken token)
+    private string ValidateStagedLocalizationRows(StagedLocalizationGeneration generation,CancellationToken token)
     {
-        lock(gate)CatalogService.ExecuteInterruptible(connection,token,() =>
+        lock(gate)return CatalogService.ExecuteInterruptible(connection,token,() =>
         {
-            using var tx=connection.BeginTransaction(deferred:true);var state=ReadWriterState(tx,generation);
+            using var tx=connection.BeginTransaction();var state=ReadWriterState(tx,generation);
             if(state.State!="validating")throw new InvalidOperationException("Generation is not sealed for validation.");
             var batches=ReadBatches(tx,generation.Generation);ValidateBatches(batches,state);
             if(batches.Any(batch=>batch.RecordKeyHash!=batch.SearchKeyHash))throw new InvalidDataException("Record and search key sets differ.");
@@ -279,7 +284,10 @@ public sealed partial class FeatureStore
                 generation.RecordStoreVersion,generation.RecordStoreVersion,token);
             ValidateCollection(tx,generation.Generation,batches,LocalizationSearchCollection,true,
                 generation.SearchProjectionVersion,generation.RecordStoreVersion,token);
-            token.ThrowIfCancellationRequested();tx.Commit();return true;
+            var validationToken=Guid.NewGuid().ToString("N");
+            SaveLocalizationValidation(tx,generation.Generation,generation.RecordStoreVersion,
+                generation.SearchProjectionVersion,validationToken);
+            token.ThrowIfCancellationRequested();tx.Commit();return validationToken;
         });
     }
 
@@ -289,11 +297,14 @@ public sealed partial class FeatureStore
     {
         ValidateVersion(recordStoreVersion,nameof(recordStoreVersion));ValidateVersion(searchProjectionVersion,nameof(searchProjectionVersion));
         ArgumentNullException.ThrowIfNull(identify);ArgumentNullException.ThrowIfNull(acceptsSource);
+        var persistValidation=true;
         try
         {
-        lock(gate)return CatalogService.ExecuteInterruptible<PublishedLocalizationGeneration<THead>?>(connection,token,()=>
+        lock(gate)for(var attempt=0;;attempt++)try
+        { return CatalogService.ExecuteInterruptible<PublishedLocalizationGeneration<THead>?>(connection,token,()=>
         {
             using var tx=connection.BeginTransaction(deferred:true);string? generation;
+            var changeStamp=ReadLocalizationChangeStamp(tx);
             using(var active=connection.CreateCommand())
             { active.Transaction=tx;active.CommandText="SELECT generation FROM localization_generation_active WHERE revision=$r AND record_store_version=$v";
               active.Parameters.AddWithValue("$r",revision);active.Parameters.AddWithValue("$v",recordStoreVersion);generation=active.ExecuteScalar() as string; }
@@ -302,10 +313,30 @@ public sealed partial class FeatureStore
             var identity=identify(stored.Head);ValidateStoredIdentity(identity,stored,recordStoreVersion);
             if(!acceptsSource(stored.Head))return null;
             var searchMatches=stored.SearchVersion==searchProjectionVersion;
-            ValidatePublishedRows(tx,generation,stored,recordStoreVersion,searchMatches,token);
+            var validationToken=ReadLocalizationValidation(tx,generation,recordStoreVersion,
+                searchMatches?stored.SearchVersion:string.Empty);
+            if(validationToken is null)
+            {
+                ValidatePublishedRows(tx,generation,stored,recordStoreVersion,searchMatches,token);
+                validationToken=Guid.NewGuid().ToString("N");
+                if(persistValidation)
+                    SaveLocalizationValidation(tx,generation,recordStoreVersion,
+                        searchMatches?stored.SearchVersion:string.Empty,validationToken);
+                else
+                {
+                    if(changeStamp!=ReadLocalizationChangeStamp(tx))throw new LocalizationValidationChangedException();
+                    localizationReadValidations[validationToken]=(generation,changeStamp.External,changeStamp.Local);
+                }
+            }
             token.ThrowIfCancellationRequested();tx.Commit();
-            return new(this,recordStoreVersion,generation,stored.Head,identity,searchMatches);
-        });
+            return new(this,recordStoreVersion,generation,stored.Head,identity,searchMatches,validationToken);
+        }); }
+        catch(SqliteException error)when(error.SqliteErrorCode==5&&attempt<2)
+        { token.ThrowIfCancellationRequested(); }
+        catch(LocalizationValidationChangedException)when(attempt<2)
+        { token.ThrowIfCancellationRequested(); }
+        catch(IOException error)when(persistValidation&&error.InnerException is SqliteException { SqliteErrorCode:13 })
+        { token.ThrowIfCancellationRequested();persistValidation=false; }
         }
         catch(Exception exception) when(exception is JsonException or InvalidDataException or FormatException or OverflowException or InvalidOperationException)
         { token.ThrowIfCancellationRequested();return null; }
@@ -463,7 +494,7 @@ public sealed partial class FeatureStore
         }
     }
     internal void Release<THead>(PublishedLocalizationGeneration<THead> generation)
-    {if(ReferenceEquals(generation.Owner,this))generation.Active=false;}
+    {if(ReferenceEquals(generation.Owner,this))lock(gate){generation.Active=false;localizationReadValidations.Remove(generation.ValidationToken);}}
 
     private WriterState ReadWriterState(SqliteTransaction tx,StagedLocalizationGeneration writer)
     {
@@ -573,6 +604,7 @@ public sealed partial class FeatureStore
 
     private void ValidatePinnedGeneration<THead>(SqliteTransaction tx,PublishedLocalizationGeneration<THead> lease)
     {
+        RequireLocalizationValidation(tx,lease.Generation,lease.ValidationToken);
         using var command=connection.CreateCommand();command.Transaction=tx;
         command.CommandText="SELECT state,record_store_version,search_projection_version,input_snapshot_id,parsed_result_id,json_policy_version,record_count,asset_count FROM localization_generations WHERE revision=$r AND generation=$g";
         command.Parameters.AddWithValue("$r",revision);command.Parameters.AddWithValue("$g",lease.Generation);
