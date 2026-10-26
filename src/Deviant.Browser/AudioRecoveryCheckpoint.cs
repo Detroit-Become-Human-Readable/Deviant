@@ -93,7 +93,7 @@ public sealed partial class AudioExplorerSession
             {
                 var row=RecoveryMetadataRow(stored);
                 labelsByIdentity[row.Identity.Key]=SourceLabel(stored.Asset);
-                RememberBrowseRow(row,stored.SerializedBytes);rows.Add(row);
+                row=RememberBrowseRow(row,stored.SerializedBytes);rows.Add(row);
             }
         }
         token.ThrowIfCancellationRequested();

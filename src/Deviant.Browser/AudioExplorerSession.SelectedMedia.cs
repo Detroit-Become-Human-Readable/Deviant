@@ -105,6 +105,23 @@ public sealed partial class AudioExplorerSession
                 }
             }
         }
+        if (media is null)
+        {
+            var retained = store.ReadRetainedLinkedFeatureEvidence<MediaEntry>(BrowseScope,
+                [stored.Asset.Identity], MaximumRecoveryPayloadBytes, token).SingleOrDefault();
+            if (retained is { ErrorCode: null, Feature: { } candidate } &&
+                retained.Asset.Revision == new SourceRevision(Snapshot.IndexContentId, Snapshot.PhysicalSourceStamp) &&
+                candidate.Identity == stored.Asset.Identity && candidate.MetadataReadCoverageComplete &&
+                candidate.MetadataReadDigests is { Count: > 0 } && candidate.SourceEvidence is not null &&
+                candidate.SourceEvidence.All(item => item is not null && item.Declaration is not null) &&
+                candidate.MetadataReadDigests.All(digest => digest is not null && digest.Slice?.FilePath is not null &&
+                    digest.Sha256 is not null) &&
+                candidate.BankKey is not null && GroupKey(candidate) == stored.Asset.GroupKey)
+            {
+                _ = RestoreResolvedSourceClassification(candidate);
+                if (HasSelectedClassification(candidate, null)) { media = candidate; persist = true; }
+            }
+        }
         if (media is not null && RestoreResolvedSourceClassification(media)) persist = true;
         if(media is null||!HasSelectedClassification(media,scope)||!media.MetadataReadCoverageComplete||media.MetadataReadDigests.Count==0)
         {
@@ -134,6 +151,12 @@ public sealed partial class AudioExplorerSession
         if(media.Identity!=stored.Asset.Identity||!HasSelectedClassification(media,scope))
             throw new ArchiveException("ClassificationPending","The selected clip's source classification is incomplete.");
 
+        var namesBefore = StagedMediaFingerprint(media, label);
+        await RetainSourceNamesAsync([media], token, store).ConfigureAwait(false);
+        if (recovered is not null) MergeSourceNames(media, CaptureSourceNames(recovered));
+        label = StoredUserLabel(media) ?? label;
+        persist |= namesBefore != StagedMediaFingerprint(media, label);
+
         var checkpoint=new AudioRecoveryCheckpoint(new(Snapshot.IndexContentId,Snapshot.PhysicalSourceStamp),media,label)
             { SelectedScope=scope };
         var serialized=BoundedFeatureWrite.Create(RecoveryFeaturePrefix+key,RecoveryVersion,checkpoint,MaximumRecoveryPayloadBytes).Utf8ByteCount;
@@ -151,6 +174,12 @@ public sealed partial class AudioExplorerSession
                 if(latest.Asset.Revision!=stored.Asset.Revision||latest.Asset.GroupKey!=stored.Asset.GroupKey)
                     throw new ArchiveException("SelectionChanged","The selected clip's owner changed while its details loaded.");
                 label=SourceLabel(latest.Asset);
+                if (TryReadRecoveryMedia(latest, out var named, out _))
+                {
+                    MergeSourceNames(media, CaptureSourceNames(named));
+                    label = StoredUserLabel(media) ?? label;
+                }
+                var saveSelected = writerAvailable;
                 if(TryReadRecoveryMedia(latest,out var refreshed,out var currentLabel)&&
                     HasSelectedClassification(refreshed,latest.Feature!.SelectedScope)&&refreshed.MetadataReadCoverageComplete&&
                     refreshed.MetadataReadDigests.Count>0)
@@ -164,9 +193,14 @@ public sealed partial class AudioExplorerSession
                         _=AudioResourceBinding.Resolve(Snapshot,refreshed);
                         _=AudioResourceBinding.Resolve(Snapshot,refreshed,original:true);
                     }
-                    media=refreshed;scope=latest.Feature!.SelectedScope;label=currentLabel;
+                    var refreshedBefore = StagedMediaFingerprint(refreshed, currentLabel);
+                    MergeSourceNames(refreshed, CaptureSourceNames(media));
+                    media=refreshed;scope=latest.Feature!.SelectedScope;label=StoredUserLabel(media)??currentLabel;
+                    saveSelected = writerAvailable && refreshedBefore != StagedMediaFingerprint(media, label);
+                    if (!writerAvailable && refreshedBefore != StagedMediaFingerprint(media, label))
+                        cachePersistenceError = "CacheWriteDeferred";
                 }
-                else if(writerAvailable)
+                if(saveSelected)
                 {
                     operation?.Progress("Saving selected checkpoint");
                     IReadOnlyDictionary<string,SelectedAudioClassificationScope>? scopes=scope is { } local
@@ -187,7 +221,7 @@ public sealed partial class AudioExplorerSession
                         WorkflowDiagnostics.Failure("Audio.SelectedCheckpoint",error,key,partial:true,phase:"Saving selected clip");
                     }
                 }
-                else
+                else if(!writerAvailable)
                 {
                     cachePersistenceError="CacheWriteDeferred";
                     operation?.Progress("Checkpoint deferred");
@@ -206,7 +240,7 @@ public sealed partial class AudioExplorerSession
             labelsByIdentity[key]=label;
             prepared=new(Describe(media,label),media,aliases.Get(stored.Asset.Identity),UserBankLabel(media))
                 { SelectedSourceVerified=true,SelectedClassificationScope=scope,CachePersistenceErrorCode=cachePersistenceError };
-            RememberBrowseRow(prepared,serialized);
+            prepared=RememberBrowseRow(prepared,serialized);
         }
         return (prepared,serialized);
     }
@@ -221,7 +255,8 @@ public sealed partial class AudioExplorerSession
             payload.IndexContentId != identity.IndexContentId || payload == identity ||
             !MediaPolicy.CanPreview(media)) return false;
         var bankKey = identity.IndexContentId + ":resource:" + identity.Ordinal.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        if (media.BankKey != bankKey || media.SourceEvidence.Any(item => item.BankKey != bankKey || item.Declaration.Id != media.Id)) return false;
+        if (media.BankKey != bankKey || media.SourceEvidence.Any(item => item is null || item.Declaration is null ||
+            item.BankKey != bankKey || item.Declaration.Id != media.Id)) return false;
         // Older resolved-source checkpoints predate the processing marker. Their
         // canonical member path records the complete native declaration group.
         var declarations = string.Join(";", media.SourceEvidence.Select(item =>

@@ -88,6 +88,7 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
             if (media.Identity is not null)
             {
                 mediaByIdentity.TryAdd(media.Identity.Key, media);
+                RememberSourceNames(media);
                 mediaFingerprints[media.Identity.Key] = StagedMediaFingerprint(media, labels.GetValueOrDefault(media.Identity.Key, UserLabel(media)));
             }
         InitializeFilterOptions();
@@ -297,42 +298,43 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
     {
         if (result.Catalog.IndexContentId != Snapshot.IndexContentId || result.Catalog.PhysicalSourceStamp != Snapshot.PhysicalSourceStamp)
             throw new InvalidDataException("Audio snapshot does not belong to the opened archive revision.");
-        var fullUpdate = initializeFeatures || changedMedia is null;
-        AudioUserLabelDelta? labelDelta = null;
-        Dictionary<string, string> labels;
-        if (fullUpdate)
-        {
-            lock (catalogGate) labels = BuildUserLabels(result.Catalog);
-        }
-        else
-        {
-            labelDelta = PrepareUserLabelDelta(changedMedia!);
-            labels = labelDelta.Labels;
-        }
-
-        var candidates = new Dictionary<string, MediaEntry>(StringComparer.Ordinal);
-        foreach (var media in fullUpdate ? result.Catalog.Media : changedMedia!)
-            if (media.Identity is { } identity) candidates[identity.Key] = media;
-        if (labelDelta is not null)
-            foreach (var pair in labelDelta.Entries) candidates[pair.Key] = pair.Value;
-        var mediaToIndex = new List<MediaEntry>();
-        var fingerprints = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var media in candidates.Values)
-        {
-            if (media.Identity is null) continue;
-            var label = labels.GetValueOrDefault(media.Identity.Key, UserLabel(media));
-            var fingerprint = StagedMediaFingerprint(media, label);
-            if (!fingerprints.TryAdd(media.Identity.Key, fingerprint))
-                throw new InvalidDataException("Audio snapshot contains duplicate stable media identities.");
-            if (initializeFeatures || !mediaFingerprints.TryGetValue(media.Identity.Key, out var previous) || previous != fingerprint)
-                mediaToIndex.Add(media);
-        }
-        IEnumerable<AssetDescriptor> Descriptors() => mediaToIndex.Select(media => Describe(media,
-            media.Identity is not null && labels.TryGetValue(media.Identity.Key, out var label) ? label : null));
         await featureGate.WaitAsync(token).ConfigureAwait(false);
-        var publishedFence = expectedBrowse;
         try
         {
+            var fullUpdate = initializeFeatures || changedMedia is null;
+            await RetainSourceNamesAsync(fullUpdate ? result.Catalog.Media : changedMedia!, token).ConfigureAwait(false);
+            AudioUserLabelDelta? labelDelta = null;
+            Dictionary<string, string> labels;
+            if (fullUpdate)
+            {
+                lock (catalogGate) labels = BuildUserLabels(result.Catalog);
+            }
+            else
+            {
+                labelDelta = PrepareUserLabelDelta(changedMedia!);
+                labels = labelDelta.Labels;
+            }
+
+            var candidates = new Dictionary<string, MediaEntry>(StringComparer.Ordinal);
+            foreach (var media in fullUpdate ? result.Catalog.Media : changedMedia!)
+                if (media.Identity is { } identity) candidates[identity.Key] = media;
+            if (labelDelta is not null)
+                foreach (var pair in labelDelta.Entries) candidates[pair.Key] = pair.Value;
+            var mediaToIndex = new List<MediaEntry>();
+            var fingerprints = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var media in candidates.Values)
+            {
+                if (media.Identity is null) continue;
+                var label = labels.GetValueOrDefault(media.Identity.Key, UserLabel(media));
+                var fingerprint = StagedMediaFingerprint(media, label);
+                if (!fingerprints.TryAdd(media.Identity.Key, fingerprint))
+                    throw new InvalidDataException("Audio snapshot contains duplicate stable media identities.");
+                if (initializeFeatures || !mediaFingerprints.TryGetValue(media.Identity.Key, out var previous) || previous != fingerprint)
+                    mediaToIndex.Add(media);
+            }
+            IEnumerable<AssetDescriptor> Descriptors() => mediaToIndex.Select(media => Describe(media,
+                media.Identity is not null && labels.TryGetValue(media.Identity.Key, out var label) ? label : null));
+            var publishedFence = expectedBrowse;
             if (persistFeatures && initializeFeatures)
             {
                 if (expectedBrowse is null)
@@ -346,12 +348,24 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
             lock (catalogGate)
             {
                 AudioResult = result;
-                if (initializeFeatures) { mediaByIdentity.Clear(); mediaFingerprints.Clear(); labelsByIdentity.Clear(); }
+                if (initializeFeatures)
+                {
+                    mediaByIdentity.Clear(); mediaFingerprints.Clear(); labelsByIdentity.Clear();
+                    foreach (var key in retainedSourceNames.Keys.Where(key => !fingerprints.ContainsKey(key)).ToArray())
+                    { retainedSourceNameBytes -= SourceNameBytes(retainedSourceNames[key]); retainedSourceNames.Remove(key); }
+                    retainedSourceNameReads.RemoveWhere(key =>
+                    {
+                        if (fingerprints.ContainsKey(key)) return false;
+                        retainedSourceNameReadBytes -= 64L + 2L * key.Length; return true;
+                    });
+                }
                 foreach (var media in mediaToIndex)
                     if (media.Identity is not null)
                     {
                         mediaByIdentity[media.Identity.Key] = media;
                         mediaFingerprints[media.Identity.Key] = fingerprints[media.Identity.Key];
+                        RememberSourceNames(media);
+                        RememberSourceNameRead(media.Identity.Key);
                     }
                 if (fullUpdate)
                 {
@@ -361,10 +375,15 @@ public sealed partial class AudioExplorerSession : IAsyncDisposable
                 else if (labelDelta is not null) ApplyUserLabelDelta(labelDelta);
                 if (initializeFeatures) InitializeFilterOptions(labelsAlreadyBuilt: true);
                 else UpdateStagedFilterOptions(result.Catalog, fullUpdate ? null : changedMedia);
+                if (AssetLoadDiagnostics.CountersEnabled)
+                    AssetLoadDiagnostics.Counters("Audio.NameRetention", Snapshot.PhysicalSourceStamp,
+                        new Dictionary<string, long> { ["Rows"] = retainedSourceNames.Count,
+                            ["LookupRows"] = retainedSourceNameReads.Count,
+                            ["EstimatedBytes"] = retainedSourceNameBytes + retainedSourceNameReadBytes });
             }
+            return publishedFence;
         }
         finally { featureGate.Release(); }
-        return publishedFence;
     }
 
     private void UpdateStagedFilterOptions(AudioCatalog catalog, IReadOnlyCollection<MediaEntry>? changedMedia = null)

@@ -141,7 +141,7 @@ public sealed partial class AudioExplorerSession
                 labelsByIdentity[media.Identity.Key] = sourceLabel;
                 var descriptor = Describe(media, sourceLabel);
                 var row = new AudioExplorerRow(descriptor, media, aliases.Get(media.Identity), UserBankLabel(media));
-                RememberBrowseRow(row, stored.SerializedBytes);
+                row = RememberBrowseRow(row, stored.SerializedBytes);
                 rows[index] = row;
             }
         }
@@ -150,12 +150,24 @@ public sealed partial class AudioExplorerSession
         return new(page.Total, rows) { Generation = page.Generation };
     }
 
-    private void RememberBrowseRow(AudioExplorerRow row, long serializedBytes)
+    private AudioExplorerRow RememberBrowseRow(AudioExplorerRow row, long serializedBytes)
     {
         var key = row.Identity.Key;
+        if (row.SourceMedia is { } sourceMedia &&
+            row.Descriptor.Revision == new SourceRevision(Snapshot.IndexContentId, Snapshot.PhysicalSourceStamp))
+        {
+            var names = retainedSourceNames.GetValueOrDefault(key);
+            if (names is null && browseRows.TryGetValue(key, out var known) && known.SourceMedia is { } residentMedia)
+                names = CaptureSourceNames(residentMedia);
+            MergeSourceNames(sourceMedia, names);
+            var label = StoredUserLabel(sourceMedia) ?? SourceLabel(row.Descriptor);
+            row = row with { Descriptor = Describe(sourceMedia, label) };
+            labelsByIdentity[key] = label;
+            if (retainedSourceNames.ContainsKey(key)) RememberSourceNames(sourceMedia);
+        }
         if(row.SourceMedia is null&&browseRows.TryGetValue(key,out var resident)&&resident.SelectedSourceVerified&&
             resident.Descriptor.Revision==row.Descriptor.Revision&&resident.Descriptor.GroupKey==row.Descriptor.GroupKey&&
-            SourceLabel(resident.Descriptor)==SourceLabel(row.Descriptor)) return;
+            SourceLabel(resident.Descriptor)==SourceLabel(row.Descriptor)) return row;
         if (!browseRows.ContainsKey(key)) browseRowOrder.Enqueue(key);
         retainedBrowseBytes -= browseRowBytes.GetValueOrDefault(key);
         // Allow for UTF-16 strings, object/list overhead and references in the decoded metadata.
@@ -171,6 +183,7 @@ public sealed partial class AudioExplorerSession
         }
         if (evicted > 0) AssetLoadDiagnostics.Counters("AudioBrowseRetention", Snapshot.PhysicalSourceStamp,
             new Dictionary<string, long> { ["Rows"] = browseRows.Count, ["EstimatedBytes"] = retainedBrowseBytes, ["Evicted"] = evicted });
+        return row;
     }
 
     public IReadOnlyList<AudioExplorerRow> ResolveKnownSelection(IEnumerable<string> identityKeys)
