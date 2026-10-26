@@ -22,7 +22,27 @@ public partial class SceneView
     public SceneActivityProgress ActivityProgress { get; private set; } = new(false, "Ready", 0, 0);
 
     public bool IsDiscoveringAll => automaticDiscoveryActive;
-    public bool IsLoading => exportActive || queryActive || automaticDiscoveryActive || batchDiscoveryActive || sectionLoadingActive || renderLoadingActive || scenePipelineActive || regionsLoadingActive;
+    private bool IsStreamingSceneMaterials => SceneViewport?.IsStreamingMaterials == true;
+    public bool IsLoading => exportActive || queryActive || automaticDiscoveryActive || batchDiscoveryActive || sectionLoadingActive || renderLoadingActive || scenePipelineActive || regionsLoadingActive || IsStreamingSceneMaterials;
+
+    private static bool IsMaterialActivityStage(string? stage) => stage is
+        "Materials streaming" or "Materials paused" or "Materials incomplete" or "Visible materials limited by GPU memory";
+
+    private string SettledActivityStage()
+    {
+        if (activityTerminalStage is { } terminal && !IsMaterialActivityStage(terminal)) return terminal;
+        if (SceneViewport?.MaterialStreamingPaused == true) return "Materials paused";
+        if (SceneViewport?.BudgetDeferredMaterialPartCount > 0) return "Visible materials limited by GPU memory";
+        if (HasIncompleteRenderedMaterials) return "Materials incomplete";
+        return "Ready";
+    }
+
+    private void UpdateMaterialStreamingActivity()
+    {
+        if (!renderLoadingActive && IsMaterialActivityStage(activityTerminalStage)) activityTerminalStage = null;
+        UpdateRenderedCount();
+        UpdateLoadingProgress();
+    }
 
     public async Task DiscoverAllAsync(CancellationToken token = default)
     {
@@ -91,6 +111,9 @@ public partial class SceneView
 
     private void UpdateLoadingProgress()
     {
+        if (SceneCount is null || SceneViewport is null || ViewportLoadingOverlay is null ||
+            ViewportProcessing is null || ViewportLoadingProgress is null ||
+            ViewportLoadingStage is null || ViewportLoadingCount is null) return;
         var discovery = session?.Progress;
         SceneCount.Text = discovery is null ? "" : $"{discovery.Available:N0} scenes";
         string stage;
@@ -115,15 +138,32 @@ public partial class SceneView
         {
             stage = "Reading scene"; completed = total = 0; known = false;
         }
+        else if (IsStreamingSceneMaterials && !automaticDiscoveryActive && !batchDiscoveryActive)
+        {
+            stage = "Materials streaming";
+            total = Math.Max(0, SceneViewport.VisibleMaterialPartCount);
+            completed = Math.Clamp(SceneViewport.ResidentVisibleMaterialPartCount, 0, total);
+            known = total > 0;
+        }
         else
         {
             stage = "Discovering scenes"; completed = discovery?.Visited ?? 0; total = discovery?.Candidates ?? 0; known = total > 0;
         }
-        if (!IsLoading) { stage = activityTerminalStage ?? "Ready"; cancellingActivity = false; }
+        if (!IsLoading)
+        {
+            stage = SettledActivityStage(); cancellingActivity = false;
+            if (IsMaterialActivityStage(stage))
+            {
+                total = Math.Max(0, SceneViewport.VisibleMaterialPartCount);
+                completed = Math.Clamp(SceneViewport.ResidentVisibleMaterialPartCount, 0, total);
+                known = total > 0;
+            }
+            else { completed = total = 0; known = false; }
+        }
         else if (cancellingActivity) { stage = "Cancelling…"; known = false; }
         else if (largeLoadDecision is not null) { stage = "Continue loading this scene?"; known = false; }
         var update = new SceneActivityProgress(IsLoading, stage, completed, known ? total : 0);
-        var viewportLoading = sectionLoadingActive || renderLoadingActive || scenePipelineActive || regionsLoadingActive;
+        var viewportLoading = sectionLoadingActive || renderLoadingActive || scenePipelineActive || regionsLoadingActive || IsStreamingSceneMaterials;
         var hasGeometry = SceneViewport.VisiblePartCount > 0;
         ViewportLoadingOverlay.Visibility = viewportLoading ? Visibility.Visible : Visibility.Collapsed;
         ViewportLoadingOverlay.IsHitTestVisible = false;
@@ -155,7 +195,7 @@ public partial class SceneView
 
     private void UpdateRenderLoadingProgress(RenderLoadProgress progress)
     {
-        if (!renderLoadingActive) return;
+        if (!renderLoadingActive) { UpdateMaterialStreamingActivity(); return; }
         renderLoadingStage = progress.Stage switch
         {
             "Metadata" => "Reading scene",

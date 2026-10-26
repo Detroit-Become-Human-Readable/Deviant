@@ -624,7 +624,7 @@ public partial class SceneView : UserControl, IAsyncDisposable
         catch (OperationCanceledException) { Status.Text = "Export cancelled"; }
         catch (Exception error) { Status.Text = error.Message; }
     }
-    private void Cancel_Click(object sender, RoutedEventArgs e) { queriesSuspended = true; catalogRefreshPending = false; catalogRefreshTimer.Stop(); cancellingActivity = IsLoading; largeLoadDecision?.TrySetCanceled(); exportCancellation?.Cancel(); searchTimer.Stop(); queryCancellation?.Cancel(); loadCancellation?.Cancel(); discoveryCancellation?.Cancel(); automaticDiscoveryCancellation?.Cancel(); textureCancellation?.Cancel(); renderCancellation?.Cancel(); scenePipelineCancellation?.Cancel(); session?.CancelDiscovery(); UpdateLoadingProgress(); }
+    private void Cancel_Click(object sender, RoutedEventArgs e) { queriesSuspended = true; catalogRefreshPending = false; catalogRefreshTimer.Stop(); cancellingActivity = IsLoading; SceneViewport?.PauseMaterialStreaming(); largeLoadDecision?.TrySetCanceled(); exportCancellation?.Cancel(); searchTimer.Stop(); queryCancellation?.Cancel(); loadCancellation?.Cancel(); discoveryCancellation?.Cancel(); automaticDiscoveryCancellation?.Cancel(); textureCancellation?.Cancel(); renderCancellation?.Cancel(); scenePipelineCancellation?.Cancel(); session?.CancelDiscovery(); UpdateLoadingProgress(); }
     private async void Rows_DoubleClick(object sender, MouseButtonEventArgs e)
     {
         if (Rows.SelectedItem is not SceneCatalogRow row) return;

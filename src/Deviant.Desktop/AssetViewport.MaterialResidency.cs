@@ -22,6 +22,25 @@ public partial class AssetViewport
     private long materialCursorGeneration = -1;
     private int materialResidencyCursor;
     private int materialFramesPending;
+    private bool materialResidencyRunning, materialResidencyPaused;
+    private int visibleMaterialParts, residentVisibleMaterialParts, budgetDeferredMaterialParts;
+
+    public bool IsStreamingMaterials => materialResidencySource is not null && !materialResidencyPaused &&
+        (materialResidencyRunning || Volatile.Read(ref materialResidencyDirty) != 0);
+    public bool MaterialStreamingPaused => materialResidencySource is not null && materialResidencyPaused;
+    public int VisibleMaterialPartCount => visibleMaterialParts;
+    public int ResidentVisibleMaterialPartCount => residentVisibleMaterialParts;
+    public int BudgetDeferredMaterialPartCount => budgetDeferredMaterialParts;
+
+    public void PauseMaterialStreaming()
+    {
+        Dispatcher.VerifyAccess();
+        if (materialResidencySource is null) return;
+        materialResidencyPaused = true;
+        materialResidencyTimer?.Stop(); materialResidencyCancellation?.Cancel();
+        Volatile.Write(ref materialResidencyDirty, 0);
+        MaterialResidencyChanged?.Invoke(this, EventArgs.Empty);
+    }
 
     public int DeferredMaterialPartCount => materialBindings.Count(binding => binding.Material is not null &&
         !residentMaterialParts.Contains(binding.Index));
@@ -50,7 +69,7 @@ public partial class AssetViewport
 
     private void MarkMaterialResidencyDirty()
     {
-        if (materialResidencySource is null) return;
+        if (materialResidencySource is null || materialResidencyPaused) return;
         Interlocked.Increment(ref materialPriorityGeneration);
         Interlocked.Exchange(ref materialFramesPending, 2);
         Volatile.Write(ref materialResidencyDirty, 1); RenderView.InvalidateRender();
@@ -65,6 +84,9 @@ public partial class AssetViewport
         Volatile.Write(ref materialResidencyDirty, 0); Volatile.Write(ref materialFrustum, null);
         materialCursorGeneration = -1; materialResidencyCursor = 0;
         Interlocked.Exchange(ref materialFramesPending, 0);
+        materialResidencyPaused = false;
+        visibleMaterialParts = residentVisibleMaterialParts = budgetDeferredMaterialParts = 0;
+        MaterialResidencyChanged?.Invoke(this, EventArgs.Empty);
     }
 
     private async Task InitializeSceneMaterialsAsync(RenderAssetSnapshot source, long current, CancellationToken token)
@@ -105,7 +127,7 @@ public partial class AssetViewport
 
     private async Task RefreshMaterialResidencyAsync()
     {
-        if (disposed || !IsLoaded || !IsVisible || materialResidencySource is not { } source ||
+        if (disposed || !IsLoaded || !IsVisible || materialResidencyPaused || materialResidencySource is not { } source ||
             Volatile.Read(ref materialResidencyDirty) == 0 || !await loadGate.WaitAsync(0)) return;
         var current = generation;
         using var own = new CancellationTokenSource(); materialResidencyCancellation = own;
@@ -114,86 +136,120 @@ public partial class AssetViewport
         catch (Exception error)
         {
             materialResidencyTimer?.Stop();
+            Volatile.Write(ref materialResidencyDirty, 0);
             WorkflowDiagnostics.Failure("Viewport.MaterialResidency", error, source.Revision.IndexContentId);
             StatusText.Text = error.Message; RenderFailed?.Invoke(this, error);
         }
         finally
         {
-            if (ReferenceEquals(materialResidencyCancellation, own)) materialResidencyCancellation = null;
-            loadGate.Release();
+            try
+            {
+                if (materialResidencyPaused && residencyRetirements.Count > 0)
+                {
+                    using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                    try { await FlushMaterialRetirementsAsync(cleanup.Token); }
+                    catch (OperationCanceledException) when (cleanup.IsCancellationRequested) { }
+                    catch (Exception error) { WorkflowDiagnostics.Failure("Viewport.MaterialRetirement", error, source.Revision.IndexContentId); }
+                }
+            }
+            finally
+            {
+                if (ReferenceEquals(materialResidencyCancellation, own)) materialResidencyCancellation = null;
+                loadGate.Release();
+            }
         }
     }
 
     private async Task UpdateMaterialResidencyAsync(RenderAssetSnapshot source, long current, CancellationToken token)
     {
-        using var scratch = source.MemoryBudget.Reserve(checked(parts.Count * 64L + 4096), "material residency sorting");
-        await FlushMaterialRetirementsAsync(token);
-        var frame = Volatile.Read(ref materialFrustum);
-        for (int attempt = 0; attempt < 2 && frame is null; attempt++)
-        { await WaitForFrameAsync(token); frame = Volatile.Read(ref materialFrustum); }
-        if (frame is null)
-        { Volatile.Write(ref materialResidencyDirty, 1); return; }
-        Interlocked.Exchange(ref materialResidencyDirty, 0);
-        long priorityGeneration = frame.Generation;
-        if (materialCursorGeneration != priorityGeneration)
-        { materialCursorGeneration = priorityGeneration; materialResidencyCursor = 0; }
-        var ordered = materialBindings.Select(binding => RankMaterialPart(binding, frame, frame.Position)).OrderByDescending(row => row.Selected)
-            .ThenByDescending(row => row.InView).ThenBy(row => row.Distance).ThenBy(row => row.Index).ToArray();
-        var rank = ordered.Select((row, index) => (row.Index, Rank: index)).ToDictionary(row => row.Index, row => row.Rank);
-        int promoted = 0;
-        var batchClock = Stopwatch.StartNew();
-        while (materialResidencyCursor < ordered.Length)
-        {
-            CheckMaterialGeneration(current, token);
-            if (promoted >= 8 || batchClock.ElapsedMilliseconds >= 75)
-            { Volatile.Write(ref materialResidencyDirty, 1); break; }
-            var row = ordered[materialResidencyCursor++];
-            if (!row.InView && !row.Selected) continue;
-            if (residentMaterialParts.Contains(row.Index)) continue;
-            var binding = materialBindings[row.Index];
-            while (true)
-            {
-                try
-                {
-                    var material = await service!.AcquireMaterialAsync(source, binding.Material, binding.Primitive, token);
-                    await BindPartMaterialAsync(source, binding, material, prepareGeometry: true, current, token);
-                    residentMaterialParts.Add(row.Index);
-                    promoted++;
-                    foreach (var diagnostic in material.Diagnostics)
-                    {
-                        var issue = new RenderIssue(binding.Material!.Asset.Identity,
-                            material.IsUnavailable ? AssetViewportService.UnsupportedMaterialPassIssueCode : "MaterialRenderer", diagnostic);
-                        if (!rendererIssues.Contains(issue)) rendererIssues.Add(issue);
-                    }
-                    break;
-                }
-                catch (ViewportGpuBudgetException)
-                {
-                    if (residencyRetirements.Count > 0)
-                    { await FlushMaterialRetirementsAsync(token); continue; }
-                    var victim = ordered.LastOrDefault(candidate => rank[candidate.Index] > rank[row.Index] &&
-                        residentMaterialParts.Contains(candidate.Index) && materialBindings[candidate.Index].Material is not null);
-                    if (victim is null) break;
-                    var victimBinding = materialBindings[victim.Index];
-                    var placeholder = victimBinding.Placeholder!.Retain();
-                    await BindPartMaterialAsync(source, victimBinding, placeholder, prepareGeometry: false, current, token);
-                    residentMaterialParts.Remove(victim.Index);
-                    await FlushMaterialRetirementsAsync(token);
-                }
-            }
-            if (residencyRetirements.Count >= 32) await FlushMaterialRetirementsAsync(token);
-            else await Dispatcher.Yield(DispatcherPriority.Background);
-        }
-        await FlushMaterialRetirementsAsync(token);
-        if (priorityGeneration != Volatile.Read(ref materialPriorityGeneration) || Volatile.Read(ref materialFramesPending) > 0)
-            Volatile.Write(ref materialResidencyDirty, 1);
-        if (Volatile.Read(ref materialResidencyDirty) != 0) RenderView.InvalidateRender();
+        materialResidencyRunning = true;
         MaterialResidencyChanged?.Invoke(this, EventArgs.Empty);
-        LoadProgressChanged?.Invoke(this, new("Streaming materials", ResidentMaterialPartCount,
-            materialBindings.Length, source.MemoryBudget.UsedBytes));
-        AssetLoadDiagnostics.Counters("MaterialResidency", source.Revision.IndexContentId,
-            new Dictionary<string, long> { ["ResidentParts"] = ResidentMaterialPartCount,
-                ["DeferredParts"] = DeferredMaterialPartCount, ["GpuBytes"] = service!.GpuBytes });
+        MaterialPartRank[]? ordered = null;
+        try
+        {
+            using var scratch = source.MemoryBudget.Reserve(checked(parts.Count * 64L + 4096), "material residency sorting");
+            await FlushMaterialRetirementsAsync(token);
+            var frame = Volatile.Read(ref materialFrustum);
+            for (int attempt = 0; attempt < 2 && frame is null; attempt++)
+            { await WaitForFrameAsync(token); frame = Volatile.Read(ref materialFrustum); }
+            if (frame is null)
+            { Volatile.Write(ref materialResidencyDirty, 1); return; }
+            Interlocked.Exchange(ref materialResidencyDirty, 0);
+            long priorityGeneration = frame.Generation;
+            if (materialCursorGeneration != priorityGeneration)
+            { materialCursorGeneration = priorityGeneration; materialResidencyCursor = 0; }
+            ordered = materialBindings.Select(binding => RankMaterialPart(binding, frame, frame.Position)).OrderByDescending(row => row.Selected)
+                .ThenByDescending(row => row.InView).ThenBy(row => row.Distance).ThenBy(row => row.Index).ToArray();
+            visibleMaterialParts = ordered.Count(row => (row.InView || row.Selected) && materialBindings[row.Index].Material is not null);
+            residentVisibleMaterialParts = ordered.Count(row => (row.InView || row.Selected) &&
+                materialBindings[row.Index].Material is not null && residentMaterialParts.Contains(row.Index));
+            budgetDeferredMaterialParts = 0;
+            var rank = ordered.Select((row, index) => (row.Index, Rank: index)).ToDictionary(row => row.Index, row => row.Rank);
+            int promoted = 0;
+            var batchClock = Stopwatch.StartNew();
+            while (materialResidencyCursor < ordered.Length)
+            {
+                CheckMaterialGeneration(current, token);
+                if (promoted >= 8 || batchClock.ElapsedMilliseconds >= 75)
+                { Volatile.Write(ref materialResidencyDirty, 1); break; }
+                var row = ordered[materialResidencyCursor++];
+                if (!row.InView && !row.Selected) continue;
+                if (residentMaterialParts.Contains(row.Index)) continue;
+                var binding = materialBindings[row.Index];
+                while (true)
+                {
+                    try
+                    {
+                        var material = await service!.AcquireMaterialAsync(source, binding.Material, binding.Primitive, token);
+                        await BindPartMaterialAsync(source, binding, material, prepareGeometry: true, current, token);
+                        residentMaterialParts.Add(row.Index);
+                        promoted++;
+                        foreach (var diagnostic in material.Diagnostics)
+                        {
+                            var issue = new RenderIssue(binding.Material!.Asset.Identity,
+                                material.IsUnavailable ? AssetViewportService.UnsupportedMaterialPassIssueCode : "MaterialRenderer", diagnostic);
+                            if (!rendererIssues.Contains(issue)) rendererIssues.Add(issue);
+                        }
+                        break;
+                    }
+                    catch (ViewportGpuBudgetException)
+                    {
+                        if (residencyRetirements.Count > 0)
+                        { await FlushMaterialRetirementsAsync(token); continue; }
+                        var victim = ordered.LastOrDefault(candidate => rank[candidate.Index] > rank[row.Index] &&
+                            residentMaterialParts.Contains(candidate.Index) && materialBindings[candidate.Index].Material is not null);
+                        if (victim is null) { budgetDeferredMaterialParts++; break; }
+                        var victimBinding = materialBindings[victim.Index];
+                        var placeholder = victimBinding.Placeholder!.Retain();
+                        await BindPartMaterialAsync(source, victimBinding, placeholder, prepareGeometry: false, current, token);
+                        residentMaterialParts.Remove(victim.Index);
+                        await FlushMaterialRetirementsAsync(token);
+                    }
+                }
+                if (residencyRetirements.Count >= 32) await FlushMaterialRetirementsAsync(token);
+                else await Dispatcher.Yield(DispatcherPriority.Background);
+            }
+            await FlushMaterialRetirementsAsync(token);
+            CheckMaterialGeneration(current, token);
+            if (priorityGeneration != Volatile.Read(ref materialPriorityGeneration) || Volatile.Read(ref materialFramesPending) > 0)
+                Volatile.Write(ref materialResidencyDirty, 1);
+            if (Volatile.Read(ref materialResidencyDirty) != 0) RenderView.InvalidateRender();
+            residentVisibleMaterialParts = ordered.Count(row => (row.InView || row.Selected) &&
+                materialBindings[row.Index].Material is not null && residentMaterialParts.Contains(row.Index));
+            LoadProgressChanged?.Invoke(this, new("Streaming materials", residentVisibleMaterialParts,
+                visibleMaterialParts, source.MemoryBudget.UsedBytes));
+            AssetLoadDiagnostics.Counters("MaterialResidency", source.Revision.IndexContentId,
+                new Dictionary<string, long> { ["ResidentParts"] = ResidentMaterialPartCount,
+                    ["DeferredParts"] = DeferredMaterialPartCount, ["GpuBytes"] = service!.GpuBytes });
+        }
+        finally
+        {
+            materialResidencyRunning = false;
+            if (materialResidencySource is not null && ordered is not null && materialResidencyCursor >= ordered.Length &&
+                Volatile.Read(ref materialResidencyDirty) == 0 && !materialResidencyPaused)
+                budgetDeferredMaterialParts = Math.Max(0, visibleMaterialParts - residentVisibleMaterialParts);
+            MaterialResidencyChanged?.Invoke(this, EventArgs.Empty);
+        }
     }
 
     private MaterialPartRank RankMaterialPart(MaterialBinding binding, FrustumFrame frame, System.Numerics.Vector3 position)
@@ -259,7 +315,7 @@ public partial class AssetViewport
     private void CheckMaterialGeneration(long current, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
-        if (disposed || current != generation) throw new OperationCanceledException(token);
+        if (disposed || materialResidencyPaused || current != generation) throw new OperationCanceledException(token);
     }
 
     private sealed record MaterialBinding(int Index, RenderMesh Mesh, MeshPrimitive Primitive, RenderMaterial? Material)
