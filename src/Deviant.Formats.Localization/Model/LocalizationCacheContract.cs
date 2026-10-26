@@ -15,7 +15,7 @@ public static class LocalizationCacheContract
     /// every transitive dependency whose semantics affect those outputs. It excludes packaging,
     /// UI, search projection, archive source fencing, and unrelated assembly build changes.
     /// </summary>
-    public const string ParserContractVersion = "localization-parser-v2-bounded-pointer-arrays";
+    public const string ParserContractVersion = "localization-parser-v3-bounded-record-forms";
     public const string JsonPolicyVersion = "system-text-json-default-v1";
     public const string SearchProjectionVersion = "localization-search-v1";
     public const string InputDigestVersion = "localization-input-sha256-v1";

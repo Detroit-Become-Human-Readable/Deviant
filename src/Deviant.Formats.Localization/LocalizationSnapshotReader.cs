@@ -114,7 +114,7 @@ public sealed class LocalizationSnapshotReader(ISourceRevisionProvider? revision
         for (var languageIndex = 0; languageIndex < languageCount; languageIndex++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (cursor > bodyEnd - 8)
+            if (cursor > bodyEnd - 5)
             {
                 const string message = "The declared language count exceeds the available language blocks.";
                 diagnostics.Add(new("LocalizationLanguageCountMismatch", message, sourceIdentity.Key));
@@ -124,8 +124,8 @@ public sealed class LocalizationSnapshotReader(ISourceRevisionProvider? revision
                 sawMalformedRecord = true;
                 break;
             }
-            var markerValue = BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(cursor, 4));
-            if (markerValue != 0x00000301)
+            var languageBytes = BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(cursor + 1, 4));
+            if (bytes[cursor] != 1 || languageBytes is not (0 or 3) || languageBytes > bodyEnd - cursor - 5)
             {
                 const string message = "A language block has an invalid marker or truncated header.";
                 diagnostics.Add(new("MalformedLocalizationLanguage", message, sourceIdentity.Key));
@@ -134,9 +134,9 @@ public sealed class LocalizationSnapshotReader(ISourceRevisionProvider? revision
                 sawMalformedRecord = true;
                 break;
             }
-            var rawLanguage = DecodeLanguageCode(bytes.Slice(cursor + 5, 3));
+            var rawLanguage = languageBytes == 0 ? string.Empty : DecodeLanguageCode(bytes.Slice(cursor + 5, 3));
             var displayLanguage = NormalizeLanguage(rawLanguage);
-            cursor += 8;
+            cursor += 5 + (int)languageBytes;
             while (cursor <= bodyEnd - 8)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -147,7 +147,29 @@ public sealed class LocalizationSnapshotReader(ISourceRevisionProvider? revision
                 cursor += 8;
                 if (keyLength == 0) break;
 
-                if (keyLength <= 256 && keyLength <= bodyEnd - cursor && IsAsciiKey(bytes.Slice(cursor, (int)keyLength)))
+                var textKey = keyLength <= 256 && keyLength <= bodyEnd - cursor &&
+                    IsAsciiKey(bytes.Slice(cursor, (int)keyLength));
+                if (textKey)
+                {
+                    var lengthOffset = cursor + (int)keyLength;
+                    var boundedText = lengthOffset <= bodyEnd - 4 &&
+                        (BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(lengthOffset, 4)) & 1) == 0 &&
+                        BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(lengthOffset, 4)) <= bodyEnd - lengthOffset - 4;
+                    // A single pointer's key-length low byte can also look like a
+                    // one-character ASCII key. Admit it only when the text extent
+                    // is invalid and the complete reference-bounded pointer parses.
+                    if (!boundedText && keyLength <= pointerCapacity &&
+                        TryParsePointerRecord(indexContentId, resource, relativeSource, bytes, bodyEnd, version,
+                            languageIndex, rawLanguage, displayLanguage, recordStart, cursor, flags, (int)keyLength,
+                            out var alternatePointers, out var alternateEnd, out _, cancellationToken))
+                    {
+                        records.AddRange(alternatePointers);
+                        cursor = alternateEnd;
+                        continue;
+                    }
+                }
+
+                if (textKey)
                 {
                     var keyOffset = cursor;
                     var key = Encoding.ASCII.GetString(bytes.Slice(cursor, (int)keyLength));
@@ -437,8 +459,8 @@ public sealed class LocalizationSnapshotReader(ISourceRevisionProvider? revision
         return Encoding.ASCII.GetString(bytes);
     }
 
-    private static string NormalizeLanguage(string raw) => raw.Equals("JAP", StringComparison.OrdinalIgnoreCase)
-        ? "JPN" : raw.ToUpperInvariant();
+    private static string NormalizeLanguage(string raw) => raw.Length == 0 ? "UND" :
+        raw.Equals("JAP", StringComparison.OrdinalIgnoreCase) ? "JPN" : raw.ToUpperInvariant();
 
     private readonly record struct LocalizationHeader(int Marker, uint Version, uint LanguageCount, int BodyStart, int BodyEnd);
 }
